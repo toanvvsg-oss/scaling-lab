@@ -1,12 +1,41 @@
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { createHistory, pushMilestone } from './timeline.mjs';
 import { queryPrometheus, upQueryForRun } from './prometheus.mjs';
 
 const runFile = promisify(execFile);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function realExec(args) {
+  return runFile('kubectl', args, { timeout: 180000 });
+}
+
+function realApply(ns, obj) {
+  const base = ['--context', 'kind-scaling-lab', ...(ns ? ['-n', ns] : [])];
+  return new Promise((resolve, reject) => {
+    const child = spawn('kubectl', [...base, 'apply', '-f', '-'], { timeout: 60000 });
+    let stderr = '';
+    child.stderr.on('data', (c) => { stderr += c.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`kubectl apply failed: ${stderr.trim()}`))));
+    child.stdin.write(JSON.stringify(obj));
+    child.stdin.end();
+  });
+}
+
+// Injectable dependencies so lifecycle tests run without touching a cluster.
+// exec(args) -> {stdout}; apply(ns, obj); forward(ns) -> {port, close};
+// query(promql) -> {value, at, stale}; sleep(ms); genId() -> run id.
+export const realDeps = {
+  exec: realExec,
+  apply: realApply,
+  forward: null, // set below (needs kubectlBase-free port-forward)
+  query: (q) => queryPrometheus(q),
+  sleep: realSleep,
+  genId: createRunId,
+};
 
 export const MAX_ACTIVE_RUNS = 2;
 // Every lesson can run isolated. Only the autoscaling lessons add a scaler;
@@ -38,12 +67,12 @@ export const archives = new Map();
 // "dashboard", and the lesson must be one the dashboard can drive. Anything
 // else is never touched. Adopted runs resume sampling under a new edge
 // forward; their previous in-memory events are gone (archive files persist).
-export async function adoptOrphanRuns() {
+export async function adoptOrphanRuns(deps = realDeps) {
   const adopted = [];
   let items = [];
   try {
-    const raw = await kubectl('get', 'namespaces', '-l', 'scaling.lab/owner=dashboard', '-o', 'json');
-    items = JSON.parse(raw).items;
+    const raw = await deps.exec(kubectlBase(null).concat(['get', 'namespaces', '-l', 'scaling.lab/owner=dashboard', '-o', 'json']));
+    items = JSON.parse(raw.stdout).items;
   } catch {
     return adopted;
   }
@@ -56,7 +85,7 @@ export async function adoptOrphanRuns() {
     if (!RUN_LESSONS.has(labels['scaling.lab/lesson'])) continue;
     const id = m[1];
     if (runs.has(id)) continue;
-    const present = await kubectl('-n', name, 'get', 'deployment/app', 'deployment/edge', '-o', 'name').catch(() => null);
+    const present = await deps.exec(kubectlBase(name).concat(['get', 'deployment/app', 'deployment/edge', '-o', 'name'])).then(() => true).catch(() => false);
     const run = {
       id, ns: name, lesson: labels['scaling.lab/lesson'], status: present ? 'ready' : 'degraded',
       error: present ? null : 'Run namespace is missing its app or edge deployment.',
@@ -66,7 +95,7 @@ export async function adoptOrphanRuns() {
     };
     if (present) {
       try {
-        const fwd = await startEdgeForward(id);
+        const fwd = await deps.forward(id);
         run.forward = fwd; run.forwardPort = fwd.port;
       } catch (error) {
         run.status = 'degraded';
@@ -83,22 +112,30 @@ function kubectlBase(ns) {
   return ['--context', 'kind-scaling-lab', ...(ns ? ['-n', ns] : [])];
 }
 
-async function kubectl(...args) {
-  const { stdout } = await runFile('kubectl', kubectlBase(null).concat(args), { timeout: 180000 });
+async function kubectl(d, ...args) {
+  const { stdout } = await d.exec(kubectlBase(null).concat(args));
   return stdout.trim();
 }
 
-function applyJson(ns, obj) {
+function startEdgeForwardReal(runId) {
+  const ns = namespaceFor(runId);
   return new Promise((resolve, reject) => {
-    const child = spawn('kubectl', [...kubectlBase(ns), 'apply', '-f', '-'], { timeout: 60000 });
-    let stderr = '';
-    child.stderr.on('data', (c) => { stderr += c.toString(); });
-    child.on('error', reject);
-    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`kubectl apply failed: ${stderr.trim()}`))));
-    child.stdin.write(JSON.stringify(obj));
-    child.stdin.end();
+    const child = spawn('kubectl', [...kubectlBase(ns), 'port-forward', '--address', '127.0.0.1', 'service/edge', ':8080'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timeout = setTimeout(() => { child.kill(); reject(new Error(`Edge port-forward did not start for run ${runId}`)); }, 15000);
+    let output = '';
+    const inspect = (chunk) => {
+      output += chunk.toString();
+      const m = output.match(/Forwarding from 127\.0\.0\.1:(\d+)/);
+      if (m) { clearTimeout(timeout); resolve({ port: Number(m[1]), close: () => child.kill() }); }
+    };
+    child.stdout.on('data', inspect);
+    child.stderr.on('data', inspect);
+    child.on('error', (e) => { clearTimeout(timeout); reject(e); });
+    child.on('exit', (code) => { clearTimeout(timeout); reject(new Error(`Edge port-forward exited ${code} for run ${runId}: ${output}`)); });
   });
 }
+
+realDeps.forward = startEdgeForwardReal;
 
 const APP_IMAGE = 'scaling-lab-app:local';
 
@@ -234,13 +271,13 @@ function namespaceManifest(runId, lesson) {
   };
 }
 
-export async function runClusterState(runId) {
+export async function runClusterState(runId, deps = realDeps) {
   const ns = namespaceFor(runId);
   try {
     const [podsRaw, slicesRaw, hpaRaw] = await Promise.all([
-      kubectl('-n', ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json'),
-      kubectl('-n', ns, 'get', 'endpointslices', '-l', 'kubernetes.io/service-name=app', '-o', 'json'),
-      kubectl('-n', ns, 'get', 'hpa', '-o', 'json').catch(() => '{"items":[]}'),
+      deps.exec(kubectlBase(ns).concat(['get', 'pods', '-l', 'app=scaling-app', '-o', 'json'])).then((r) => r.stdout),
+      deps.exec(kubectlBase(ns).concat(['get', 'endpointslices', '-l', 'kubernetes.io/service-name=app', '-o', 'json'])).then((r) => r.stdout),
+      deps.exec(kubectlBase(ns).concat(['get', 'hpa', '-o', 'json'])).then((r) => r.stdout).catch(() => '{"items":[]}'),
     ]);
     const pods = JSON.parse(podsRaw).items.map((x) => ({
       name: x.metadata.name, phase: x.status.phase,
@@ -251,10 +288,14 @@ export async function runClusterState(runId) {
       pod: x.targetRef?.name, ready: x.conditions?.ready, terminating: x.conditions?.terminating,
     }));
     const hpa = JSON.parse(hpaRaw).items.find((x) => x.spec?.scaleTargetRef?.name === 'app');
+    // autoscaling/v2 reports observed usage in status.currentMetrics[], not in
+    // a top-level percentage field.
+    const cpuMetric = hpa?.status?.currentMetrics?.find((m) => m.type === 'Resource' && m.resource?.name === 'cpu');
     return {
       connected: true, pods, endpoints,
       hpa: hpa && {
         name: hpa.metadata.name, current: hpa.status?.currentReplicas, desired: hpa.status?.desiredReplicas,
+        currentCPU: cpuMetric?.resource?.current?.averageUtilization ?? null,
         metrics: (hpa.spec?.metrics || []).map((m) => ({ type: m.type })),
       },
     };
@@ -263,47 +304,29 @@ export async function runClusterState(runId) {
   }
 }
 
-async function waitRunReady(runId, progress) {
+async function waitRunReady(runId, deps) {
   const until = Date.now() + 120000;
   let last = null;
   while (Date.now() < until) {
-    last = await runClusterState(runId);
+    last = await runClusterState(runId, deps);
     if (last.connected && last.pods.length === 2
       && last.pods.every((p) => p.ready && !p.terminating)
       && last.endpoints.filter((e) => e.ready && !e.terminating).length >= 2) return last;
-    await sleep(2000);
+    await deps.sleep(2000);
   }
   throw new Error(`Run ${runId} did not settle to exactly two Ready app pods (saw ${last?.pods.length ?? '?'} pods). Check kubectl --context kind-scaling-lab -n ${namespaceFor(runId)} get pods.`);
 }
 
-async function verifyRunScrape(runId) {
+async function verifyRunScrape(runId, deps) {
   const query = upQueryForRun(runId);
   let count = 0;
   for (let i = 0; i < 12; i++) {
-    const r = await queryPrometheus(query);
+    const r = await deps.query(query);
     if (!r.stale) count = r.value;
     if (count >= 2) return count;
-    await sleep(5000);
+    await deps.sleep(5000);
   }
   throw new Error(`Prometheus is not scraping both app pods of run ${runId} (saw ${count}, need 2 for query ${query}). Open Status -> Targets via make prometheus-ui, or re-run make prometheus-up.`);
-}
-
-function startEdgeForward(runId) {
-  const ns = namespaceFor(runId);
-  return new Promise((resolve, reject) => {
-    const child = spawn('kubectl', [...kubectlBase(ns), 'port-forward', '--address', '127.0.0.1', 'service/edge', ':8080'], { stdio: ['ignore', 'pipe', 'pipe'] });
-    const timeout = setTimeout(() => { child.kill(); reject(new Error(`Edge port-forward did not start for run ${runId}`)); }, 15000);
-    let output = '';
-    const inspect = (chunk) => {
-      output += chunk.toString();
-      const m = output.match(/Forwarding from 127\.0\.0\.1:(\d+)/);
-      if (m) { clearTimeout(timeout); resolve({ port: Number(m[1]), close: () => child.kill() }); }
-    };
-    child.stdout.on('data', inspect);
-    child.stderr.on('data', inspect);
-    child.on('error', (e) => { clearTimeout(timeout); reject(e); });
-    child.on('exit', (code) => { clearTimeout(timeout); reject(new Error(`Edge port-forward exited ${code} for run ${runId}: ${output}`)); });
-  });
 }
 
 export function activeRuns() {
@@ -326,48 +349,55 @@ export function describeRun(run) {
   };
 }
 
-export async function createRun(lesson, onEvent) {
-  if (!RUN_LESSONS.has(lesson)) throw new Error(`Unknown run lesson: ${lesson}. Expected one of ${[...RUN_LESSONS].join(', ')}.`);
+export function beginRun(lesson, onEvent, deps = realDeps) {
+  if (!RUN_LESSONS.has(lesson)) throw Object.assign(new Error(`Unknown run lesson: ${lesson}. Expected one of ${[...RUN_LESSONS].join(', ')}.`), { status: 400 });
   if (activeRuns().length >= MAX_ACTIVE_RUNS) {
-    throw new Error(`Run limit reached (${MAX_ACTIVE_RUNS} active runs: ${activeRuns().map((r) => r.id).join(', ')}). Clean up a run before creating another.`);
+    throw Object.assign(new Error(`Run limit reached (${MAX_ACTIVE_RUNS} active runs: ${activeRuns().map((r) => r.id).join(', ')}). Clean up a run before creating another.`), { status: 409 });
   }
-  const id = createRunId();
+  let id = deps.genId();
+  for (let guard = 0; runs.has(id) && guard < 5; guard++) id = deps.genId();
+  if (runs.has(id)) throw Object.assign(new Error('Could not allocate a fresh run id. Retry.'), { status: 503 });
   const ns = namespaceFor(id);
   const run = {
     id, ns, lesson, status: 'creating', createdAt: new Date().toISOString(),
     error: null, steps: [], events: [], timeline: createHistory(), result: null,
     load: null, forward: null, forwardPort: null, prev: null,
   };
+  runs.set(id, run);
+  return run;
+}
+
+export async function finishRun(run, onEvent, deps = realDeps) {
+  const { id, ns, lesson } = run;
   const step = (sid, detail) => {
     run.steps.push({ at: new Date().toISOString(), step: sid, detail });
     onEvent('run', { run: id, step: sid, text: `${sid}: ${detail}` });
   };
-  runs.set(id, run);
   try {
     step('create-namespace', `Creating namespace ${ns} with run/lesson/owner labels.`);
-    await applyJson(null, namespaceManifest(id, lesson));
+    await deps.apply(null, namespaceManifest(id, lesson));
     step('apply-manifests', 'Applying fixed app, edge, and scaler manifests scoped to the run namespace.');
     const objs = [...appManifests(id, ns), ...edgeManifests(ns)];
     if (SCALER_LESSON[lesson] === 'keda') objs.push(scaledObjectManifest(id, ns));
     if (SCALER_LESSON[lesson] === 'cpu-hpa') objs.push(cpuHpaManifest(ns));
     for (const obj of objs) {
-      await applyJson(ns, obj);
+      await deps.apply(ns, obj);
     }
     step('wait-rollout', 'Waiting for app and edge rollouts.');
-    await kubectl('-n', ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
-    await kubectl('-n', ns, 'rollout', 'status', 'deployment/edge', '--timeout=180s');
+    await deps.exec(kubectlBase(ns).concat(['rollout', 'status', 'deployment/app', '--timeout=180s'])).then((r) => r.stdout);
+    await deps.exec(kubectlBase(ns).concat(['rollout', 'status', 'deployment/edge', '--timeout=180s'])).then((r) => r.stdout);
     step('wait-ready', 'Waiting for exactly two Ready, non-terminating app pods and Ready endpoints.');
-    await waitRunReady(id, step);
+    await waitRunReady(id, deps);
     if (lesson === 'prometheus') {
       step('verify-scrape', `Verifying Prometheus scrapes both run targets (${upQueryForRun(id)}).`);
-      var targets = await verifyRunScrape(id);
+      var targets = await verifyRunScrape(id, deps);
     }
     if (lesson === 'autoscale') {
       step('verify-scaler', 'Verifying the CPU HPA is present for the run deployment.');
-      await kubectl('-n', ns, 'get', 'hpa', 'app', '-o', 'name');
+      await deps.exec(kubectlBase(ns).concat(['get', 'hpa', 'app', '-o', 'name']));
     }
     step('start-route', 'Starting the run traffic route (edge port-forward).');
-    const fwd = await startEdgeForward(id);
+    const fwd = await deps.forward(id);
     run.forward = fwd; run.forwardPort = fwd.port;
     run.status = 'ready';
     pushMilestone(run.timeline, { kind: 'run', text: `Run ${id} ready in ${ns}${lesson === 'prometheus' ? ` (${targets} Prometheus targets)` : lesson === 'autoscale' ? ' (CPU HPA active)' : ''}.`, detail: 'Traffic for this run is routed to its own edge; other runs are unaffected.', observer: 'run controller' });
@@ -376,9 +406,13 @@ export async function createRun(lesson, onEvent) {
     run.status = 'failed';
     run.error = error.message;
     try { if (run.forward) run.forward.close(); } catch { /* ignore */ }
-    await kubectl('delete', 'namespace', ns, '--ignore-not-found').catch(() => {});
+    await deps.exec(kubectlBase(null).concat(['delete', 'namespace', ns, '--ignore-not-found'])).catch(() => {});
     throw error;
   }
+}
+
+export async function createRun(lesson, onEvent, deps = realDeps) {
+  return finishRun(beginRun(lesson, onEvent, deps), onEvent, deps);
 }
 
 export function buildArchive(run) {
@@ -390,20 +424,47 @@ export function buildArchive(run) {
   };
 }
 
-export async function cleanupRun(runId, resultsDir) {
+export async function cleanupRun(runId, resultsDir, deps = realDeps) {
   const run = runs.get(validateRunId(runId));
-  if (!run) throw new Error(`Unknown run: ${runId}`);
-  if (run.status === 'deleting' || run.status === 'deleted') return run;
+  if (!run) throw Object.assign(new Error(`Unknown run: ${runId}`), { status: 404 });
+  if (run.status === 'deleted') return run;
+  if (run.status === 'deleting') throw Object.assign(new Error(`Run ${runId} cleanup is already in progress.`), { status: 409 });
+  if (run.status === 'creating') throw Object.assign(new Error(`Run ${runId} is still being created. Wait for it to become ready (or fail) before cleanup.`), { status: 409 });
+  if (run.scenarioRunning) throw Object.assign(new Error(`Run ${runId} has a scenario running. Wait for it before cleanup.`), { status: 409 });
   run.status = 'deleting';
-  const archive = buildArchive(run);
-  archives.set(runId, archive);
+  run.error = null;
   try {
-    await mkdir(resultsDir, { recursive: true });
-    await writeFile(`${resultsDir}/archive-${runId}.json`, JSON.stringify(archive, null, 2));
-  } catch { /* archive file is best-effort; memory copy remains */ }
-  if (run.load?.active) await run.load.stop('stopped by run cleanup').catch(() => {});
-  try { if (run.forward) run.forward.close(); } catch { /* ignore */ }
-  await kubectl('delete', 'namespace', run.ns, '--ignore-not-found').catch(() => {});
-  run.status = 'deleted';
-  return run;
+    // Stop traffic first and await in-flight requests, so final counts are
+    // stable before the snapshot is taken.
+    if (run.load?.active) await run.load.stop('stopped by run cleanup');
+    const archive = structuredClone(buildArchive(run));
+    try {
+      await mkdir(resultsDir, { recursive: true });
+      const file = `${resultsDir}/archive-${runId}.json`;
+      await writeFile(file, JSON.stringify(archive, null, 2));
+      JSON.parse(await readFile(file, 'utf8'));
+    } catch (error) {
+      throw new Error(`Evidence snapshot could not be persisted: ${error.message}`);
+    }
+    archives.set(runId, archive);
+    try { if (run.forward) run.forward.close(); } catch { /* ignore */ }
+    run.forward = null;
+    try {
+      await deps.exec(kubectlBase(null).concat(['delete', 'namespace', run.ns])).then((r) => r.stdout);
+    } catch (error) {
+      // Real failure: keep everything for retry. The route is already closed
+      // and traffic stopped; the namespace and record stay for another attempt.
+      run.status = 'cleanup-failed';
+      run.error = `Namespace deletion failed: ${error.message}`;
+      throw Object.assign(new Error(run.error), { status: 502 });
+    }
+    run.status = 'deleted';
+    return run;
+  } catch (error) {
+    if (run.status === 'deleting') {
+      run.status = 'cleanup-failed';
+      run.error = error.message;
+    }
+    throw error;
+  }
 }

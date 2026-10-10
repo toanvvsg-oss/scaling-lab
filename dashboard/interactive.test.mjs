@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PROFILES, LOAD_LIMITS, validateProfile, LoadSession } from './load.mjs';
+import { PROFILES, CPU_PROFILES, LOAD_LIMITS, validateProfile, LoadSession } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, RESET_TARGETS } from './reset.mjs';
 import { createRunId, validateRunId, namespaceFor, buildArchive, MAX_ACTIVE_RUNS, RUN_LESSONS } from './runs.mjs';
@@ -8,9 +8,17 @@ import { rateQueryForRun, upQueryForRun, LEGACY_RATE_QUERY } from './prometheus.
 
 test('load profiles stay within laptop-safe bounds', () => {
   for (const [name, p] of Object.entries(PROFILES)) {
-    assert.ok(p.initialRps >= 1 && p.initialRps <= LOAD_LIMITS.maxRps, name);
+    assert.ok(p.phases.length >= 1, name);
+    assert.ok(Math.abs(p.phases.reduce((a, x) => a + x.frac, 0) - 1) < 1e-9, `${name} phases cover the duration`);
+    for (const phase of p.phases) {
+      assert.ok(phase.rps >= 1 && phase.rps <= LOAD_LIMITS.maxRps, `${name}/${phase.label}`);
+    }
     assert.ok(p.maxRps <= LOAD_LIMITS.maxRps, name);
     assert.equal(LOAD_LIMITS.endpoint, 'http://127.0.0.1:8080');
+  }
+  for (const [name, p] of Object.entries(CPU_PROFILES)) {
+    assert.ok(p.path.startsWith('/cpu'), `${name} burns CPU`);
+    assert.ok(p.maxRps <= 12, `${name} stays laptop-safe`);
   }
   assert.throws(() => validateProfile('nope'), /Unknown profile/);
 });
@@ -45,6 +53,21 @@ test('timeline points keep measured offered rate plus target, stale stays null',
   assert.equal(h.points[0].stale, true);
 });
 
+test('load phases progress over the session duration', () => {
+  const s = new LoadSession(() => {}, { cpu: false });
+  s.profile = 'ramp';
+  s.durationMs = 120000;
+  s.manualDelta = 0;
+  assert.equal(s.phaseAt(0), 0);
+  assert.equal(s.phaseAt(29999), 0);
+  assert.equal(s.phaseAt(30000), 1);
+  assert.equal(s.phaseAt(90000), 3);
+  assert.equal(s.effectiveRps(0), 5);
+  s.manualDelta = 5;
+  assert.equal(s.effectiveRps(0), 10);
+  s.manualDelta = 1000;
+  assert.equal(s.effectiveRps(0), 30);
+});
 test('load session clamps rate changes to profile bounds and stops cleanly', async () => {
   const events = [];
   const s = new LoadSession((t, d) => events.push([t, d]));

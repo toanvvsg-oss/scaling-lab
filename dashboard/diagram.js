@@ -71,4 +71,9 @@ document.addEventListener('click', event => {
   if (!button) return;
   lesson = Number(button.dataset.index); play();
 });
+// Programmatic lesson changes (select() after run flows) drive the same
+// illustration; the animation itself stays illustrative, not evidence.
+window.addEventListener('lab:lesson', event => {
+  if (typeof event.detail === 'number') { lesson = event.detail; play(); }
+});
 play();

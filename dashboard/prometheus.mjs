@@ -38,8 +38,63 @@ export async function prometheusPort() {
   return port;
 }
 
-// Returns { value, at, stale }. `at` is the Prometheus sample timestamp
-// (seconds since epoch from the result vector), not the dashboard poll time.
+// True stored-sample freshness for one run's counter series.
+// timestamp(v) returns each sample's ACTUAL stored timestamp as the result
+// VALUE (Prometheus docs, query functions). query_range step times would only
+// be evaluation times, so we do not use them here. Returns the freshest and
+// stalest per-pod sample times plus whether every target scraped OK (up==1).
+// A failed scrape (up != 1) or samples older than 3 scrape intervals is stale
+// and must never display as a fresh zero.
+export async function queryRunSamples(counterSel, upSel) {
+  const empty = { total: null, at: null, stalestAt: null, upAllOne: false, evaluatedAt: null, stale: true };
+  try {
+    const p = await prometheusPort();
+    const instant = async (q) => {
+      const response = await fetch(`http://127.0.0.1:${p}/api/v1/query?query=${encodeURIComponent(q)}&time=${Math.floor(Date.now() / 1000)}`, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return null;
+      const data = await response.json();
+      return data.status === 'success' ? data : null;
+    };
+    const [totalRes, tsRes, upRes] = await Promise.all([
+      instant(`sum(${counterSel})`),
+      instant(`timestamp(${counterSel})`),
+      instant(upSel),
+    ]);
+    if (!totalRes || !tsRes || !upRes) return empty;
+    const evaluatedAt = new Date().toISOString();
+    const totalSample = totalRes.data?.result?.[0]?.value;
+    const stamps = (tsRes.data?.result || []).map((r) => Number(r.value?.[1])).filter(Number.isFinite);
+    const ups = (upRes.data?.result || []).map((r) => Number(r.value?.[1]));
+    if (!stamps.length || !ups.length) return { ...empty, evaluatedAt };
+    const freshest = Math.max(...stamps);
+    const stalest = Math.min(...stamps);
+    const upAllOne = ups.every((v) => v === 1);
+    const ageMs = Date.now() - freshest * 1000;
+    const stale = !upAllOne || ageMs > 15000;
+    return {
+      total: totalSample ? Number(totalSample[1]) : null,
+      at: new Date(freshest * 1000).toISOString(),
+      stalestAt: new Date(stalest * 1000).toISOString(),
+      upAllOne, evaluatedAt, stale,
+    };
+  } catch { return empty; }
+}
+
+export function counterSelForRun(runId) {
+  if (!/^[a-z0-9]{8}$/.test(runId)) throw new Error(`Invalid run id: ${runId}`);
+  return `scaling_lab_http_requests_total{job="scaling-app",labrun="${runId}"}`;
+}
+
+export function counterQueryForRun(runId) {
+  return `sum(${counterSelForRun(runId)})`;
+}
+
+export function upSelForRun(runId) {
+  if (!/^[a-z0-9]{8}$/.test(runId)) throw new Error(`Invalid run id: ${runId}`);
+  return `up{job="scaling-app",labrun="${runId}"}`;
+}
+
+// Instant-query evaluation result: `at` is evaluation time, not scrape time.
 export async function queryPrometheus(query) {
   try {
     const p = await prometheusPort();
