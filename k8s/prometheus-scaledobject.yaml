@@ -1,0 +1,24 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: app-prometheus
+  namespace: scaling-lab
+spec:
+  scaleTargetRef:
+    name: app
+  minReplicaCount: 2
+  maxReplicaCount: 5
+  pollingInterval: 5
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 60
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.scaling-lab.svc.cluster.local:9090
+        query: sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))
+        threshold: "5"
+        activationThreshold: "1"
+        ignoreNullValues: "false"

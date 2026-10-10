@@ -34,6 +34,12 @@ const frames = [
     ['Metrics-server reports CPU usage relative to requests.', 2, 'still'],
     ['The HPA asks the Deployment for more replicas.', 2, 'play'],
     ['New ready pods share subsequent requests.', 3, 'play']
+  ],
+  [
+    ['App pods count each HTTP request and expose /metrics.', 0, 'play'],
+    ['Prometheus scrapes every app pod and calculates total requests per second.', 1, 'play'],
+    ['KEDA queries Prometheus and offers that rate as an external HPA metric.', 2, 'play'],
+    ['The HPA changes replica count; each pod gets a share of traffic.', 3, 'play']
   ]
 ];
 let lesson = 0, step = 0, timer;
@@ -44,7 +50,9 @@ function draw() {
   document.getElementById('diagram-text').textContent = caption;
   const track = document.getElementById('diagram-track');
   track.className = `diagram-track ${motion}`;
+  const labels = lesson === 6 ? ['App', 'Prometheus', 'KEDA', 'HPA'] : ['Client', 'Edge', 'Service', 'Pod'];
   nodes.forEach((node, index) => {
+    node.lastChild.textContent = labels[index];
     node.classList.toggle('active', index === active);
     node.classList.toggle('drain', (lesson === 2 || lesson === 3 || lesson === 4) && step === 2 && index === 3);
     node.classList.toggle('gone', lesson === 2 && step === 3 && index === 3);

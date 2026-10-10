@@ -7,6 +7,7 @@ const mode = process.env.SHUTDOWN_MODE || 'graceful';
 const shutdownMs = Number(process.env.SHUTDOWN_MS || 24000);
 let ready = true;
 let active = 0;
+let requestsTotal = 0;
 let nextConnection = 0;
 const connections = new WeakMap();
 
@@ -22,6 +23,13 @@ const server = http.createServer(async (req, res) => {
   const connection = connections.get(req.socket);
   if (url.pathname === '/health/live') return reply(res, 200, { live: true, pod });
   if (url.pathname === '/health/ready') return reply(res, ready ? 200 : 503, { ready, pod });
+  if (url.pathname === '/metrics') {
+    const label = JSON.stringify(pod);
+    res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(`# HELP scaling_lab_http_requests_total Application HTTP requests excluding probes and metrics\n# TYPE scaling_lab_http_requests_total counter\nscaling_lab_http_requests_total{pod=${label}} ${requestsTotal}\n# HELP scaling_lab_http_inflight_requests Requests currently being handled\n# TYPE scaling_lab_http_inflight_requests gauge\nscaling_lab_http_inflight_requests{pod=${label}} ${active}\n`);
+    return;
+  }
+  requestsTotal++;
   active++;
   const request = req.headers['x-request-id'] || randomUUID();
   res.setHeader('x-pod', pod);

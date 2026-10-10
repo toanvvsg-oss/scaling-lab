@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { clusterState, runScenario } from './runner.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
-const files = { '/': ['index.html', 'text/html'], '/worksheet': ['worksheet.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/diagram.css': ['diagram.css', 'text/css'], '/app.js': ['app.js', 'text/javascript'], '/diagram.js': ['diagram.js', 'text/javascript'], '/worksheet.js': ['worksheet.js', 'text/javascript'] };
+const files = { '/': ['index.html', 'text/html'], '/worksheet': ['worksheet.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/diagram.css': ['diagram.css', 'text/css'], '/app.js': ['app.js', 'text/javascript'], '/diagram.js': ['diagram.js', 'text/javascript'], '/prometheus-ui.js': ['prometheus-ui.js', 'text/javascript'], '/worksheet.js': ['worksheet.js', 'text/javascript'] };
 const state = { running: false, scenario: null, events: [], result: null, error: null, started: null };
 function send(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -57,7 +57,7 @@ const server = http.createServer(async (req, res) => {
     }
     let input;
     try { input = JSON.parse(body); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
-    if (!['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale'].includes(input.id)) return send(res, 400, { error: 'Unknown scenario' });
+    if (!['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus'].includes(input.id)) return send(res, 400, { error: 'Unknown scenario' });
     Object.assign(state, { running: true, scenario: input.id, events: [], result: null, error: null, started: new Date().toISOString() });
     send(res, 202, { started: true });
     const stopObservation = observeCluster();

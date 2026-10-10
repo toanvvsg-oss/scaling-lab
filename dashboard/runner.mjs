@@ -16,7 +16,7 @@ export async function clusterState() {
     const [pods, endpoints, hpa] = await Promise.all([
       kubectl('get', 'pods', '-l', 'app=scaling-app', '-o', 'json'),
       kubectl('get', 'endpointslices', '-l', 'kubernetes.io/service-name=app', '-o', 'json'),
-      kubectl('get', 'hpa', 'app', '-o', 'json').catch(() => null)
+      kubectl('get', 'hpa', '-o', 'json').catch(() => null)
     ]);
     const p = JSON.parse(pods).items.map(x => ({
       name: x.metadata.name, phase: x.status.phase,
@@ -26,8 +26,8 @@ export async function clusterState() {
     const e = JSON.parse(endpoints).items.flatMap(x => x.endpoints || []).map(x => ({
       pod: x.targetRef?.name, ready: x.conditions?.ready, terminating: x.conditions?.terminating
     }));
-    const h = hpa && JSON.parse(hpa);
-    return { connected: true, pods: p, endpoints: e, hpa: h && { current: h.status?.currentReplicas, desired: h.status?.desiredReplicas } };
+    const h = hpa && JSON.parse(hpa).items.find(x => x.spec?.scaleTargetRef?.name === 'app');
+    return { connected: true, pods: p, endpoints: e, hpa: h && { name: h.metadata.name, current: h.status?.currentReplicas, desired: h.status?.desiredReplicas } };
   } catch (error) { return { connected: false, error: error.message, pods: [], endpoints: [] }; }
 }
 
@@ -53,13 +53,14 @@ function startRequest(path, agent) {
   return { headers, done };
 }
 
-async function traffic(durationMs, path, emit, intervalMs = 120) {
+async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: 12 });
   const requests = [];
+  let observed = 0;
   const until = Date.now() + durationMs;
   while (Date.now() < until) {
     const task = startRequest(path, agent).done.then(x => {
-      emit('request', { pod: x.pod, ok: x.ok, status: x.status, error: x.error, ms: x.ms });
+      if (++observed % emitEvery === 0 || !x.ok) emit('request', { pod: x.pod, ok: x.ok, status: x.status, error: x.error, ms: x.ms });
       return x;
     });
     requests.push(task);
@@ -100,6 +101,97 @@ function watchPodLogs(pod, emit) {
     }
   });
   return () => child.kill();
+}
+
+async function startPrometheusForward() {
+  const child = spawn('kubectl', ['--context', 'kind-scaling-lab', '-n', 'scaling-lab', 'port-forward', '--address', '127.0.0.1', 'service/prometheus', ':9090'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const port = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Prometheus port-forward did not start')), 15000);
+    let output = '';
+    const inspect = chunk => {
+      output += chunk.toString();
+      const match = output.match(/Forwarding from 127\.0\.0\.1:(\d+)/);
+      if (match) { clearTimeout(timeout); resolve(Number(match[1])); }
+    };
+    child.stdout.on('data', inspect);
+    child.stderr.on('data', inspect);
+    child.on('error', error => { clearTimeout(timeout); reject(error); });
+    child.on('exit', code => { clearTimeout(timeout); reject(new Error(`Prometheus port-forward exited ${code}: ${output}`)); });
+  }).catch(error => { child.kill(); throw error; });
+  return { port, close: () => child.kill() };
+}
+
+async function prometheusValue(port, query) {
+  const url = `http://127.0.0.1:${port}/api/v1/query?query=${encodeURIComponent(query)}`;
+  const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error(`Prometheus query failed with HTTP ${response.status}`);
+  const data = await response.json();
+  if (data.status !== 'success') throw new Error(`Prometheus query failed: ${data.error || data.status}`);
+  const value = data.data?.result?.[0]?.value?.[1];
+  return value == null ? null : Number(value);
+}
+
+const REQUEST_RATE_QUERY = 'sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))';
+
+async function runPrometheusScenario(emit) {
+  await kubectl('get', 'scaledobject', 'app-prometheus', '-o', 'name').catch(() => { throw new Error('Prometheus scaler is missing. Run make prometheus-up first.'); });
+  await waitStablePods();
+  const forward = await startPrometheusForward();
+  try {
+    let scrapeTargets = 0;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      scrapeTargets = await prometheusValue(forward.port, 'count(up{job="scaling-app"} == 1)') ?? 0;
+      if (scrapeTargets >= 2) break;
+      await sleep(5000);
+    }
+    if (scrapeTargets < 2) throw new Error('Prometheus is not scraping both app pods yet. Check the prometheus targets page.');
+    const initialState = await clusterState();
+    if (!initialState.hpa?.name?.startsWith('keda-hpa-')) throw new Error('KEDA has not created its HPA yet. Wait a moment and retry.');
+    const initial = initialState.pods.filter(x => !x.terminating).length;
+    let peak = initial;
+    let peakRps = 0;
+    let monitoring = false;
+    const sample = async () => {
+      if (monitoring) return;
+      monitoring = true;
+      try {
+        const [rps, state] = await Promise.all([prometheusValue(forward.port, REQUEST_RATE_QUERY), clusterState()]);
+        peakRps = Math.max(peakRps, rps ?? 0);
+        peak = Math.max(peak, state.pods.filter(x => !x.terminating).length);
+        emit('prometheus', { rps, pods: state.pods.length, desired: state.hpa?.desired, text: `${rps == null ? 'warming up' : rps.toFixed(1) + ' req/s'} · ${state.pods.length} pods · desired ${state.hpa?.desired ?? '?'}` });
+      } catch (error) { emit('note', { text: `Metric sample unavailable: ${error.message}` }); }
+      finally { monitoring = false; }
+    };
+    emit('note', { text: `Prometheus is scraping ${scrapeTargets} app pods. Sending request load.` });
+    const timer = setInterval(sample, 5000);
+    const load = await traffic(80000, '/fast', emit, 30, 15);
+    clearInterval(timer);
+    await sample();
+    emit('note', { text: `Load stopped. Peak observed rate ${peakRps.toFixed(1)} req/s; watching scale down.` });
+    let stableDown = false;
+    let final = peak;
+    const drain = [];
+    const until = Date.now() + 180000;
+    while (Date.now() < until && !stableDown) {
+      drain.push(...await traffic(5000, '/fast', emit, 500, 5));
+      await sample();
+      const state = await clusterState();
+      final = state.pods.filter(x => !x.terminating).length;
+      stableDown = state.pods.length === initial && state.pods.every(x => x.ready && !x.terminating);
+    }
+    const checks = [
+      { pass: scrapeTargets >= 2, label: 'Prometheus scraped both starting app pods' },
+      { pass: peakRps > 10, label: 'PromQL observed request demand above the 5 req/s per-pod target' },
+      { pass: peak > initial, label: 'KEDA and HPA added app replicas under request load' },
+      { pass: stableDown, label: 'Replicas returned to baseline after the request rate fell' },
+      { pass: drain.length > 0 && drain.every(x => x.ok), label: 'Sampled requests succeeded during scale down' }
+    ];
+    return {
+      status: checks.every(x => x.pass) ? 'pass' : 'fail',
+      checks,
+      evidence: { query: REQUEST_RATE_QUERY, thresholdRpsPerPod: 5, scrapeTargets, initial, peak, final, peakRps, loadRequests: load.length, loadFailures: load.filter(x => !x.ok).length, drainRequests: drain.length, drainFailures: drain.filter(x => !x.ok).slice(0, 10) }
+    };
+  } finally { forward.close(); }
 }
 
 export async function runScenario(id, options, emit) {
@@ -221,5 +313,6 @@ export async function runScenario(id, options, emit) {
       evidence: { initial, peak, final, stableDown, loadRequests: samples.length, loadFailures: samples.filter(x => !x.ok).length, drainRequests: drainSamples.length, drainFailures: drainSamples.filter(x => !x.ok).slice(0, 10) }
     };
   }
+  if (id === 'prometheus') return runPrometheusScenario(emit);
   throw new Error('Unknown scenario');
 }

@@ -4,7 +4,7 @@ import { runScenario } from './runner.mjs';
 
 const id = process.argv[2] || 'connections';
 const mode = process.argv[3] || 'graceful';
-const allowed = new Set(['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale']);
+const allowed = new Set(['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus']);
 if (!allowed.has(id)) { console.error(`Unknown scenario: ${id}`); process.exit(2); }
 const events = [];
 const report = { scenario: id, mode, started: new Date().toISOString(), events };

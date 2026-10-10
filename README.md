@@ -1,12 +1,12 @@
 # Scaling Lab
 
-A guided local lab for HTTP connection reuse, Node.js graceful shutdown, Kubernetes rollouts, and CPU autoscaling. The web dashboard pairs each experiment with a live pod/endpoint view, request timeline, conceptual question, and evidence-backed verification result.
+A guided local lab for HTTP connection reuse, Node.js graceful shutdown, Kubernetes rollouts, CPU autoscaling, and Prometheus request-rate autoscaling. The web dashboard pairs each experiment with a live pod/endpoint view, request timeline, conceptual question, and evidence-backed verification result.
 
 ![Scaling Lab dashboard](docs/dashboard.png)
 
 ## Requirements
 
-- Docker-compatible daemon, `kind`, `kubectl`, `make`, `curl`, and Node.js 22 or later
+- Docker-compatible daemon, `kind`, `kubectl`, `make`, `curl`, `helm`, and Node.js 22 or later for the Prometheus lesson
 - About 4 GB free memory and network access for the first image pulls
 - Port 8080 (lab proxy) and 4173 (dashboard) available on localhost
 
@@ -27,6 +27,27 @@ colima ssh -- sudo sysctl -w fs.inotify.max_user_instances=1024
 
 For the autoscaling lesson, run `make hpa-up` first. This installs the pinned metrics-server release and sets `--kubelet-insecure-tls` for the local kind cluster, then creates the CPU HPA. Give metrics collection a minute before running the experiment.
 
+For the Prometheus lesson, run `make prometheus-up`. It deploys a local Prometheus, installs KEDA 2.17.3, and creates a ScaledObject that scales the app toward **5 requests/second per pod**. This target is intentionally low for a laptop experiment; measure your own service before choosing a production target. The two autoscaling lessons use separate HPAs for the same Deployment, so each setup removes the other lesson's scaler. Run `make hpa-up` to switch back to CPU scaling. Prometheus data is stored only in its pod and disappears if that pod is replaced.
+
+```sh
+make prometheus-up
+make dashboard
+```
+
+In another terminal, `make prometheus-ui` optionally opens a port-forward for Prometheus at <http://127.0.0.1:19090>.
+
+In Prometheus, inspect **Status → Target health** and query `sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))`. App pods expose the counter at `/metrics`. Prometheus scrapes each pod every five seconds, KEDA reads the query, and its generated HPA changes the Deployment replica count. The dashboard shows the measured rate alongside pod and HPA state while lesson 07 runs.
+
+```mermaid
+flowchart LR
+    T[Lab request traffic] --> A[Node.js app pods]
+    A -->|/metrics request counters| P[Prometheus]
+    P -->|PromQL total requests per second| K[KEDA]
+    K -->|external metric| H[Kubernetes HPA]
+    H -->|desired replicas| D[App Deployment]
+    D --> A
+```
+
 ```sh
 make reset    # restore the baseline app configuration and remove the HPA
 make test     # verifier unit tests
@@ -45,10 +66,11 @@ make down     # delete only the scaling-lab kind cluster
 | Rolling deployment | Change a pod-template environment variable under traffic | A new pod serves traffic and sampled requests have no failures |
 | Streaming drain | Delete a pod during a 20-tick response | The stream completes with all 20 ticks |
 | Autoscaling | Sustain CPU-intensive requests, then stop the load | The HPA adds replicas, returns to baseline, and sampled scale-down requests succeed |
+| Prometheus scaling | Sustain HTTP requests, then reduce the rate | Prometheus scrapes both starting pods, observes over 10 requests/second, the KEDA HPA adds replicas and returns to baseline, and sampled requests succeed |
 
 Checks may return **inconclusive** if the intended race or enough traffic was not observed. The result includes raw request and pod evidence. A passing local experiment is evidence for this topology and workload, not a guarantee for a different ingress, service mesh, or cloud load balancer.
 
-You can run any lesson without the browser using `make verify SCENARIO=shutdown MODE=graceful` (or `connections`, `timeouts`, `rollout`, `streaming`, `autoscale`). The command writes a JSON evidence report under `results/` and exits nonzero for a failed or inconclusive check.
+You can run any lesson without the browser using `make verify SCENARIO=shutdown MODE=graceful` (or `connections`, `timeouts`, `rollout`, `streaming`, `autoscale`, `prometheus`). The command writes a JSON evidence report under `results/` and exits nonzero for a failed or inconclusive check. Run the relevant setup target before either autoscaling verifier.
 
 Use the dashboard's **configuration worksheet** after the lessons. It checks shutdown timing and compares measured per-pod capacity with peak demand and HPA replica limits. It exports a JSON record of your choices. The worksheet is a consistency check; rerun live experiments with the actual settings before applying them elsewhere.
 
@@ -63,7 +85,7 @@ The app is configured with a two-second `preStop`, a 30-second pod grace period,
 ```text
 app/          Instrumented Node.js service and Dockerfile
 dashboard/    Guided UI, scenario runner, and verifier
-k8s/          kind, Deployment, Service, proxy, and HPA manifests
+k8s/          kind, app, proxy, Prometheus, and scaler manifests
 Makefile      Setup, reset, test, and teardown commands
 ```
 
@@ -75,4 +97,7 @@ The dashboard binds to `127.0.0.1` and exposes only predefined scenarios against
 - [Kubernetes pod and endpoint termination flow](https://kubernetes.io/docs/tutorials/services/pods-and-endpoint-termination-flow/)
 - [Kubernetes container lifecycle hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
 - [Kubernetes HPA behavior](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/)
+- [Prometheus scrape configuration](https://prometheus.io/docs/prometheus/latest/configuration/configuration/)
+- [KEDA Prometheus scaler](https://keda.sh/docs/2.17/scalers/prometheus/)
+- [KEDA ScaledObject behavior](https://keda.sh/docs/2.17/reference/scaledobject-spec/)
 - [kind cluster configuration](https://kind.sigs.k8s.io/docs/user/configuration/)

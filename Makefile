@@ -4,7 +4,7 @@ KUBECTL := kubectl --context $(CTX)
 SCENARIO ?= connections
 MODE ?= graceful
 
-.PHONY: up check open dashboard reset down test hpa-up verify
+.PHONY: up check open dashboard reset down test hpa-up prometheus-up prometheus-ui verify
 
 up:
 	@kind get clusters | grep -qx $(CLUSTER) || kind create cluster --config k8s/kind.yaml
@@ -27,6 +27,7 @@ open:
 	python3 -m webbrowser http://127.0.0.1:4173
 
 reset:
+	$(KUBECTL) -n scaling-lab delete scaledobject app-prometheus --ignore-not-found
 	$(KUBECTL) -n scaling-lab delete hpa app --ignore-not-found
 	$(KUBECTL) apply -f k8s/app.yaml -f k8s/proxy.yaml
 	$(KUBECTL) -n scaling-lab rollout restart deployment/app
@@ -35,11 +36,24 @@ reset:
 	$(KUBECTL) -n scaling-lab rollout status deployment/edge --timeout=180s
 
 hpa-up:
+	$(KUBECTL) -n scaling-lab delete scaledobject app-prometheus --ignore-not-found
 	$(KUBECTL) apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
 	$(KUBECTL) -n kube-system patch deployment metrics-server --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
 	$(KUBECTL) -n kube-system rollout status deployment/metrics-server --timeout=180s
 	$(KUBECTL) apply -f k8s/hpa.yaml
 	@echo 'Wait for kubectl --context $(CTX) -n scaling-lab get hpa app to show a CPU value.'
+
+prometheus-up: up
+	$(KUBECTL) -n scaling-lab delete hpa app --ignore-not-found
+	$(KUBECTL) apply -f k8s/prometheus.yaml
+	$(KUBECTL) -n scaling-lab rollout status deployment/prometheus --timeout=180s
+	helm repo add kedacore https://kedacore.github.io/charts --force-update
+	helm upgrade --install keda kedacore/keda --version 2.17.3 --namespace keda --create-namespace --kube-context $(CTX) --wait --timeout 5m
+	$(KUBECTL) apply -f k8s/prometheus-scaledobject.yaml
+	$(KUBECTL) -n scaling-lab get scaledobject,hpa
+
+prometheus-ui:
+	$(KUBECTL) -n scaling-lab port-forward service/prometheus 19090:9090
 
 test:
 	npm test
