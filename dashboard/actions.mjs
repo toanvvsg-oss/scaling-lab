@@ -121,7 +121,22 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
           headers = await task.headers;
           if (!headers.pod) {
             lastError = `HTTP ${headers.status ?? '?'} ${headers.error || 'no x-pod header'}`;
-            task.done.catch(() => {});
+            // Account the failed pre-pod attempt exactly once: it never
+            // becomes the pending request, so without this the 502/transport
+            // attempts before route recovery stay invisible in statusStats
+            // despite the every-result requirement. One http-result plus one
+            // failure trace; the eventual identified completion is accounted
+            // once through the pending logic below, never duplicated here.
+            const failed = await Promise.race([
+              task.done,
+              deps.sleep(10000).then(() => null),
+            ]);
+            if (failed) {
+              emit('http-result', { ...strip(failed) });
+              emit('request', { group: `${action} retry`, ...strip(failed) });
+            } else {
+              task.done.catch(() => {});
+            }
           }
         }
         if (!headers?.pod) {

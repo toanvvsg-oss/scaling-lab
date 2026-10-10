@@ -138,6 +138,50 @@ test('start-long waits for endpoints and retries only pre-headers failures', asy
   run.pendingLong = null;
 });
 
+test('failed pre-pod retries are accounted once each; eventual completion accounted once', async () => {
+  const run = { id: 'aaaabbbb', ns: 'scaling-run-aaaabbbb', lesson: 'shutdown', forwardPort: 18888, pendingLong: null };
+  const deps = fakeDeps();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let attempts = 0;
+  deps.startRequest = () => {
+    attempts++;
+    if (attempts <= 2) {
+      return {
+        headers: Promise.resolve({ pod: null, status: 502, error: 'bad gateway' }),
+        done: Promise.resolve({ ok: false, complete: true, status: 502, ms: 12 }),
+      };
+    }
+    return {
+      headers: Promise.resolve({ pod: 'app-x-1', requestId: 'req-9' }),
+      done: gate.then(() => ({ ok: true, complete: true, status: 200, pod: 'app-x-1', requestId: 'req-9', ms: 8000 })),
+    };
+  };
+  const events = [];
+  const out = await runAction(run, 'start-long', { mode: 'graceful' }, (t, d) => events.push([t, d]), deps);
+  assert.equal(out.pod, 'app-x-1');
+  release();
+  await new Promise((r) => setTimeout(r, 20));
+  const accounted = events.filter(([t]) => t === 'http-result');
+  assert.equal(accounted.length, 3, 'two failed attempts plus one completion, none duplicated');
+  assert.deepEqual(accounted.map(([, d]) => d.status ?? d.error), [502, 502, 200]);
+  assert.equal(events.filter(([t]) => t === 'request').length, 2, 'one failure trace per failed attempt');
+  assert.ok(events.some(([t]) => t === 'slow-end'), 'completion emitted through pending logic');
+});
+
+test('all retries failing still leaves observed errors instead of no observations', async () => {
+  const run = { id: 'aaaabbbb', ns: 'scaling-run-aaaabbbb', lesson: 'shutdown', forwardPort: 18888, pendingLong: null };
+  const deps = fakeDeps();
+  deps.startRequest = () => ({
+    headers: Promise.resolve({ pod: null, status: 502, error: 'bad gateway' }),
+    done: Promise.resolve({ ok: false, complete: true, status: 502, ms: 9 }),
+  });
+  const events = [];
+  await assert.rejects(runAction(run, 'start-long', { mode: 'graceful' }, (t, d) => events.push([t, d]), deps), /did not reach a pod/);
+  assert.equal(events.filter(([t]) => t === 'http-result').length, 5, 'every bounded retry attempt accounted once');
+  assert.equal(events.filter(([t]) => t === 'request').length, 5, 'every attempt leaves a failure trace');
+});
+
 test('start-long reports HTTP status when no pod is ever reached', async () => {
   const run = { id: 'aaaabbbb', ns: 'scaling-run-aaaabbbb', lesson: 'shutdown', forwardPort: 18888, pendingLong: null };
   const deps = fakeDeps();
