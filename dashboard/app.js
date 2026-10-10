@@ -74,6 +74,9 @@ async function refresh(){
     const effLoad = (lessons[current].id === 'prometheus' && active) ? active.load : load;
     if (lessons[current].id === 'prometheus') {
       $('run-panel-state').textContent = active ? `run ${active.id} · ${active.status} · ${active.namespace}${active.error ? ' · error: ' + active.error : ''}${active.status === 'deleted' ? ' · evidence stays downloadable' : ''}` : (pendingRun ? 'Creating run…' : 'No live runs — create one to start.');
+      const liveRuns = runs.filter(r => r.status === 'ready' || r.status === 'creating');
+      const cap = state.maxActiveRuns || 2;
+      $('run-footprint').textContent = liveRuns.length ? `Footprint: ${liveRuns.length}/${cap} active runs · ${liveRuns.length * 2} app pods (100m CPU / 64Mi each) + ${liveRuns.length} edge pod — laptop limit enforced.` : `Footprint: 0/${cap} active runs.`;
       const arch = state.archivedRuns || [];
       const box = $('archived-list');
       box.innerHTML = arch.length ? 'Archived evidence: ' : '';

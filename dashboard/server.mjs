@@ -181,7 +181,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const path = url.pathname;
   if (req.method === 'GET' && path === '/api/state') {
-    return send(res, 200, { ...state, load: loadState(), profiles: profilesPayload(), runs: [...runs.values()].map(describeRun), archivedRuns: [...archives.keys()] });
+    return send(res, 200, { ...state, load: loadState(), profiles: profilesPayload(), runs: [...runs.values()].map(describeRun), archivedRuns: [...archives.keys()], maxActiveRuns: MAX_ACTIVE_RUNS });
   }
   if (req.method === 'GET' && path === '/api/cluster') return send(res, 200, await clusterState());
   if (req.method === 'GET' && path === '/api/load') return send(res, 200, loadState());
@@ -194,7 +194,13 @@ const server = http.createServer(async (req, res) => {
       if (live) return send(res, 200, buildArchive(live));
       const archived = archives.get(runParam);
       if (archived) return send(res, 200, archived);
-      return send(res, 404, { error: `Unknown run: ${runParam}` });
+      // Archive files survive dashboard restarts; serve them as a fallback.
+      try {
+        const file = await readFile(join(resultsDir, `archive-${runParam}.json`), 'utf8');
+        return send(res, 200, JSON.parse(file));
+      } catch {
+        return send(res, 404, { error: `Unknown run: ${runParam}` });
+      }
     }
     return send(res, 200, { scenario: state.scenario, started: state.started, result: state.result, error: state.error, load: loadState(), timeline: state.timeline, events: state.events });
   }

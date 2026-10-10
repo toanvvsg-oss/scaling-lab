@@ -253,6 +253,10 @@ export function describeRun(run) {
     id: run.id, lesson: run.lesson, namespace: run.ns, status: run.status,
     createdAt: run.createdAt, error: run.error || null, steps: run.steps,
     load: run.load ? run.load.state() : { active: false },
+    resources: {
+      appReplicas: 2, appCpuRequest: '100m', appMemoryRequest: '64Mi',
+      edgeReplicas: 1, note: 'Fixed footprint per run: 2 app pods (100m/64Mi each) + 1 edge pod. Active-run limit keeps laptop usage bounded.',
+    },
   };
 }
 

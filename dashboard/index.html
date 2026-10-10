@@ -30,6 +30,7 @@
             <p class="micro">Each run gets its own namespace <code>scaling-run-&lt;id&gt;</code> with app, edge, and KEDA scaler (max 2 active). Switching runs never touches another run.</p>
             <div class="actions"><button id="run-new">New run</button><select id="run-select"></select><button id="run-evidence">Download evidence</button><button id="run-cleanup-open">Clean up run…</button></div>
             <p id="run-panel-state" class="micro">No runs yet — create one to start.</p>
+            <p id="run-footprint" class="micro"></p>
             <p id="archived-list" class="micro"></p>
           </div>
           <div id="load-panel" hidden>
