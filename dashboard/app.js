@@ -12,6 +12,8 @@ const ACTION_DEFS = {
   connections: [
     ['reuse-batch', 'Send 8 reused requests', 'One client socket, eight requests — check the shared edge connection ID.'],
     ['fresh-batch', 'Send 8 fresh requests', 'Eight new sockets — each should get its own edge connection ID.'],
+    ['demo-404', 'Demo app 404', 'Predefined safe route that returns an app-emitted 404 with a pod ID.'],
+    ['demo-500', 'Demo app 500', 'Predefined safe route that returns an app-emitted 500 with a pod ID.'],
   ],
   timeouts: [
     ['short-gap', 'Probe 1s idle gap', 'Short pause: both connections should survive.'],
@@ -198,6 +200,43 @@ async function createRunForLesson(lesson, statusEl){
 function setCreatingDisabled(disabled){
   for (const id of ['run-new', 'reset-confirm']) { const el = $(id); if (el) el.disabled = disabled; }
 }
+function renderStatus(stats){
+  const box = $('status-stats');
+  const errBox = $('status-errors');
+  if (!box) return;
+  if (!stats || !stats.total) {
+    box.textContent = 'No responses counted yet (missing, not zero). Denominator: counted client responses in this run, cumulative.';
+    if (errBox) errBox.innerHTML = '';
+    return;
+  }
+  // error% is 4xx+5xx over counted client responses; redirects are
+  // retained separately (never errors) and transport has its own ratio.
+  const errors = (stats.http4xx || 0) + (stats.http5xx || 0);
+  const pct = stats.total ? (100 * errors / stats.total).toFixed(1) : '0.0';
+  const tpct = stats.total ? (100 * (stats.transport || 0) / stats.total).toFixed(1) : '0.0';
+  const partial = stats.partial ? ` · partial ${stats.partial}` : '';
+  const redir = stats.http3xx ? ` · 3xx ${stats.http3xx}` : '';
+  box.textContent = `2xx ${stats.ok2xx || 0}${redir} · 4xx ${stats.http4xx || 0} · 5xx ${stats.http5xx || 0} · transport ${stats.transport || 0}${partial} · error ${pct}% 4xx+5xx (${errors} of ${stats.total} counted client responses, cumulative per run) · transport ${tpct}%`;
+  if (!errBox) return;
+  const rows = (stats.recentErrors || []).slice(0, 5);
+  errBox.innerHTML = rows.map(e => {
+    const label = e.status != null ? `HTTP ${e.status}` : `transport ${escape(e.transport || 'error')}`;
+    return `<div class="status-error">${escape(label)} · pod ${escape(e.pod || 'unknown')} · req ${escape(e.requestId || 'unknown')}<span class="hint">${escape(e.hint || '')}</span></div>`;
+  }).join('');
+}
+// View-only observation width toggle: pure DOM class change, no cluster
+// calls, no run/load mutation. Preserves selection, load, pause, cursor.
+function setObserveExpanded(expanded){
+  const layout = document.querySelector('.layout');
+  const btn = $('observe-toggle');
+  if (!layout || !btn) return;
+  layout.classList.toggle('observe-expanded', Boolean(expanded));
+  btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  btn.textContent = expanded ? 'Collapse' : 'Expand';
+}
+function isObserveExpanded(){
+  return Boolean(document.querySelector('.layout')?.classList.contains('observe-expanded'));
+}
 async function refresh(){
   if (frozenView) return; // whole observation stays frozen: pods, endpoints, events, trace
   if (refreshActive) { refreshQueued = true; return; }
@@ -254,6 +293,7 @@ async function refreshInner(){
     }
     if (!alive()) return;
     renderStepper(runDetail);
+    renderStatus(runDetail ? runDetail.statusStats : state.statusStats);
     $('pods').innerHTML=pods?.length?pods.map(x=>`<div class="pod ${x.terminating?'terminating':x.ready?'':'not-ready'}" title="${escape(x.name)}">${escape(x.name)} · ${x.terminating?'terminating':x.ready?'ready':'not ready'}</div>`).join(''):'No application pods';
     $('endpoints').innerHTML=endpoints?.length?endpoints.map(x=>`<div class="endpoint ${x.terminating?'terminating':x.ready?'':'not-ready'}" title="${escape(x.pod)}">${escape(x.pod)} · ${x.terminating?'terminating':x.ready?'ready':'not ready'}</div>`).join(''):'No endpoints';
     const scenarioBusy = active ? active.scenarioRunning : state.running;
@@ -377,6 +417,7 @@ function summarizeAction(s){
   if (s.shared !== undefined) return s.shared ? 'one shared edge connection' : 'distinct edge connections';
   if (s.allDistinct !== undefined) return s.allDistinct ? 'all fresh connections distinct' : 'some connections reused';
   if (s.clientReused !== undefined) return `client ${s.clientReused ? 'reused' : 'renewed'}`;
+  if (s.action === 'demo-404' || s.action === 'demo-500') return s.status != null ? `app returned HTTP ${s.status}` : 'no response';
   if (s.complete !== undefined) return s.complete ? `completed in ${s.ms}ms` : 'interrupted';
   if (s.pod) return `serving pod ${s.pod}`;
   if (s.rolled) return 'rollout finished';
@@ -439,6 +480,12 @@ $('load-start').onclick=()=>loadAction('start');
 $('load-inc').onclick=()=>loadAction('increase');
 $('load-dec').onclick=()=>loadAction('decrease');
 $('load-stop').onclick=()=>loadAction('stop');
+if ($('observe-toggle')) {
+  $('observe-toggle').onclick=()=>setObserveExpanded(!isObserveExpanded());
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isObserveExpanded()) setObserveExpanded(false);
+  });
+}
 async function predictClick(b){
   const btn = b?.dataset ? b : this;
   const body = { guess: btn.dataset.guess, lesson: lessons[current].id };

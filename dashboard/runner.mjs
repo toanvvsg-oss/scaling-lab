@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { gradeConnections, gradeTimeout, gradeShutdown, gradeRollout, gradeStream } from './grade.mjs';
+import { gradeAutoscale, gradeConnections, gradePrometheus, gradeTimeout, gradeShutdown, gradeRollout, gradeStream } from './grade.mjs';
 
 const runFile = promisify(execFile);
 const base = 'http://127.0.0.1:8080';
@@ -43,17 +43,23 @@ function startRequest(path, agent, baseUrl = base) {
   const done = new Promise(resolve => { onDone = resolve; });
   const started = Date.now();
   let headerSent = false;
+  let seen = null;
   const req = http.get(`${baseUrl}${path}`, { agent, timeout: 30000 }, res => {
     headerSent = true;
+    seen = { status: res.statusCode ?? null, pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'] };
     onHeaders({ pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], status: res.statusCode });
     const chunks = [];
     res.on('data', x => chunks.push(x));
     res.on('end', () => onDone({ ok: res.statusCode === 200, complete: true, status: res.statusCode, pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], ms: Date.now() - started, body: Buffer.concat(chunks).toString() }));
-    res.on('error', error => onDone({ ok: false, complete: false, error: error.code || error.message, pod: res.headers['x-pod'], ms: Date.now() - started }));
+    // Headers seen then connection broke: interrupted response. Preserve the
+    // headers-seen status/identity separately from completed counters.
+    res.on('error', error => onDone({ ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started, headersSeen: true, partial: true, observedStatus: seen?.status ?? null, status: null, pod: seen?.pod, requestId: seen?.requestId, edgeConnection: seen?.edgeConnection, appConnection: seen?.appConnection }));
   });
   req.on('timeout', () => req.destroy(new Error('request timeout')));
   req.on('error', error => {
     if (!headerSent) onHeaders({ error: error.code || error.message });
+    // Pre-headers failure: no status observed. Post-headers socket errors
+    // surface via res 'error' above with headersSeen instead.
     onDone({ ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started });
   });
   return { headers, done };
@@ -67,10 +73,11 @@ async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1, 
   while (Date.now() < until) {
     const task = startRequest(path, agent, baseUrl).done.then(x => {
       const n = ++observed;
-      // Successful samples go to the trace as 'sample' (no milestone);
-      // failures keep the 'request' type so they milestone.
-      if (x.ok && (n % emitEvery === 0)) emit('sample', { pod: x.pod, ok: true, ms: x.ms, requestId: x.requestId, edgeConnection: x.edgeConnection, appConnection: x.appConnection });
-      else if (!x.ok) emit('request', { pod: x.pod, ok: x.ok, status: x.status, error: x.error, ms: x.ms, requestId: x.requestId });
+      // Per-response accounting for EVERY response (render-free 'http-result').
+      // Trace sampling stays emitEvery-gated for ok; failures milestone.
+      emit('http-result', { ...x });
+      if (x.ok && (n % emitEvery === 0)) emit('sample', { pod: x.pod, ok: true, complete: true, status: x.status ?? 200, ms: x.ms, requestId: x.requestId, edgeConnection: x.edgeConnection, appConnection: x.appConnection });
+      else if (!x.ok) emit('request', { pod: x.pod, ok: x.ok, complete: x.complete === true, status: x.status ?? null, observedStatus: x.observedStatus ?? null, headersSeen: x.headersSeen === true, partial: x.partial === true, error: x.error ?? null, ms: x.ms, requestId: x.requestId });
       return x;
     });
     requests.push(task);
@@ -208,18 +215,7 @@ async function runPrometheusScenario(emit, opts = {}) {
       final = state.pods.filter(x => !x.terminating).length;
       stableDown = state.pods.length === initial && state.pods.every(x => x.ready && !x.terminating);
     }
-    const checks = [
-      { pass: scrapeTargets >= 2, label: 'Prometheus scraped both starting app pods' },
-      { pass: peakRps > 10, label: 'PromQL observed request demand above the 5 req/s per-pod target' },
-      { pass: peak > initial, label: 'KEDA and HPA added app replicas under request load' },
-      { pass: stableDown, label: 'Replicas returned to baseline after the request rate fell' },
-      { pass: drain.length > 0 && drain.every(x => x.ok), label: 'Sampled requests succeeded during scale down' }
-    ];
-    return {
-      status: checks.every(x => x.pass) ? 'pass' : 'fail',
-      checks,
-      evidence: { query: rateQuery, thresholdRpsPerPod: 5, scrapeTargets, initial, peak, final, peakRps, loadRequests: load.length, loadFailures: load.filter(x => !x.ok).length, drainRequests: drain.length, drainFailures: drain.filter(x => !x.ok).slice(0, 10) }
-    };
+    return gradePrometheus({ scrapeTargets, peakRps, peak, initial, final, stableDown, load, drain, query: rateQuery, thresholdRpsPerPod: 5 });
   } finally { forward.close(); }
 }
 
@@ -234,12 +230,14 @@ export async function runScenario(id, options, emit) {
     for (let i = 0; i < 8; i++) {
       const r = await startRequest('/fast', agent, baseUrl).done;
       reused.push(r.edgeConnection);
+      emit('http-result', { ...r, body: undefined });
       emit('request', { group: 'keep-alive', ...r, body: undefined });
     }
     agent.destroy();
     for (let i = 0; i < 8; i++) {
       const r = await startRequest('/fast', false, baseUrl).done;
       fresh.push(r.edgeConnection);
+      emit('http-result', { ...r, body: undefined });
       emit('request', { group: 'new connection', ...r, body: undefined });
     }
     return gradeConnections(reused, fresh);
@@ -248,9 +246,11 @@ export async function runScenario(id, options, emit) {
     async function pair(gapMs) {
       const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
       const first = await startRequest('/fast', agent, baseUrl).done;
+      emit('http-result', { ...first, body: undefined });
       emit('request', { group: `${gapMs}ms idle`, ...first, body: undefined });
       await sleep(gapMs);
       const second = await startRequest('/fast', agent, baseUrl).done;
+      emit('http-result', { ...second, body: undefined });
       emit('request', { group: `${gapMs}ms idle`, ...second, body: undefined });
       agent.destroy();
       return [first, second];
@@ -275,6 +275,7 @@ export async function runScenario(id, options, emit) {
     emit('pod-delete', { pod: slowHeaders.pod });
     await kubectl(ns, 'delete', 'pod', slowHeaders.pod, '--wait=false');
     const slow = { ...await slowReq.done, pod: slowHeaders.pod };
+    emit('http-result', { ...slow, body: undefined });
     emit('slow-end', slow);
     const samples = await background;
     stopLogWatch();
@@ -307,7 +308,8 @@ export async function runScenario(id, options, emit) {
     emit('pod-delete', { pod: streamHeaders.pod });
     await kubectl(ns, 'delete', 'pod', streamHeaders.pod, '--wait=false');
     const stream = { ...await streamRequest.done, pod: streamHeaders.pod };
-    emit('stream-end', { pod: stream.pod, complete: stream.complete, error: stream.error });
+    emit('http-result', { ...stream, body: undefined });
+    emit('stream-end', { pod: stream.pod, complete: stream.complete, status: stream.status ?? null, observedStatus: stream.observedStatus ?? null, headersSeen: stream.headersSeen === true, partial: stream.partial === true, error: stream.error, requestId: stream.requestId ?? null });
     stopLogWatch();
     return gradeStream({ stream, deletedPod: streamHeaders.pod });
   }
@@ -331,18 +333,7 @@ export async function runScenario(id, options, emit) {
       stableDown = current.pods.length === initial && current.pods.every(x => x.ready && !x.terminating);
       emit('hpa', { text: `Current ${final}, desired ${current.hpa?.desired ?? '?'} replicas` });
     }
-    const grew = peak > initial;
-    const shrank = grew && stableDown;
-    const drainClean = drainSamples.length > 0 && drainSamples.every(x => x.ok);
-    return {
-      status: grew && shrank && drainClean ? 'pass' : 'fail',
-      checks: [
-        { pass: grew, label: 'HPA added replicas during CPU load' },
-        { pass: shrank, label: 'HPA returned to the starting replica count after load ended' },
-        { pass: drainClean, label: 'Sampled requests succeeded during scale down' }
-      ],
-      evidence: { initial, peak, final, stableDown, loadRequests: samples.length, loadFailures: samples.filter(x => !x.ok).length, drainRequests: drainSamples.length, drainFailures: drainSamples.filter(x => !x.ok).slice(0, 10) }
-    };
+    return gradeAutoscale({ initial, peak, final, stableDown, samples, drainSamples });
   }
   if (id === 'prometheus') return runPrometheusScenario(emit, options);
   throw new Error('Unknown scenario');

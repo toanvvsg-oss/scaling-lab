@@ -8,8 +8,52 @@ const shutdownMs = Number(process.env.SHUTDOWN_MS || 24000);
 let ready = true;
 let active = 0;
 let requestsTotal = 0;
+let openSockets = 0;
 let nextConnection = 0;
 const connections = new WeakMap();
+// Completed-response counters by bounded dimensions only: method is a fixed
+// allowlist, route is a normalized learner-route name (never a raw path),
+// status is the numeric code the app actually wrote. Transport-level failures
+// (resets/timeouts with no response) never invent a status here; they stay
+// visible only in client-observed dashboard stats, since /metrics cannot see
+// proxy-emitted 502/504.
+const responsesByStatus = new Map();
+
+function routeName(pathname) {
+  if (pathname === '/fast') return 'fast';
+  if (pathname === '/slow') return 'slow';
+  if (pathname === '/cpu') return 'cpu';
+  if (pathname === '/stream') return 'stream';
+  if (pathname === '/demo/404') return 'demo-404';
+  if (pathname === '/demo/500') return 'demo-500';
+  return 'other';
+}
+
+function methodName(method) {
+  if (method === 'GET' || method === 'POST' || method === 'HEAD') return method;
+  return 'OTHER';
+}
+
+function statusClassOf(status) {
+  if (status >= 200 && status < 300) return '2xx';
+  if (status >= 400 && status < 500) return '4xx';
+  if (status >= 500 && status < 600) return '5xx';
+  return 'other';
+}
+
+function recordResponse(method, route, status) {
+  const key = `${method}|${route}|${status}|${statusClassOf(status)}`;
+  responsesByStatus.set(key, (responsesByStatus.get(key) || 0) + 1);
+}
+
+function renderResponses(label) {
+  const lines = [];
+  for (const [key, count] of [...responsesByStatus.entries()].sort()) {
+    const [method, route, status, statusClass] = key.split('|');
+    lines.push(`scaling_lab_http_responses_total{pod=${label},method="${method}",route="${route}",status="${status}",status_class="${statusClass}"} ${count}`);
+  }
+  return lines.join('\n');
+}
 
 function log(event, fields = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, pod, active, ...fields }));
@@ -38,12 +82,17 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/metrics') {
     const label = JSON.stringify(pod);
     res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' });
-    res.end(`# HELP scaling_lab_http_requests_total Application HTTP requests excluding probes and metrics\n# TYPE scaling_lab_http_requests_total counter\nscaling_lab_http_requests_total{pod=${label}} ${requestsTotal}\n# HELP scaling_lab_http_inflight_requests Requests currently being handled\n# TYPE scaling_lab_http_inflight_requests gauge\nscaling_lab_http_inflight_requests{pod=${label}} ${active}\n`);
+    const responses = renderResponses(label);
+    res.end(`# HELP scaling_lab_http_requests_total Application HTTP requests excluding probes and metrics\n# TYPE scaling_lab_http_requests_total counter\nscaling_lab_http_requests_total{pod=${label}} ${requestsTotal}\n# HELP scaling_lab_http_responses_total Completed HTTP responses by bounded method/route/status; excludes probes and lifecycle\n# TYPE scaling_lab_http_responses_total counter\n${responses ? responses + '\n' : ''}# HELP scaling_lab_http_inflight_requests Requests currently being handled\n# TYPE scaling_lab_http_inflight_requests gauge\nscaling_lab_http_inflight_requests{pod=${label}} ${active}\n# HELP scaling_lab_http_open_sockets Currently open TCP sockets\n# TYPE scaling_lab_http_open_sockets gauge\nscaling_lab_http_open_sockets{pod=${label}} ${openSockets}\n`);
     return;
   }
   requestsTotal++;
   active++;
   const request = req.headers['x-request-id'] || randomUUID();
+  const route = routeName(url.pathname);
+  const method = methodName(req.method);
+  const finishWith = (status) => { try { recordResponse(method, route, status); } catch { /* metrics never break responses */ } };
+  res.on('finish', () => finishWith(res.statusCode));
   res.setHeader('x-pod', pod);
   res.setHeader('x-app-connection', String(connection));
   res.setHeader('x-request-id', request);
@@ -69,6 +118,13 @@ const server = http.createServer(async (req, res) => {
       else res.write(`${pod} tick ${count}\n`);
     }, 500);
     res.once('close', () => clearInterval(timer));
+  } else if (url.pathname === '/demo/404') {
+    // Intentional safe 404 for learning: a completed app-emitted response
+    // with an x-pod header, distinct from edge 502/504 which lack one.
+    reply(res, 404, { error: 'demo-not-found', pod, request, route: 'demo-404', hint: 'App returned 404 for the predefined demo route. Compare with transport resets, which have no HTTP status.' });
+  } else if (url.pathname === '/demo/500') {
+    // Intentional safe 500 for learning: app-emitted, counted in responses_total.
+    reply(res, 500, { error: 'demo-failure', pod, request, route: 'demo-500', hint: 'App returned 500 for the predefined demo route. Compare with edge 502/504 during rollouts, which the app never sees.' });
   } else {
     reply(res, 200, { pod, request, connection, ready, active, mode, keepAliveBudgetMs: server.keepAliveTimeout + (server.keepAliveTimeoutBuffer || 0) });
   }
@@ -79,8 +135,9 @@ server.headersTimeout = 31000;
 server.on('connection', socket => {
   const id = ++nextConnection;
   connections.set(socket, id);
+  openSockets++;
   log('connection-open', { connection: id });
-  socket.on('close', () => log('connection-close', { connection: id }));
+  socket.on('close', () => { openSockets--; log('connection-close', { connection: id }); });
 });
 
 let stopping = false;

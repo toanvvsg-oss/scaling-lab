@@ -41,10 +41,10 @@ test('connections batches distinguish shared from fresh sockets', async () => {
   const deps = fakeDeps();
   const reused = await runAction(run, 'reuse-batch', {}, emit, deps);
   assert.equal(reused.shared, true);
-  assert.ok(events.every(([t]) => t === 'sample'), 'successes emit sample, never request milestones');
+  assert.ok(events.every(([t]) => t === 'sample' || t === 'http-result'), 'successes emit sample, never request milestones (http-result is render-free accounting)');
   const fresh = await runAction(run, 'fresh-batch', {}, emit, deps);
   assert.equal(fresh.requests, 8);
-  assert.deepEqual(ACTIONS.connections, ['reuse-batch', 'fresh-batch']);
+  assert.deepEqual(ACTIONS.connections, ['reuse-batch', 'fresh-batch', 'demo-404', 'demo-500']);
 });
 
 test('gap probes report client and upstream reuse', async () => {

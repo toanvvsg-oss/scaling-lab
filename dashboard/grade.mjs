@@ -71,3 +71,42 @@ export function gradeStream({ stream, deletedPod }) {
     evidence: { deletedPod, complete: stream?.complete, ticks, error: stream?.error, durationMs: stream?.ms }
   };
 }
+
+export function gradeAutoscale({ initial, peak, final, stableDown, samples, drainSamples }) {
+  const load = samples || [];
+  const drain = drainSamples || [];
+  const grew = peak > initial;
+  // The stableDown flag alone is not enough: the replica count must actually
+  // equal the starting count, or a stale/foreign flag could fake a pass.
+  const shrank = grew && stableDown === true && final === initial;
+  const drainClean = drain.length > 0 && drain.every(x => x.ok);
+  const observed = load.length > 0 && drain.length > 0;
+  const checks = [
+    { pass: grew, label: 'HPA added replicas during CPU load' },
+    { pass: shrank, label: 'HPA returned to the starting replica count after load ended' },
+    { pass: drainClean, label: 'Sampled requests succeeded during scale down' }
+  ];
+  return {
+    status: !observed ? 'inconclusive' : checks.every(x => x.pass) ? 'pass' : 'fail',
+    checks,
+    evidence: { initial, peak, final, stableDown, loadRequests: load.length, loadFailures: load.filter(x => !x.ok).length, drainRequests: drain.length, drainFailures: drain.filter(x => !x.ok).slice(0, 10) }
+  };
+}
+
+export function gradePrometheus({ scrapeTargets, peakRps, peak, initial, final, stableDown, load, drain, query, thresholdRpsPerPod }) {
+  const loadArr = load || [];
+  const drainArr = drain || [];
+  const checks = [
+    { pass: scrapeTargets >= 2, label: 'Prometheus scraped both starting app pods' },
+    { pass: peakRps > 10, label: 'PromQL observed request demand above the 5 req/s per-pod target' },
+    { pass: peak > initial, label: 'KEDA and HPA added app replicas under request load' },
+    { pass: stableDown === true && final === initial, label: 'Replicas returned to baseline after the request rate fell' },
+    { pass: drainArr.length > 0 && drainArr.every(x => x.ok), label: 'Sampled requests succeeded during scale down' }
+  ];
+  const observed = loadArr.length > 0 && drainArr.length > 0;
+  return {
+    status: !observed ? 'inconclusive' : checks.every(x => x.pass) ? 'pass' : 'fail',
+    checks,
+    evidence: { query, thresholdRpsPerPod: thresholdRpsPerPod ?? 5, scrapeTargets, initial, peak, final, stableDown, peakRps, loadRequests: loadArr.length, loadFailures: loadArr.filter(x => !x.ok).length, drainRequests: drainArr.length, drainFailures: drainArr.filter(x => !x.ok).slice(0, 10) }
+  };
+}

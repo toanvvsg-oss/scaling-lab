@@ -6,6 +6,7 @@ import { clusterState, runScenario } from './runner.mjs';
 import { LoadSession, PROFILES, CPU_PROFILES, profileSet } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, runReset } from './reset.mjs';
+import { recordStatus, emptyStats, summarizeStats } from './status.mjs';
 import { queryPrometheus, queryRunSamples, LEGACY_RATE_QUERY, rateQueryForRun, upQueryForRun, counterSelForRun, upSelForRun } from './prometheus.mjs';
 import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns } from './runs.mjs';
 import { runAction } from './actions.mjs';
@@ -54,16 +55,34 @@ function send(res, status, value) {
 export function createApp(overrides = {}) {
   const io = { ...prodDeps, ...overrides };
   const R = io.runsApi;
-  const state = { running: false, scenario: null, events: [], rev: 0, result: null, error: null, started: null, resetting: false, resetSteps: [], load: null, timeline: createHistory(), predictions: {} };
+  const state = { running: false, scenario: null, events: [], rev: 0, result: null, error: null, started: null, resetting: false, resetSteps: [], load: null, timeline: createHistory(), predictions: {}, statusStats: emptyStats() };
   let booted = false;
 
+  function ensureStats(store) {
+    if (!store.statusStats) store.statusStats = emptyStats();
+    return store.statusStats;
+  }
+
   function pushEvent(store, type, data) {
+    // Render-free per-response accounting: exactly one 'http-result' event
+    // per client response folds into cumulative per-store totals. It is
+    // handled BEFORE appending anything to the trace history: no event
+    // stored, no rev bump, no milestone. Trace sampling ('sample' subsets,
+    // 'request' failures, slow-end/stream-end markers) is render-only and
+    // never counted, so totals are not skewed by sampling and accounting
+    // can never evict meaningful trace events. The scenario-completion
+    // 'result' marker below ({status: pass|fail|...}) is a different type
+    // and is never folded into HTTP totals.
+    if (type === 'http-result') {
+      try { recordStatus(ensureStats(store), data || {}, new Date().toISOString()); } catch { /* stats never break events */ }
+      return { at: new Date().toISOString(), type, data };
+    }
     const event = { at: new Date().toISOString(), type, data };
     store.events.push(event);
     if (store.events.length > 2500) store.events.shift();
     store.rev = (store.rev || 0) + 1;
     if (type === 'request') {
-      if (data?.ok === false) pushMilestone(store.timeline, { at: event.at, kind: 'failure', text: `Request failure ${data.error || data.status || ''}`, detail: `Pod ${data.pod || 'unknown'} returned an error. Failures do not drive scaling directly; they signal overload or draining pods.`, observer: 'dashboard load client' });
+      if (data?.ok === false) pushMilestone(store.timeline, { at: event.at, kind: 'failure', text: `Request failure ${data.status != null ? `HTTP ${data.status}` : data.error || 'transport'} · pod ${data.pod || 'unknown'} · req ${data.requestId || 'unknown'}`, detail: `Client-observed ${data.status != null ? `HTTP ${data.status}` : `transport ${data.error || 'error'}`}. This is what the client saw through the edge; app /metrics cannot show proxy 502/504. Check the failed sample's pod/requestId and Ready endpoints before concluding a cause. Failures do not drive scaling directly.`, observer: 'dashboard load client' });
       return event;
     }
     // Sampled successful requests and preStop markers feed the trace lanes;
@@ -108,6 +127,7 @@ export function createApp(overrides = {}) {
         offeredTarget: load.active ? load.targetRps : 0,
         achievedRps: load.active ? load.achievedLastSecond : 0,
         observedRps: rate.value, observedAt: rate.at, stale: rate.stale,
+        status: summarizeStats(ensureStats(state)),
         desired: cluster.hpa?.desired ?? null, actual, ready,
       });
     } finally { sampling = false; }
@@ -157,6 +177,7 @@ export function createApp(overrides = {}) {
           counterTotal: counter.total, sampleAt: counter.at,
           scrapeTargets: targets.stale ? null : targets.value,
           scrapeOk: counter.upAllOne,
+          status: summarizeStats(ensureStats(run)),
           desired: snap.hpa?.desired ?? null,
           currentCPU: snap.hpa?.currentCPU ?? null,
           cpuTarget: snap.hpa?.cpuTarget ?? null,
@@ -262,6 +283,7 @@ function summarizeAction(s) {
   if (s.shared !== undefined) return s.shared ? 'one shared edge connection' : 'distinct edge connections';
   if (s.allDistinct !== undefined) return s.allDistinct ? 'all fresh connections distinct' : 'some connections reused';
   if (s.clientReused !== undefined) return `client ${s.clientReused ? 'reused' : 'renewed'}, upstream ${s.upstream.after[0] === s.upstream.before[0] && s.upstream.after[1] === s.upstream.before[1] ? 'reused' : 'reconnected'}`;
+  if (s.action === 'demo-404' || s.action === 'demo-500') return s.status != null ? `app returned HTTP ${s.status} · pod ${s.pod || 'unknown'}` : `no response (${s.error || 'transport'})`;
   if (s.complete !== undefined) return s.complete ? `completed in ${s.ms}ms` : `interrupted (${s.error || 'no response'})`;
   if (s.pod && !s.complete && s.action?.startsWith('start')) return `serving pod ${s.pod}`;
   if (s.rolled) return 'rollout finished';

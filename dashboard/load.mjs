@@ -73,17 +73,25 @@ function get(endpoint, path, agent, timeoutMs = 8000) {
   return new Promise((resolve) => {
     const started = Date.now();
     const req = http.get(`${endpoint}${path}`, { agent, timeout: timeoutMs }, (res) => {
+      // Headers seen: preserve status + identity for partial-reset
+      // diagnostics. A later 'error' before 'end' is an interrupted
+      // response (transport), not a completed one.
+      const seen = {
+        status: res.statusCode ?? null,
+        pod: res.headers['x-pod'], requestId: res.headers['x-request-id'],
+        edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'],
+      };
       const chunks = [];
       res.on('data', (x) => chunks.push(x));
       res.on('end', () => resolve({
-        ok: res.statusCode === 200, status: res.statusCode, ms: Date.now() - started,
+        ok: res.statusCode === 200, complete: true, status: res.statusCode, ms: Date.now() - started,
         pod: res.headers['x-pod'], requestId: res.headers['x-request-id'],
         edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'],
       }));
-      res.on('error', (error) => resolve({ ok: false, error: error.code || error.message, ms: Date.now() - started }));
+      res.on('error', (error) => resolve({ ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started, headersSeen: true, partial: true, observedStatus: seen.status, status: null, pod: seen.pod, requestId: seen.requestId, edgeConnection: seen.edgeConnection, appConnection: seen.appConnection }));
     });
     req.on('timeout', () => req.destroy(new Error('request timeout')));
-    req.on('error', (error) => resolve({ ok: false, error: error.code || error.message, ms: Date.now() - started }));
+    req.on('error', (error) => resolve({ ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started }));
   });
 }
 
@@ -251,15 +259,18 @@ export class LoadSession {
         const intervalMs = 1000 / Math.max(1, this.targetRps);
         const task = get(this.endpoint, path, agent).then((r) => {
           this.total += 1;
+          // Per-response accounting for EVERY response (render-free 'http-result'
+          // event). Trace sampling below stays a 1-in-10 subset for ok.
+          this.emit('http-result', { ...r });
           if (r.ok) {
             this.succeeded += 1;
             windowOk += 1;
             if (++sampleCount % 10 === 0) {
-              this.emit('sample', { pod: r.pod, ok: true, ms: r.ms, requestId: r.requestId, edgeConnection: r.edgeConnection, appConnection: r.appConnection });
+              this.emit('sample', { pod: r.pod, ok: true, complete: true, status: r.status, ms: r.ms, requestId: r.requestId, edgeConnection: r.edgeConnection, appConnection: r.appConnection });
             }
           } else {
             this.failures += 1;
-            this.emit('request', { pod: r.pod, ok: false, status: r.status, error: r.error, ms: r.ms, requestId: r.requestId });
+            this.emit('request', { pod: r.pod, ok: false, complete: r.complete === true, status: r.status ?? null, observedStatus: r.observedStatus ?? null, headersSeen: r.headersSeen === true, partial: r.partial === true, error: r.error ?? null, ms: r.ms, requestId: r.requestId });
           }
           this._inflight.delete(task);
           return r;

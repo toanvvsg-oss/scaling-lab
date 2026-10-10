@@ -92,6 +92,7 @@ export async function adoptOrphanRuns(deps = realDeps) {
       createdAt: ns.metadata.creationTimestamp || new Date().toISOString(),
       steps: [], events: [], timeline: createHistory(), result: null,
       load: null, forward: null, forwardPort: null, prev: null, readopted: true,
+      statusStats: { total: 0, ok2xx: 0, http3xx: 0, http4xx: 0, http5xx: 0, httpOther: 0, transport: 0, partial: 0, byStatus: {}, recentErrors: [] },
     };
     if (present) {
       try {
@@ -364,6 +365,7 @@ export function describeRun(run) {
     id: run.id, lesson: run.lesson, namespace: run.ns, status: run.status,
     createdAt: run.createdAt, error: run.error || null, steps: run.steps,
     load: run.load ? run.load.state() : { active: false },
+    statusStats: run.statusStats || { total: 0, ok2xx: 0, http3xx: 0, http4xx: 0, http5xx: 0, httpOther: 0, transport: 0, partial: 0, byStatus: {}, recentErrors: [] },
     readopted: Boolean(run.readopted),
     scenario: run.scenario || null,
     scenarioRunning: Boolean(run.scenarioRunning),
@@ -391,6 +393,7 @@ export function beginRun(lesson, onEvent, deps = realDeps) {
     id, ns, lesson, status: 'creating', createdAt: new Date().toISOString(),
     error: null, steps: [], events: [], timeline: createHistory(), result: null,
     load: null, forward: null, forwardPort: null, prev: null,
+    statusStats: { total: 0, ok2xx: 0, http3xx: 0, http4xx: 0, http5xx: 0, httpOther: 0, transport: 0, partial: 0, byStatus: {}, recentErrors: [] },
   };
   runs.set(id, run);
   return run;
@@ -459,6 +462,7 @@ export function buildArchive(run) {
     run: run.id, lesson: run.lesson, namespace: run.ns, createdAt: run.createdAt,
     archivedAt: new Date().toISOString(), status: run.status, error: run.error,
     steps: run.steps, load: run.load ? run.load.state() : null,
+    statusStats: run.statusStats || { total: 0, ok2xx: 0, http3xx: 0, http4xx: 0, http5xx: 0, httpOther: 0, transport: 0, partial: 0, byStatus: {}, recentErrors: [] },
     result: run.result, timeline: run.timeline, events: run.events,
   };
 }

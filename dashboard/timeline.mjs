@@ -16,6 +16,7 @@ export function pushPoint(history, point) {
     sampleAt: point.sampleAt || null,
     scrapeTargets: point.scrapeTargets ?? null,
     scrapeOk: point.scrapeOk ?? null,
+    status: point.status ?? null,
     desired: point.desired ?? null,
     actual: point.actual ?? null,
     ready: point.ready ?? null,

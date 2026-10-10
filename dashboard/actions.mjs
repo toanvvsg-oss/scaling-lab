@@ -5,7 +5,7 @@ import { kubectlIn, startRequest, traffic, watchPodLogs } from './runner.mjs';
 // the run namespace and returns a summary for the UI. The one-click verifier
 // stays available as an automatic shortcut.
 export const ACTIONS = {
-  connections: ['reuse-batch', 'fresh-batch'],
+  connections: ['reuse-batch', 'fresh-batch', 'demo-404', 'demo-500'],
   timeouts: ['short-gap', 'long-gap'],
   shutdown: ['start-long', 'terminate-serving'],
   streaming: ['start-stream', 'terminate-serving'],
@@ -51,15 +51,29 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
         for (let i = 0; i < 8; i++) {
           const r = await deps.startRequest('/fast', agent, base).done;
           ids.push(r.edgeConnection);
+          emit('http-result', { ...strip(r) });
           emit('sample', { group: 'keep-alive', ...strip(r) });
         }
         return { action, requests: 8, edgeIds: ids, shared: new Set(ids).size === 1 };
+      }
+      case 'demo-404':
+      case 'demo-500': {
+        // Predefined safe error demo: one app-emitted HTTP error response.
+        // The app route always exists, so this never mutates config; it only
+        // produces a completed 4xx/5xx with an x-pod header for comparison
+        // with edge 502/504 and transport resets.
+        const path = action === 'demo-404' ? '/demo/404' : '/demo/500';
+        const r = await deps.startRequest(path, agent, base).done;
+        emit('http-result', { ...strip(r) });
+        emit(r.ok ? 'sample' : 'request', { group: action, ...strip(r) });
+        return { action, status: r.status ?? null, pod: r.pod ?? null, requestId: r.requestId ?? null, error: r.error ?? null };
       }
       case 'fresh-batch': {
         const ids = [];
         for (let i = 0; i < 8; i++) {
           const r = await deps.startRequest('/fast', false, base).done;
           ids.push(r.edgeConnection);
+          emit('http-result', { ...strip(r) });
           emit('sample', { group: 'new connection', ...strip(r) });
         }
         return { action, requests: 8, edgeIds: ids, allDistinct: new Set(ids).size === ids.length };
@@ -69,9 +83,11 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
         const gapMs = action === 'short-gap' ? 1000 : 6500;
         const a = deps.httpAgent({ keepAlive: true, maxSockets: 1 });
         const first = await deps.startRequest('/fast', a, base).done;
+        emit('http-result', { ...strip(first) });
         emit('sample', { group: `${gapMs}ms idle`, ...strip(first) });
         await deps.sleep(gapMs);
         const second = await deps.startRequest('/fast', a, base).done;
+        emit('http-result', { ...strip(second) });
         emit('sample', { group: `${gapMs}ms idle`, ...strip(second) });
         a.destroy();
         return {
@@ -118,16 +134,19 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
         emit(action === 'start-long' ? 'slow-start' : 'stream-start', { ...headers });
         // Natural completion clears the slot, releases the watcher/agent, and
         // emits the completion so the learner can retry or clean up.
+        // 'http-result' carries full accounting (status/requestId) exactly once;
+        // slow-end/stream-end stay trace-only.
         pending.task.done.then((done) => {
           if (run.pendingLong !== pending) return;
           run.pendingLong = null;
           pending.completed = true;
           try { pending.stopWatch(); } catch { /* ignore */ }
           try { pending.agent.destroy(); } catch { /* ignore */ }
+          emit('http-result', { pod: done.pod || pending.pod, requestId: pending.requestId, ok: done.ok, complete: done.complete, status: done.status ?? null, observedStatus: done.observedStatus ?? null, headersSeen: done.headersSeen === true, partial: done.partial === true, error: done.error ?? null, ms: done.ms ?? null, edgeConnection: done.edgeConnection ?? null, appConnection: done.appConnection ?? null });
           emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end',
             pending.kind === 'start-long'
-              ? { pod: done.pod || pending.pod, requestId: pending.requestId, complete: done.complete, ms: done.ms, error: done.error }
-              : { pod: done.pod || pending.pod, requestId: pending.requestId, complete: done.complete, ms: done.ms, error: done.error, ticks: countTicks(done.body) });
+              ? { pod: done.pod || pending.pod, requestId: pending.requestId, ok: done.ok, complete: done.complete, status: done.status ?? null, observedStatus: done.observedStatus ?? null, headersSeen: done.headersSeen === true, partial: done.partial === true, ms: done.ms, error: done.error }
+              : { pod: done.pod || pending.pod, requestId: pending.requestId, ok: done.ok, complete: done.complete, status: done.status ?? null, observedStatus: done.observedStatus ?? null, headersSeen: done.headersSeen === true, partial: done.partial === true, ms: done.ms, error: done.error, ticks: countTicks(done.body) });
         });
         return { action, pod: headers.pod, requestId: headers.requestId };
       }
@@ -147,7 +166,8 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
         try { pending.agent.destroy(); } catch { /* ignore */ }
         const result = { ...done, pod: pending.pod, requestId: pending.requestId };
         if (pending.kind !== 'start-long') result.ticks = countTicks(done.body);
-        emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end', { pod: result.pod, requestId: result.requestId, complete: result.complete, ms: result.ms, error: result.error, ticks: result.ticks });
+        emit('http-result', { pod: result.pod, requestId: result.requestId, ok: result.ok, complete: result.complete, status: result.status ?? null, observedStatus: result.observedStatus ?? null, headersSeen: result.headersSeen === true, partial: result.partial === true, error: result.error ?? null, ms: result.ms ?? null, edgeConnection: result.edgeConnection ?? null, appConnection: result.appConnection ?? null });
+        emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end', { pod: result.pod, requestId: result.requestId, ok: result.ok, complete: result.complete, status: result.status ?? null, observedStatus: result.observedStatus ?? null, headersSeen: result.headersSeen === true, partial: result.partial === true, ms: result.ms, error: result.error, ticks: result.ticks });
         return { action, pod: pending.pod, requestId: pending.requestId, complete: result.complete, ms: result.ms, error: result.error, ticks: result.ticks };
       }
       case 'bg-start': {

@@ -187,7 +187,12 @@ function summaryHtml(point, lesson, timeline) {
   const sampledAt = prom && latest.sampleAt ? ` · stored sample ${fmtClock(latest.sampleAt)}` : '';
   const scrapeNote = prom && latest.scrapeOk === false ? ' · scrape FAILED (not zero)' : '';
   const hpaText = latest.desired == null ? 'desired ?' : `desired ${latest.desired}`;
+  const st = latest.status;
+  const statusLine = st && st.total
+    ? `<span class="timeline-meta">client-observed responses: 2xx ${st.ok2xx ?? 0}${st.http3xx ? ` · 3xx ${st.http3xx}` : ''} · 4xx ${st.http4xx ?? 0} · 5xx ${st.http5xx ?? 0} · transport ${st.transport ?? 0} (denominator: ${st.total} counted client responses, cumulative per run; error% is 4xx+5xx only; transport has no HTTP status; app /metrics cannot see proxy 502/504)</span>`
+    : `<span class="timeline-meta">client-observed responses: none counted yet (missing, not zero)</span>`;
   return `<strong>${esc(head)}</strong><span class="timeline-meta">offered ${latest.offeredRps ?? 0} / achieved ${latest.achievedRps ?? 0} req/s (target ${latest.offeredTarget ?? 0})${esc(scrapedAt)}${esc(sampledAt)}${esc(scrapeNote)} · ${esc(hpaText)} · actual ${latest.actual ?? '?'} · ready ${latest.ready ?? '?'}${latest.terminating ? ` · terminating ${latest.terminating}` : ''} · endpoints ${latest.endpoints ?? '?'}${failCount ? ` · ${failCount} failures` : ''}${prom ? ' · target 5 req/s per pod' : ''}${cpu && latest.currentCPU != null ? ` · CPU ${latest.currentCPU}% (target ${latest.cpuTarget ?? 60}%)` : ''}</span>`
+    + statusLine
     + (prom && latest.counterTotal != null ? `<span class="timeline-meta">raw counter ${Math.round(latest.counterTotal)} requests · scrape targets ${latest.scrapeTargets ?? '?'}${latest.externalCurrent != null ? ` · KEDA external avg ${latest.externalCurrent} req/s per pod (target ${latest.externalTarget ?? '?'} avg)` : (latest.externalRaw != null ? ` · KEDA external unavailable (raw ${escape(String(latest.externalRaw))})` : '')}</span>` : '');
 }
 

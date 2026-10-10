@@ -85,6 +85,19 @@ export function counterSelForRun(runId) {
   return `scaling_lab_http_requests_total{job="scaling-app",labrun="${runId}"}`;
 }
 
+// Completed-response selectors by bounded status class. The app exposes
+// scaling_lab_http_responses_total{method,route,status,status_class}; the
+// legacy requests_total stays the KEDA/autoscale denominator.
+export function responsesSelForRun(runId, statusClass) {
+  if (!/^[a-z0-9]{8}$/.test(runId)) throw new Error(`Invalid run id: ${runId}`);
+  if (!['2xx', '4xx', '5xx'].includes(statusClass)) throw new Error(`Invalid status class: ${statusClass}`);
+  return `scaling_lab_http_responses_total{job="scaling-app",labrun="${runId}",status_class="${statusClass}"}`;
+}
+
+export function responsesRateQueryForRun(runId, statusClass) {
+  return `sum(rate(${responsesSelForRun(runId, statusClass)}[1m]))`;
+}
+
 export function counterQueryForRun(runId) {
   return `sum(${counterSelForRun(runId)})`;
 }
