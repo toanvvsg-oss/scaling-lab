@@ -11,7 +11,7 @@ metadata:
   namespace: scaling-lab
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "services"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -54,6 +54,16 @@ data:
             replacement: $1:3000
           - source_labels: [__meta_kubernetes_namespace]
             target_label: namespace
+      - job_name: kube-state-metrics
+        metrics_path: /metrics
+        kubernetes_sd_configs:
+          - role: service
+            namespaces:
+              names: [scaling-lab]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_label_app]
+            action: keep
+            regex: kube-state-metrics
 ---
 apiVersion: apps/v1
 kind: Deployment

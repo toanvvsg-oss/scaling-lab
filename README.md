@@ -36,7 +36,13 @@ make dashboard
 
 In another terminal, `make prometheus-ui` optionally opens a port-forward for Prometheus at <http://127.0.0.1:19090>.
 
-In Prometheus, inspect **Status → Target health** and query `sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))`. App pods expose the counter at `/metrics`. Prometheus scrapes each pod every five seconds, KEDA reads the query, and its generated HPA changes the Deployment replica count. The dashboard shows the measured rate alongside pod and HPA state while lesson 07 runs.
+In Prometheus, inspect **Status → Target health** and query `sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))`. App pods expose the counter at `/metrics`. Prometheus scrapes each pod every five seconds, KEDA reads the query, and its generated HPA changes the Deployment replica count.
+
+The dashboard's lesson 07 adds manual traffic controls (`steady`, `ramp`, `burst` profiles bounded for a laptop kind cluster), a predict-before-reveal step, and one synchronized cause→effect timeline: offered RPS, Prometheus observed RPS (stale samples are marked, not shown as zero), HPA desired replicas, actual replicas, and Ready replicas, with milestones for load changes, HPA decisions, pod/endpoint changes, and request failures. The one-click scenario and pass/fail verification still work, and raw evidence stays downloadable for replay.
+
+Use **Reset lesson** in the top bar before switching between CPU and Prometheus lessons. Opening another lesson never mutates the cluster; the confirmation dialog names the affected resources (active traffic stops, old `HPA app` or `ScaledObject app-prometheus` / `HPA keda-hpa-app-prometheus` removed, app/edge restored to baseline with possible pod restarts), offers an evidence download, and Cancel leaves everything untouched. A successful reset waits for exactly two Ready app pods and the intended autoscaler, or tells you which `make` target to run. **Delete kind cluster** (`make down`, only the `scaling-lab` cluster) stays separate and is never part of lesson switching.
+
+Grafana is an optional advanced exercise; all guided lessons work without it. After the built-in timeline, try `make grafana-up` (pins `grafana/grafana:11.3.0` plus `kube-state-metrics:v2.12.0`, local only) and `make grafana-ui` (port-forward `service/grafana` to `127.0.0.1:3003`, login `admin` / `scaling-lab`). The provisioned **Scaling Lab - request rate vs replicas** dashboard shows request rate, scrape targets, HPA desired/current replicas, Ready pods, and how to compare with the guided UI.
 
 ```mermaid
 flowchart LR

@@ -4,7 +4,7 @@ KUBECTL := kubectl --context $(CTX)
 SCENARIO ?= connections
 MODE ?= graceful
 
-.PHONY: up check open dashboard reset down test hpa-up prometheus-up prometheus-ui verify
+.PHONY: up check open dashboard reset down test hpa-up prometheus-up prometheus-ui grafana-up grafana-ui verify
 
 up:
 	@kind get clusters | grep -qx $(CLUSTER) || kind create cluster --config k8s/kind.yaml
@@ -29,6 +29,7 @@ open:
 reset:
 	$(KUBECTL) -n scaling-lab delete scaledobject app-prometheus --ignore-not-found
 	$(KUBECTL) -n scaling-lab delete hpa app --ignore-not-found
+	$(KUBECTL) -n scaling-lab delete hpa keda-hpa-app-prometheus --ignore-not-found
 	$(KUBECTL) apply -f k8s/app.yaml -f k8s/proxy.yaml
 	$(KUBECTL) -n scaling-lab rollout restart deployment/app
 	$(KUBECTL) -n scaling-lab rollout restart deployment/edge
@@ -54,6 +55,16 @@ prometheus-up: up
 
 prometheus-ui:
 	$(KUBECTL) -n scaling-lab port-forward service/prometheus 19090:9090
+
+grafana-up:
+	$(KUBECTL) apply -f k8s/grafana.yaml
+	$(KUBECTL) -n scaling-lab rollout status deployment/kube-state-metrics --timeout=180s
+	$(KUBECTL) -n scaling-lab rollout status deployment/grafana --timeout=180s
+	$(KUBECTL) -n scaling-lab rollout status deployment/prometheus --timeout=60s || true
+	@echo 'Grafana is local only. Run make grafana-ui, login admin/scaling-lab, open "Scaling Lab - request rate vs replicas". Compare with the guided timeline: offered RPS, scraped RPS, desired replicas, Ready pods.'
+
+grafana-ui:
+	$(KUBECTL) -n scaling-lab port-forward service/grafana 3003:3000
 
 test:
 	npm test

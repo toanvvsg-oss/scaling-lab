@@ -1,0 +1,209 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: scaling-lab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: scaling-lab-kube-state-metrics
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: scaling-lab-kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: kube-state-metrics
+    namespace: scaling-lab
+roleRef:
+  kind: ClusterRole
+  name: scaling-lab-kube-state-metrics
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: scaling-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app: kube-state-metrics
+    spec:
+      serviceAccountName: kube-state-metrics
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.12.0
+          args: ["--resources=pods,deployments,horizontalpodautoscalers"]
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: scaling-lab
+  labels:
+    app: kube-state-metrics
+spec:
+  selector:
+    app: kube-state-metrics
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: scaling-lab
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.scaling-lab.svc.cluster.local:9090
+        isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: scaling-lab
+data:
+  scaling-lab.json: |
+    {
+      "title": "Scaling Lab - request rate vs replicas",
+      "tags": ["scaling-lab"],
+      "timezone": "browser",
+      "panels": [
+        {"id": 1, "type": "timeseries", "title": "Prometheus observed request rate (req/s)", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "targets": [{"datasource": {"type": "prometheus"}, "expr": "sum(rate(scaling_lab_http_requests_total{job=\"scaling-app\"}[30s]))"}]},
+        {"id": 2, "type": "stat", "title": "Scrape targets up", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "targets": [{"datasource": {"type": "prometheus"}, "expr": "count(up{job=\"scaling-app\"} == 1)"}]},
+        {"id": 3, "type": "timeseries", "title": "HPA desired vs current replicas", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "targets": [{"datasource": {"type": "prometheus"}, "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"scaling-lab\"}", "legendFormat": "desired {{horizontalpodautoscaler}}"}, {"datasource": {"type": "prometheus"}, "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"scaling-lab\"}", "legendFormat": "current {{horizontalpodautoscaler}}"}]},
+        {"id": 4, "type": "timeseries", "title": "Ready app pods", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "targets": [{"datasource": {"type": "prometheus"}, "expr": "kube_deployment_status_replicas_ready{namespace=\"scaling-lab\", deployment=\"app\"}"}]},
+        {"id": 5, "type": "text", "title": "How to compare with the guided UI", "gridPos": {"h": 6, "w": 24, "x": 0, "y": 16}, "options": {"content": "Target is 5 req/s per pod. Guided timeline order: offered RPS rises, scraped RPS follows (~5s scrape + 30s rate window), KEDA/HPA desired follows (~5s poll), Ready pods arrive last; reverse on scale-in with a 60s stabilization window. Request failures are sampled in dashboard evidence (Download evidence), not as a Prometheus error counter."}}
+      ],
+      "schemaVersion": 39,
+      "version": 1
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: scaling-lab
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: scaling-lab
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 10
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: scaling-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scaling-grafana
+  template:
+    metadata:
+      labels:
+        app: scaling-grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.3.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: scaling-lab
+            - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
+              value: /var/lib/grafana/dashboards/scaling-lab.json
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources/datasources.yaml
+              subPath: datasources.yaml
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml
+              subPath: dashboards.yaml
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards/scaling-lab.json
+              subPath: scaling-lab.json
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            periodSeconds: 5
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: scaling-lab
+spec:
+  selector:
+    app: scaling-grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
