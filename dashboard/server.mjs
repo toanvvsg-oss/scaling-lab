@@ -7,6 +7,7 @@ import { LoadSession, PROFILES, CPU_PROFILES, profileSet } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, runReset } from './reset.mjs';
 import { recordStatus, emptyStats, summarizeStats } from './status.mjs';
+import { grafanaStatus, closeGrafanaForward, dashboardUrl, panelEmbedUrl } from './grafana.mjs';
 import { queryPrometheus, queryRunSamples, LEGACY_RATE_QUERY, rateQueryForRun, upQueryForRun, counterSelForRun, upSelForRun } from './prometheus.mjs';
 import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns } from './runs.mjs';
 import { runAction } from './actions.mjs';
@@ -42,6 +43,9 @@ export const prodDeps = {
   rateQueryForRun, upQueryForRun,
   resetApi: { validateResetTarget, runReset },
   runAction,
+  // Injected Grafana route lifecycle so tests can stub availability without
+  // ever spawning kubectl against a live cluster.
+  grafanaApi: { status: () => grafanaStatus(), close: () => closeGrafanaForward() },
   resultsDir,
   profiles: { request: PROFILES, cpu: CPU_PROFILES },
   enableSampler: true,
@@ -322,6 +326,30 @@ function summarizeAction(s) {
       return send(res, 200, { ...state, load: loadState(), profiles: profilesPayload(), runs: [...R.runs.values()].map(R.describeRun), archivedRuns: [...R.archives.keys()], maxActiveRuns: R.MAX_ACTIVE_RUNS, booted, legacyPrediction: legacy ? { guess: legacy.guess, lesson: legacy.lesson, revealed: legacy.revealed } : null });
     }
     if (req.method === 'GET' && path === '/api/cluster') return send(res, 200, await io.clusterState());
+    // Managed local-only Grafana route (fixed service, ephemeral localhost
+    // port). Never a generic proxy: only the provisioned Grafana service.
+    // The run parameter is validated BEFORE starting any route, so unknown
+    // runs never spawn a forward.
+    if (req.method === 'GET' && path === '/api/grafana') {
+      const runParam = url.searchParams.get('run');
+      if (runParam) {
+        try {
+          R.validateRunId(runParam);
+          if (!R.runs.has(runParam) && !R.archives.has(runParam)) throw new Error('unknown run');
+        } catch {
+          return send(res, 404, { error: `Unknown run: ${runParam}` });
+        }
+      }
+      const status = await io.grafanaApi.status().catch(() => ({ available: false, baseUrl: null }));
+      if (!status.available) return send(res, 200, { available: false, baseUrl: null, dashboardUrl: null });
+      let runUrl = dashboardUrl(status.baseUrl);
+      let embedUrl = null;
+      if (runParam) {
+        runUrl = dashboardUrl(status.baseUrl, runParam);
+        embedUrl = panelEmbedUrl(status.baseUrl, runParam);
+      }
+      return send(res, 200, { available: true, baseUrl: status.baseUrl, dashboardUrl: dashboardUrl(status.baseUrl), runUrl, embedUrl });
+    }
     if (req.method === 'GET' && path === '/api/load') return send(res, 200, loadState());
     if (req.method === 'GET' && path === '/api/timeline') return send(res, 200, state.timeline);
     if (req.method === 'GET' && path === '/api/evidence') {
@@ -605,7 +633,15 @@ function summarizeAction(s) {
 
   if (io.enableSampler) setInterval(async () => { await sampleTimeline(); await sampleRuns(); }, 5000);
 
-  return { server, state, boot, isBooted: () => booted };
+  // App-level close: HTTP server plus ONLY this process's Grafana forward.
+  // Never touches clusters, namespaces, or anything else kubectl owns.
+  function close(done) {
+    try { io.grafanaApi.close(); } catch { /* ignore */ }
+    if (typeof done === 'function') server.close(done);
+    else return new Promise((resolve) => server.close(resolve));
+  }
+
+  return { server, state, boot, isBooted: () => booted, close };
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
@@ -613,7 +649,10 @@ if (isMain) {
   // PORT override lets the disposable kind harness run the dashboard on an
   // ephemeral port without touching the normal :4173 default.
   const listenPort = Number(process.env.PORT || 4173);
-  const { server, boot } = createApp();
-  server.listen(listenPort, '127.0.0.1', () => console.log(`Dashboard: http://127.0.0.1:${listenPort}`));
-  boot();
+  const app = createApp();
+  app.server.listen(listenPort, '127.0.0.1', () => console.log(`Dashboard: http://127.0.0.1:${listenPort}`));
+  const shutdown = () => app.close(() => process.exit(0));
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  app.boot();
 }
