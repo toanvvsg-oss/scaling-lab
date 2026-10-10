@@ -91,6 +91,8 @@ Makefile      Setup, reset, test, and teardown commands
 
 The dashboard binds to `127.0.0.1` and exposes only predefined scenarios against the dedicated lab context. It does not accept arbitrary shell commands.
 
+The next implementation checklist, including kind access and live acceptance steps, is in [docs/opencode-handoff.md](docs/opencode-handoff.md).
+
 ## Reference documentation
 
 - [Node.js HTTP server connection and shutdown behavior](https://nodejs.org/api/http.html)
