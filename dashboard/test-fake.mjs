@@ -44,6 +44,13 @@ export function makeFakeCluster(opts = {}) {
       if (a.includes('get namespaces')) {
         return { stdout: JSON.stringify({ items: [...namespaces.entries()].map(([name, v]) => ({ metadata: { name, labels: v.labels, creationTimestamp: new Date().toISOString() } })) }) };
       }
+      {
+        const m = /get namespace ([A-Za-z0-9-]+)/.exec(a);
+        if (m) {
+          if (!namespaces.has(m[1])) throw new Error(`namespaces "${m[1]}" not found`);
+          return { stdout: `namespace/${m[1]}` };
+        }
+      }
       if (a.includes('get pods')) return { stdout: podsJson };
       if (a.includes('get endpointslices')) return { stdout: slicesJson };
       if (a.includes('get hpa')) return { stdout: '{"items":[]}' };

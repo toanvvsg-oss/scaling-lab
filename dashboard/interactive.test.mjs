@@ -218,3 +218,43 @@ test('reset accepts only known lesson targets', () => {
   assert.ok(RESET_TARGETS.cpu.make.includes('hpa-up'));
   assert.ok(RESET_TARGETS.prometheus.make.includes('prometheus-up'));
 });
+
+test('explanation is lesson-specific, not Prometheus-framed', async () => {
+  const { deriveExplanation } = await import('./timeline.mjs');
+  const t0 = 1000000;
+  const pts = [
+    { at: new Date(t0).toISOString(), offeredRps: 0, actual: 2, ready: 2, endpoints: 2 },
+    { at: new Date(t0 + 5000).toISOString(), offeredRps: 0, actual: 2, ready: 2, endpoints: 2 },
+    { at: new Date(t0 + 10000).toISOString(), offeredRps: 0, actual: 2, ready: 2, endpoints: 2 },
+  ];
+  const conn = deriveExplanation(pts, 'connections');
+  assert.ok(!/scraped|desired replicas/i.test(conn), 'no Prometheus wording for connections');
+  assert.match(conn, /edge connection/i);
+  const cpu = deriveExplanation([
+    { at: new Date(t0).toISOString(), offeredRps: 0, currentCPU: 5, desired: 2, ready: 2 },
+    { at: new Date(t0 + 30000).toISOString(), offeredRps: 6, currentCPU: 5, desired: 2, ready: 2 },
+    { at: new Date(t0 + 90000).toISOString(), offeredRps: 6, currentCPU: 75, desired: 4, ready: 4 },
+  ], 'autoscale');
+  assert.match(cpu, /CPU crossed 60%/);
+});
+
+test('cursor filtering hides then reveals trace events by time', async () => {
+  const { filterByTime } = await import('./timeline.mjs');
+  const evs = [
+    { at: new Date(1000000).toISOString(), type: 'sample' },
+    { at: new Date(1020000).toISOString(), type: 'sample' },
+    { at: new Date(1040000).toISOString(), type: 'hpa' },
+  ];
+  assert.equal(filterByTime(evs, 999000).length, 0, 'scrub before events hides the trace');
+  assert.equal(filterByTime(evs, 1010000).length, 1);
+  assert.equal(filterByTime(evs, 1050000).length, 3, 'later scrub reveals them');
+});
+
+test('timeline points store bounded pod/endpoint snapshots', async () => {
+  const { createHistory, pushPoint } = await import('./timeline.mjs');
+  const h = createHistory();
+  const pods = [{ name: 'app-x-old1', ready: true, terminating: false }];
+  pushPoint(h, { offeredRps: 0, podsSnapshot: pods, endpointsSnapshot: [{ pod: 'app-x-old1', ready: true }] });
+  assert.deepEqual(h.points[0].podsSnapshot, pods);
+  assert.equal(h.points[0].endpointsSnapshot.length, 1);
+});

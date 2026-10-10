@@ -43,6 +43,14 @@ const frames = [
   ]
 ];
 let lesson = 0, step = 0, timer;
+const LESSON_IDS = ['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus'];
+// app.js dispatches lab:lesson before this listener attaches on a fresh load,
+// so initialize from the restored lesson instead of assuming lesson 0.
+try {
+  const restored = window.labLesson;
+  const idx = LESSON_IDS.indexOf(restored);
+  if (idx >= 0) lesson = idx;
+} catch { /* keep default */ }
 const nodes = [...document.querySelectorAll('.diagram-node')];
 function draw() {
   const [caption, active, motion] = frames[lesson][step];

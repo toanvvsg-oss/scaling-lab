@@ -69,6 +69,21 @@ function loadSelection() {
 }
 window.addEventListener('lab:freeze', () => { frozenView = true; frozenAt = new Date().toISOString(); const pill = $('live-pill'); if (pill) pill.textContent = 'PAUSED'; });
 window.addEventListener('lab:resume', () => { frozenView = false; frozenAt = null; window.labCursor = null; refresh(); });
+// Historical cursor from scrub/replay: render stored pod/endpoint snapshots
+// and filter events/trace to cursor time while live polling stays frozen.
+let lastShownEvents = [];
+window.addEventListener('lab:cursor', (event) => {
+  const d = event.detail || {};
+  window.labCursor = d.upto ?? null;
+  if (Array.isArray(d.pods)) {
+    $('pods').innerHTML = d.pods.length ? d.pods.map(x => `<div class="pod ${x.terminating ? 'terminating' : x.ready ? '' : 'not-ready'}" title="${escape(x.name)}">${escape(x.name)} · ${x.terminating ? 'terminating' : x.ready ? 'ready' : 'not ready'}</div>`).join('') : 'No application pods';
+  }
+  if (Array.isArray(d.endpoints)) {
+    $('endpoints').innerHTML = d.endpoints.length ? d.endpoints.map(x => `<div class="endpoint ${x.terminating ? 'terminating' : x.ready ? '' : 'not-ready'}" title="${escape(x.pod)}">${escape(x.pod)} · ${x.terminating ? 'terminating' : x.ready ? 'ready' : 'not ready'}</div>`).join('') : 'No endpoints';
+  }
+  lastEventRev = -1; // force re-render through the cursor filter
+  renderEvents(lastShownEvents, -3, d.upto ?? null);
+});
 function escape(s){return String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 // Lesson switching never mutates the cluster: every lesson runs inside its own
 // isolated run namespace, so opening another lesson is always safe.
@@ -79,6 +94,12 @@ function select(index){
   saveSelection();
   window.dispatchEvent(new CustomEvent('lab:lesson', { detail: index }));
   window.dispatchEvent(new CustomEvent('lab:select'));
+  // Clear run-scoped views immediately so stale data never reads as the new
+  // selection while fresh polls are in flight.
+  for (const id of ['pods', 'endpoints', 'timeline', 'trace']) {
+    const el = $(id);
+    if (el) el.innerHTML = '<p class="timeline-empty">Loading selected-run observation…</p>';
+  }
   $('lessons').innerHTML=lessons.map((x,i)=>`<button class="lesson-link ${i===index?'active':''}" data-index="${i}"><span class="num">0${i+1}</span>${escape(x.title)}</button>`).join('');
   document.querySelectorAll('.lesson-link').forEach(x=>x.onclick=()=>select(Number(x.dataset.index)));
   $('lesson-number').textContent=`LAB 0${index+1} / 07`;$('lesson-time').textContent=l.time;$('lesson-title').textContent=l.title;$('lesson-intro').textContent=l.intro;$('lesson-concept').textContent=l.concept;$('lesson-task').textContent=l.task;
@@ -141,7 +162,7 @@ function renderTrace(events, upto = window.labCursor ?? null){
     else if (x.type === 'prestop') body = `preStop ${escape(d.phase || '?')} · ${shortPod(d.pod)}`;
     else if (x.type === 'app-signal') body = `${escape(d.event || '')} · active ${d.active ?? '?'}`;
     else if (x.type === 'slow-end') body = `${d.complete ? 'completed' : 'INTERRUPTED'} · req ${short(d.requestId)} · ${shortPod(d.pod)} · ${d.ms || 0}ms`;
-    else if (x.type === 'stream-end') body = d.complete ? 'stream complete' : `stream error: ${escape(d.error || '')}`;
+    else if (x.type === 'stream-end') body = d.complete ? `stream complete · ${d.ticks ?? '?'} ticks` : `stream INTERRUPTED after ${d.ticks ?? '?'} ticks: ${escape(d.error || '')}`;
     else body = `${shortPod(d.pod || d.requestId || d.text || '')}`;
     return `<div class="event"><time>${t}</time><strong>${escape(x.type.replaceAll('-', ' '))}</strong>${body}</div>`;
   }).join('');
@@ -151,7 +172,7 @@ function renderStepper(detail){
   if (!box) return;
   const l = lessons[current];
   const done = {
-    baseline: Boolean(detail && (detail.status === 'ready' || detail.status === 'creating')),
+    baseline: Boolean(detail && detail.status === 'ready'),
     predict: Boolean(detail?.predicted),
     act: Boolean(detail && (detail.scenario || (detail.actions || 0) > 0 || (detail.load?.total || 0) > 0)),
     observe: Boolean(detail?.observed),
@@ -273,6 +294,7 @@ async function refreshInner(){
       $('predict-state').textContent = runDetail?.predicted ? (runDetail.revealed ? 'Explanation revealed below the timeline.' : `Predicted. Observe, then reveal.`) : (state.legacyPrediction ? (state.legacyPrediction.revealed ? 'Explanation revealed below the timeline.' : 'Predicted. Observe, then reveal.') : '');
     }
     const events = runDetail ? runDetail.events : state.events;
+    lastShownEvents = events;
     renderEvents(events, runDetail ? runDetail.rev : state.rev);
     if(active && active.resultStatus && active.scenario === lesson){
       const key = `${active.id}:${active.scenario}:${active.resultStatus}`;
@@ -370,7 +392,7 @@ async function loadAction(action){
   if(!r.ok){const b=await r.json();$('load-state').textContent=b.error;}
   refresh();
 }
-$('run-select').onchange=()=>{bumpEpoch();selectedRun=$('run-select').value || null; lastRunResultKey = null; lastEventRev = -1; $('verdict').innerHTML='<div class="empty">Run the experiment to see evidence and checks.</div>';$('verdict').dataset.key=''; window.dispatchEvent(new CustomEvent('lab:select')); refresh();};
+$('run-select').onchange=()=>{bumpEpoch();selectedRun=$('run-select').value || null; lastRunResultKey = null; lastEventRev = -1; $('verdict').innerHTML='<div class="empty">Run the experiment to see evidence and checks.</div>';$('verdict').dataset.key=''; window.dispatchEvent(new CustomEvent('lab:select')); for (const id of ['pods', 'endpoints', 'timeline', 'trace']) { const el = $(id); if (el) el.innerHTML = '<p class="timeline-empty">Loading selected-run observation…</p>'; } refresh();};
 $('run-new').onclick=async()=>{
   await createRunForLesson(lessons[current].id, $('run-panel-state'));
   refresh();

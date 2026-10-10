@@ -432,17 +432,12 @@ export async function finishRun(run, onEvent, deps = realDeps) {
     pushMilestone(run.timeline, { kind: 'run', text: `Run ${id} ready in ${ns}${lesson === 'prometheus' ? ` (${targets} Prometheus targets)` : lesson === 'autoscale' ? ' (CPU HPA active)' : ''}.`, detail: 'Traffic for this run is routed to its own edge; other runs are unaffected.', observer: 'run controller' });
     return run;
   } catch (error) {
-    // Creation rollback: if the namespace cannot be deleted, retain a
-    // cleanup-failed record (which keeps its slot) instead of freeing it.
+    // Creation rollback is idempotent: delete --ignore-not-found waits for
+    // removal, so success frees the slot. Only a failed delete retains a
+    // cleanup-failed record (which keeps its slot) instead.
     try {
-      await deps.exec(kubectlBase(null).concat(['delete', 'namespace', ns])).then((r) => r.stdout);
+      await deps.exec(kubectlBase(null).concat(['delete', 'namespace', ns, '--ignore-not-found'])).then((r) => r.stdout);
     } catch (deleteError) {
-      if (/NotFound/i.test(deleteError.message)) {
-        run.status = 'failed';
-        run.error = error.message;
-        try { if (run.forward) run.forward.close(); } catch { /* ignore */ }
-        throw error;
-      }
       run.status = 'cleanup-failed';
       run.error = `Creation failed (${error.message}) and rollback could not delete ${ns}: ${deleteError.message}`;
       run.cleanupAttempts = (run.cleanupAttempts || 0) + 1;
@@ -496,11 +491,12 @@ export async function cleanupRun(runId, resultsDir, deps = realDeps) {
     archives.set(runId, archive);
     try { if (run.forward) run.forward.close(); } catch { /* ignore */ }
     run.forward = null;
+    // Idempotent retry: delete --ignore-not-found waits for removal, so a
+    // successful delete means the namespace is gone and the slot is freed.
+    // Only a failed delete retains the cleanup-failed record and its slot.
     try {
-      await deps.exec(kubectlBase(null).concat(['delete', 'namespace', run.ns])).then((r) => r.stdout);
+      await deps.exec(kubectlBase(null).concat(['delete', 'namespace', run.ns, '--ignore-not-found'])).then((r) => r.stdout);
     } catch (error) {
-      // Real failure: keep everything for retry. The route is already closed
-      // and traffic stopped; the namespace and record stay for another attempt.
       run.status = 'cleanup-failed';
       run.error = `Namespace deletion failed: ${error.message}`;
       throw Object.assign(new Error(run.error), { status: 502 });

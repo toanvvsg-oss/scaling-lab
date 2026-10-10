@@ -5,17 +5,27 @@ import { ACTIONS, runAction } from './actions.mjs';
 function fakeDeps() {
   const calls = [];
   let n = 0;
+  let sleeps = 0;
+  const slices = JSON.stringify({ items: [{ endpoints: [1, 2].map((i) => ({ targetRef: { name: `app-x-${i}` }, conditions: { ready: true, terminating: false } })) }] });
   const req = (over = {}) => ({
     headers: Promise.resolve({ pod: 'app-x-1', requestId: `req-${++n}`, edgeConnection: '7', appConnection: '3', ...(over.headers || {}) }),
     done: Promise.resolve({ ok: true, complete: true, status: 200, pod: 'app-x-1', requestId: `req-${n}`, edgeConnection: '7', appConnection: '3', ms: 5, body: '{}', ...(over.done || {}) }),
   });
   return {
     calls,
-    watches: [],
+    get sleeps() { return sleeps; },
     httpAgent: () => ({ destroy() {} }),
-    sleep: async () => {},
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps > 20) throw new Error('fake clock exhausted');
+    },
     startRequest: (path, agent) => { calls.push(path); return req(); },
-    kubectlIn: async (...a) => { calls.push(a.join(' ')); return 'ok'; },
+    kubectlIn: async (...a) => {
+      const s = a.join(' ');
+      calls.push(s);
+      if (s.includes('get endpointslices')) return slices;
+      return 'ok';
+    },
     watchLogs: (pod, emit, ns) => { calls.push(`watch ${pod}`); let dead = false; return () => { dead = true; }; },
   };
 }
@@ -95,4 +105,46 @@ test('rollout trigger runs kubectl in the run namespace', async () => {
   const out = await runAction(run, 'trigger-rollout', {}, () => {}, deps);
   assert.equal(out.rolled, true);
   assert.ok(deps.calls.some((c) => c.includes('LAB_REV')));
+});
+
+test('stream end carries tick counts and request ids', async () => {
+  const { countTicks } = await import('./actions.mjs');
+  assert.equal(countTicks(Array(20).fill('tick').join('\n') + '\n'), 20);
+  assert.equal(countTicks(''), 0);
+  assert.equal(countTicks(null), 0);
+});
+
+test('start-long waits for endpoints and retries only pre-headers failures', async () => {
+  const run = { id: 'aaaabbbb', ns: 'scaling-run-aaaabbbb', lesson: 'shutdown', forwardPort: 18888, pendingLong: null };
+  const deps = fakeDeps();
+  let kubectlCalls = 0;
+  const origKubectl = deps.kubectlIn;
+  deps.kubectlIn = async (...a) => { kubectlCalls++; return origKubectl(...a); };
+  let attempts = 0;
+  deps.startRequest = () => {
+    attempts++;
+    if (attempts < 3) {
+      return { headers: Promise.resolve({ pod: null, status: 502, error: 'bad gateway' }), done: Promise.resolve({ ok: false, complete: false, error: 'bad gateway' }) };
+    }
+    return {
+      headers: Promise.resolve({ pod: 'app-x-1', requestId: 'req-9' }),
+      done: new Promise(() => {}),
+    };
+  };
+  const out = await runAction(run, 'start-long', { mode: 'graceful' }, () => {}, deps);
+  assert.equal(out.pod, 'app-x-1');
+  assert.equal(attempts, 3, 'two pre-headers 502s retried, third reached a pod');
+  assert.ok(kubectlCalls >= 3, 'mode rollout plus endpoint wait ran first');
+  run.pendingLong = null;
+});
+
+test('start-long reports HTTP status when no pod is ever reached', async () => {
+  const run = { id: 'aaaabbbb', ns: 'scaling-run-aaaabbbb', lesson: 'shutdown', forwardPort: 18888, pendingLong: null };
+  const deps = fakeDeps();
+  deps.startRequest = () => ({
+    headers: Promise.resolve({ pod: null, status: 502, error: 'bad gateway' }),
+    done: Promise.resolve({ ok: false, complete: false, error: 'bad gateway' }),
+  });
+  await assert.rejects(runAction(run, 'start-long', {}, () => {}, deps), /HTTP 502/);
+  assert.equal(run.pendingLong, null, 'no slot held without a serving pod');
 });

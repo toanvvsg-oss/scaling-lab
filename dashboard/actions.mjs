@@ -18,6 +18,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const realDeps = { kubectlIn, startRequest, traffic, sleep, httpAgent: (o) => new http.Agent(o), watchLogs: (pod, emit, ns) => watchPodLogs(pod, emit, ns) };
 
+// After a rollout the edge needs Ready endpoints before a pinned request can
+// land on a pod. Polls EndpointSlices for at least two ready endpoints.
+export async function waitRunEndpoints(ns, deps = realDeps, minReady = 2, timeoutMs = 60000) {
+  const until = Date.now() + timeoutMs;
+  let last = 0;
+  while (Date.now() < until) {
+    try {
+      const raw = await deps.kubectlIn(ns, 'get', 'endpointslices', '-l', 'kubernetes.io/service-name=app', '-o', 'json');
+      last = JSON.parse(raw).items
+        .flatMap((x) => x.endpoints || [])
+        .filter((e) => e.conditions?.ready && !e.conditions?.terminating).length;
+      if (last >= minReady) return last;
+    } catch { /* retry until timeout */ }
+    await deps.sleep(2000);
+  }
+  throw new Error(`No Ready app endpoints appeared in ${ns} (saw ${last}, need ${minReady}). Check the app rollout and Service endpoints.`);
+}
+
 export async function runAction(run, action, input = {}, emit = () => {}, deps = realDeps) {
   const allowed = ACTIONS[run.lesson] || [];
   if (!allowed.includes(action)) {
@@ -73,23 +91,43 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
           run.mode = mode;
         }
         const path = action === 'start-long' ? '/slow?ms=8000' : '/stream';
+        await waitRunEndpoints(ns, deps);
         const agent = deps.httpAgent({ keepAlive: true });
-        const task = deps.startRequest(path, agent, base);
-        const headers = await task.headers;
-        if (!headers.pod) { agent.destroy(); throw new Error(`Long request did not reach a pod: ${headers.error}`); }
+        // Retry only pre-headers failures (edge 502 / reset with no serving
+        // pod yet). Once headers arrive the request exists — never duplicate it.
+        let headers = null;
+        let lastTask = null;
+        let lastError = 'unknown';
+        for (let attempt = 0; attempt < 5 && !headers?.pod; attempt++) {
+          if (attempt > 0) await deps.sleep(2000);
+          const task = deps.startRequest(path, agent, base);
+          lastTask = task;
+          headers = await task.headers;
+          if (!headers.pod) {
+            lastError = `HTTP ${headers.status ?? '?'} ${headers.error || 'no x-pod header'}`;
+            task.done.catch(() => {});
+          }
+        }
+        if (!headers?.pod) {
+          agent.destroy();
+          throw new Error(`Long request did not reach a pod after rollout recovery (last: ${lastError}). Check the app Deployment and edge route, then retry start.`);
+        }
         const stopWatch = deps.watchLogs(headers.pod, emit, ns);
-        const pending = { kind: action, pod: headers.pod, requestId: headers.requestId, startedAt: new Date().toISOString(), task, agent, stopWatch, completed: false };
+        const pending = { kind: action, pod: headers.pod, requestId: headers.requestId, startedAt: new Date().toISOString(), task: lastTask, agent, stopWatch, completed: false };
         run.pendingLong = pending;
         emit(action === 'start-long' ? 'slow-start' : 'stream-start', { ...headers });
         // Natural completion clears the slot, releases the watcher/agent, and
         // emits the completion so the learner can retry or clean up.
-        task.done.then((done) => {
+        pending.task.done.then((done) => {
           if (run.pendingLong !== pending) return;
           run.pendingLong = null;
           pending.completed = true;
           try { pending.stopWatch(); } catch { /* ignore */ }
           try { pending.agent.destroy(); } catch { /* ignore */ }
-          emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end', { pod: done.pod || pending.pod, complete: done.complete, ms: done.ms, error: done.error });
+          emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end',
+            pending.kind === 'start-long'
+              ? { pod: done.pod || pending.pod, requestId: pending.requestId, complete: done.complete, ms: done.ms, error: done.error }
+              : { pod: done.pod || pending.pod, requestId: pending.requestId, complete: done.complete, ms: done.ms, error: done.error, ticks: countTicks(done.body) });
         });
         return { action, pod: headers.pod, requestId: headers.requestId };
       }
@@ -107,9 +145,10 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
         pending.completed = true;
         try { pending.stopWatch(); } catch { /* ignore */ }
         try { pending.agent.destroy(); } catch { /* ignore */ }
-        const result = { ...done, pod: pending.pod };
-        emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end', { pod: result.pod, complete: result.complete, ms: result.ms, error: result.error });
-        return { action, pod: pending.pod, complete: result.complete, ms: result.ms, error: result.error };
+        const result = { ...done, pod: pending.pod, requestId: pending.requestId };
+        if (pending.kind !== 'start-long') result.ticks = countTicks(done.body);
+        emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end', { pod: result.pod, requestId: result.requestId, complete: result.complete, ms: result.ms, error: result.error, ticks: result.ticks });
+        return { action, pod: pending.pod, requestId: pending.requestId, complete: result.complete, ms: result.ms, error: result.error, ticks: result.ticks };
       }
       case 'bg-start': {
         if (!run.load) throw new Error(`Run ${run.id} is not ready for traffic yet.`);
@@ -139,4 +178,9 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
 function strip(r) {
   const { body, ...rest } = r;
   return rest;
+}
+
+// Tick count in a streaming response body, same format the grader counts.
+export function countTicks(body) {
+  return (body || '').trim().split('\n').filter(Boolean).length;
 }

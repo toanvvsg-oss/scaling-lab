@@ -168,6 +168,8 @@ export function createApp(overrides = {}) {
           ready: snap.pods.filter((p) => p.ready && !p.terminating).length,
           terminating: snap.pods.filter((p) => p.terminating).length,
           endpoints: snap.endpoints.filter((e) => e.ready && !e.terminating).length,
+          podsSnapshot: snap.pods.map((p) => ({ name: p.name, ready: Boolean(p.ready), terminating: Boolean(p.terminating) })),
+          endpointsSnapshot: snap.endpoints.map((e) => ({ pod: e.pod, ready: Boolean(e.ready), terminating: Boolean(e.terminating) })),
         });
       } catch { /* skip this round for this run */ }
     }
@@ -353,7 +355,7 @@ function summarizeAction(s) {
         return send(res, 200, {
           ...R.describeRun(run), rev: run.rev || 0, events: run.events.slice(-200),
           predicted: Boolean(pred), revealed: Boolean(pred?.revealed), predictGuess: pred?.guess || null,
-          observed: run.timeline.points.length > 0 || run.events.length > 0,
+          observed: Boolean(run.experimentAt),
         });
       }
       if (req.method === 'GET' && sub === 'timeline') return send(res, 200, run.timeline);
@@ -367,7 +369,6 @@ function summarizeAction(s) {
         if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before running scenarios.` });
         if (run.scenarioRunning) return send(res, 409, { error: 'A scenario is already running in this run.' });
         if (run.actionRunning) return send(res, 409, { error: 'A learner action is running in this run. Wait for it before the one-click scenario.' });
-        if (run.pendingLong) return send(res, 409, { error: 'A guided long request is in flight. Terminate it before the one-click scenario.' });
         if (run.pendingLong) return send(res, 409, { error: 'A guided long request is in flight. Terminate it before the one-click scenario.' });
         if (run.load?.active) return send(res, 409, { error: 'Manual load is running in this run. Stop it before the one-click scenario.' });
         run.scenarioRunning = true;

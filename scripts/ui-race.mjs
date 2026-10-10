@@ -65,6 +65,23 @@ check('selection still B after stale response', (await page.evaluate(() => windo
 check('panel never rendered A-only data', (await page.textContent('#run-panel-state')).includes(runB));
 await page.unroute('**/api/state');
 
+// Section 2: a delayed timeline response for the previous selection must not
+// paint into the newly selected lesson/run.
+let delayedTimelineOnce = false;
+await page.route('**/api/runs/*/timeline', async (route) => {
+  const url = route.request().url();
+  if (!delayedTimelineOnce && url.includes(`/api/runs/${runB}/timeline`)) {
+    delayedTimelineOnce = true;
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+  await route.continue();
+});
+await page.click('.lesson-link[data-index="6"]'); // switch to Prometheus/A
+await page.waitForTimeout(8000); // let the stale B timeline land mid-flight
+const head = await page.textContent('#prometheus-rate');
+check('late B timeline never painted into A view', /requests \/ second|stale —/.test(head));
+await page.unroute('**/api/runs/*/timeline');
+
 // Cleanup owned run B only.
 await page.evaluate(async (id) => { await fetch(`/api/runs/${id}`, { method: 'DELETE' }); }, runB);
 console.log(`js errors: ${jsErrors.length ? jsErrors.join(' | ') : 'none'}`);

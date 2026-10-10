@@ -2,15 +2,28 @@ name: pr-checks
 on:
   pull_request:
   push:
-    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm test
-      - run: git diff --check
+      - name: Check changed lines for whitespace errors
+        env:
+          DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DIFF_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          base="$DIFF_BASE"
+          if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+            base=$(git hash-object -t tree /dev/null)
+          fi
+          git diff --check "$base" "$DIFF_HEAD" --

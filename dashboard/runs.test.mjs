@@ -214,3 +214,21 @@ test('parseHpa keeps raw quantity strings alongside normalized values', async ()
   assert.equal(hpa.external.currentRaw, '3200m');
   assert.equal(hpa.external.target, 5);
 });
+
+test('cleanup of an already-absent namespace succeeds and frees the slot', async () => {
+  const { makeFakeCluster } = await import('./test-fake.mjs');
+  const { runs, archives, createRun, cleanupRun, activeRuns } = await import('./runs.mjs');
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  runs.clear(); archives.clear();
+  const fake = makeFakeCluster();
+  const run = await createRun('prometheus', () => {}, fake.deps);
+  // Namespace deleted out-of-band (already absent when cleanup runs).
+  fake.namespaces.delete(run.ns);
+  const dir = mkdtempSync(join(tmpdir(), 'lab-arch-'));
+  await cleanupRun(run.id, dir, fake.deps);
+  assert.equal(run.status, 'deleted');
+  assert.equal(activeRuns().length, 0, 'absent namespace frees its slot');
+  assert.ok(archives.has(run.id), 'evidence still snapshotted');
+});

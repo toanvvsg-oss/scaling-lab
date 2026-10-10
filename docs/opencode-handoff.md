@@ -1,5 +1,7 @@
 # OpenCode handoff: interactive autoscaling labs
 
+> Superseded note: this was the original implementation checklist. The lab has since moved to per-run isolated namespaces for all lessons; the current design is `docs/adr-run-isolation.md`, current setup is `README.md`, and agent rules are `AGENTS.md`. In particular: do not follow the old single-`scaling-lab`-namespace safety wording, the destructive lesson-switch reset flow, or the one-session-at-a-time assumptions below — each run has its own namespace, traffic route, and evidence.
+
 This document is the implementation checklist. Work in `/Users/toanvv/labs/scaling-lab`. The learner should be able to create a traffic change, see the metric and Kubernetes response on one timeline, and safely reset before switching lessons. Keep the existing seven lessons and CLI verifier working.
 
 ## Current baseline
