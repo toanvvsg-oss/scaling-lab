@@ -7,7 +7,7 @@ const frames = [
   ],
   [
     ['Client and proxy keep their connection open.', 0, 'play'],
-    ['Node.js closes its upstream socket after five idle seconds.', 3, 'still'],
+    ['Node.js closes its upstream socket after about six idle seconds (5s keep-alive plus 1s close buffer).', 3, 'still'],
     ['The client reuses its socket to the proxy.', 1, 'play'],
     ['The proxy opens a new socket to the app.', 3, 'play']
   ],
@@ -30,10 +30,10 @@ const frames = [
     ['The final chunk arrives; the pod can exit.', 0, 'reverse']
   ],
   [
-    ['Clients create CPU demand in the app pods.', 3, 'play'],
+    ['Clients create CPU demand in the app pods.', 1, 'play'],
     ['Metrics-server reports CPU usage relative to requests.', 2, 'still'],
-    ['The HPA asks the Deployment for more replicas.', 2, 'play'],
-    ['New ready pods share subsequent requests.', 3, 'play']
+    ['The HPA asks the Deployment for more replicas.', 3, 'play'],
+    ['New ready pods share subsequent requests.', 1, 'play']
   ],
   [
     ['App pods count each HTTP request and expose /metrics.', 0, 'play'],
@@ -50,7 +50,7 @@ function draw() {
   document.getElementById('diagram-text').textContent = caption;
   const track = document.getElementById('diagram-track');
   track.className = `diagram-track ${motion}`;
-  const labels = lesson === 6 ? ['App', 'Prometheus', 'KEDA', 'HPA'] : ['Client', 'Edge', 'Service', 'Pod'];
+  const labels = lesson === 6 ? ['App', 'Prometheus', 'KEDA', 'HPA'] : lesson === 5 ? ['Client', 'App', 'Metrics', 'HPA'] : ['Client', 'Edge', 'Service', 'Pod'];
   nodes.forEach((node, index) => {
     node.lastChild.textContent = labels[index];
     node.classList.toggle('active', index === active);

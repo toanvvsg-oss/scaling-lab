@@ -214,3 +214,98 @@ test('malformed ids and archive discovery at boot', async (t) => {
   const missing = await ctx.api('GET', '/api/runs/a1b2c3d4/timeline');
   assert.equal(missing.status, 404);
 });
+
+test('guided-action conflicts: action/load/scenario/cleanup serialize', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer();
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  // NOTE: bootTestServer uses the real runAction; override per-test via a
+  // deferred implementation through a dedicated app below.
+  const { createApp: mk } = await import('./server.mjs');
+  const blocked = makeFakeCluster();
+  let releaseAction;
+  const actionGate = new Promise((r) => { releaseAction = r; });
+  const actionCalls = [];
+  const store2 = { runs: new Map(), archives: new Map() };
+  const runsApi2 = {
+    runs: store2.runs, archives: store2.archives,
+    activeRuns() { return [...store2.runs.values()].filter((r) => !['deleted', 'failed'].includes(r.status)); },
+    MAX_ACTIVE_RUNS: 2,
+    RUN_LESSONS: new Set(['connections', 'rollout']),
+    validateRunId: R.validateRunId,
+    describeRun: R.describeRun,
+    beginRun: (lesson, emit) => {
+      const id = (0xb0000000 + store2.runs.size).toString(16);
+      const run = { id, ns: `scaling-run-${id}`, lesson, status: 'ready', createdAt: new Date().toISOString(), error: null, steps: [], events: [], rev: 0, timeline: { points: [], milestones: [] }, result: null, load: null, forward: null, forwardPort: 18989, prev: null, scenarioRunning: false, actionRunning: false, pendingLong: null, actions: 0 };
+      store2.runs.set(id, run);
+      return run;
+    },
+    finishRun: async (run) => run,
+    cleanupRun: async (id) => { const r = store2.runs.get(id); r.status = 'deleted'; return r; },
+    runClusterState: async () => ({ connected: true, pods: [], endpoints: [], hpa: null }),
+    buildArchive: (r) => ({ run: r.id }),
+    adoptOrphanRuns: async () => [],
+  };
+  const app2 = mk({
+    clusterState: async () => ({ connected: true, pods: [], endpoints: [] }),
+    runScenario: async () => ({ status: 'pass', checks: [], evidence: {} }),
+    loadFactory: () => (() => {
+      const s = { active: false, state() { return { active: this.active }; }, async start() { this.active = true; return this.state(); }, async stop() { this.active = false; return this.state(); }, increase() { return this.state(); }, decrease() { return this.state(); } };
+      return s;
+    })(),
+    runsApi: runsApi2,
+    promQuery: async () => ({ value: 1, at: new Date().toISOString(), stale: false }),
+    queryRunSamples: async () => ({ total: 0, at: null, upAllOne: true, evaluatedAt: null, stale: true }),
+    counterSelForRun: (id) => `c-${id}`,
+    upSelForRun: (id) => `u-${id}`,
+    rateQueryForRun: (id) => `r-${id}`,
+    upQueryForRun: (id) => `cu-${id}`,
+    resetApi: { validateResetTarget: (x) => x, runReset: async () => ({}) },
+    runAction: async (run, action) => { actionCalls.push(action); await actionGate; return { action }; },
+    resultsDir: ctx.dir,
+    enableSampler: false,
+  });
+  await new Promise((r) => app2.server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => app2.server.close(r)));
+  const port = app2.server.address().port;
+  const api = async (method, path, body) => {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: res.status, body: await res.json() };
+  };
+  await app2.boot();
+  const c = (await api('POST', '/api/runs', { lesson: 'connections' })).body;
+  const id = c.id;
+  // attach a load session like wireRunLoad would
+  runsApi2.runs.get(id).load = (() => {
+    const s = { active: false, state() { return { active: this.active }; }, async start() { this.active = true; return this.state(); }, async stop() { this.active = false; return this.state(); }, increase() { return this.state(); }, decrease() { return this.state(); } };
+    return s;
+  })();
+  const first = api('POST', `/api/runs/${id}/actions`, { action: 'reuse-batch' });
+  await new Promise((r) => setTimeout(r, 50));
+  let r = await api('POST', `/api/runs/${id}/actions`, { action: 'fresh-batch' });
+  assert.equal(r.status, 409);
+  r = await api('DELETE', `/api/runs/${id}`);
+  assert.equal(r.status, 409, 'cleanup preflight rejects while an action runs');
+  r = await api('POST', `/api/runs/${id}/run`, { id: 'connections' });
+  assert.equal(r.status, 409);
+  r = await api('POST', `/api/runs/${id}/load`, { action: 'start', profile: 'steady' });
+  assert.equal(r.status, 409);
+  releaseAction();
+  assert.equal((await first).status, 200);
+  assert.deepEqual(actionCalls, ['reuse-batch']);
+  // load active: plain actions rejected, rollout trio proceeds
+  await api('POST', `/api/runs/${id}/load`, { action: 'start', profile: 'steady' });
+  r = await api('POST', `/api/runs/${id}/actions`, { action: 'reuse-batch' });
+  assert.equal(r.status, 409);
+  // pendingLong blocks load start / scenario / cleanup
+  store2.runs.get(id).pendingLong = { pod: 'p' };
+  r = await api('POST', `/api/runs/${id}/load`, { action: 'stop' });
+  assert.equal(r.status, 200, 'stop stays available');
+  r = await api('POST', `/api/runs/${id}/load`, { action: 'start', profile: 'steady' });
+  assert.equal(r.status, 409);
+  r = await api('POST', `/api/runs/${id}/run`, { id: 'connections' });
+  assert.equal(r.status, 409);
+  r = await api('DELETE', `/api/runs/${id}`);
+  assert.equal(r.status, 409);
+});

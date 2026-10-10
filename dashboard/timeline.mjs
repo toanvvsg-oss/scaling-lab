@@ -22,6 +22,11 @@ export function pushPoint(history, point) {
     terminating: point.terminating ?? null,
     endpoints: point.endpoints ?? null,
     currentCPU: point.currentCPU ?? null,
+    cpuTarget: point.cpuTarget ?? null,
+    externalCurrent: point.externalCurrent ?? null,
+    externalRaw: point.externalRaw ?? null,
+    externalTarget: point.externalTarget ?? null,
+    externalName: point.externalName ?? null,
     stale: Boolean(point.stale),
   });
   if (history.points.length > MAX_POINTS) history.points.splice(0, history.points.length - MAX_POINTS);
@@ -50,4 +55,46 @@ export function cursorAt(points, t) {
     else break;
   }
   return idx;
+}
+
+
+// Events at or before cursor time t (for scrubbing the trace/event views).
+export function filterByTime(events, upto) {
+  if (upto == null) return events;
+  return events.filter((e) => new Date(e.at).getTime() <= upto);
+}
+
+// Milestones at or before cursor time (for replay/scrub).
+export function marksUpTo(timeline, upto) {
+  const marks = (timeline.milestones || []).filter((m) => !upto || new Date(m.at).getTime() <= upto);
+  return marks.slice(-12);
+}
+
+function fmtElapsedMs(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60)}`;
+}
+
+// Measured cause-effect delays from the actual points, not a fixed story.
+export function deriveExplanation(points, lesson) {
+  if (points.length < 3) return '';
+  const t0 = new Date(points[0].at).getTime();
+  const first = (pred) => points.find(pred);
+  const rise = first((p) => (p.offeredRps || 0) > 2);
+  const seen = first((p) => (p.observedRps || 0) > 2);
+  const want = first((p) => (p.desired || 0) > 2);
+  const pods = first((p) => (p.ready || 0) > 2);
+  const lag = (a, b) => (a && b ? Math.max(0, Math.round(((new Date(b.at) - new Date(a.at)) / 1000))) : null);
+  const parts = [];
+  if (rise) parts.push(`offered traffic rose at +${fmtElapsedMs(new Date(rise.at).getTime() - t0)}`);
+  const s1 = lag(rise, seen);
+  if (s1 != null) parts.push(`scraped RPS followed ~${s1}s later (5s scrape + 30s rate window)`);
+  const s2 = lag(seen || rise, want);
+  if (s2 != null) parts.push(`desired replicas followed ~${s2}s later (KEDA poll + HPA sync)`);
+  const s3 = lag(want || seen || rise, pods);
+  if (s3 != null) parts.push(`Ready pods arrived ~${s3}s later (scheduling + readiness)`);
+  if (!parts.length) return lesson === 'autoscale'
+    ? 'No scaling movement yet. Apply CPU load and watch CPU % cross the 60% target before desired replicas move.'
+    : 'No traffic yet. Start a profile and watch offered → scraped → desired → Ready in that order.';
+  return 'Measured in this run: ' + parts.join('; ') + '. Scale-in reverses the order through the 60s stabilization window.';
 }

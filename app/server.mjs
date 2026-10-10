@@ -21,6 +21,18 @@ function reply(res, status, body) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const connection = connections.get(req.socket);
+  // Local lifecycle hook endpoint for the preStop exec hook. It is not
+  // learner traffic: excluded from request counters and metrics.
+  if (url.pathname === '/lifecycle' && req.method === 'POST') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const phase = (JSON.parse(body || '{}').phase) || 'prestop';
+    const waitMs = Math.min(10000, Math.max(0, Number(process.env.PRESTOP_WAIT_MS || 2000)));
+    log('prestop-start', { phase, ready, active });
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+    log('prestop-end', { phase, ready, active });
+    return reply(res, 200, { ok: true, phase });
+  }
   if (url.pathname === '/health/live') return reply(res, 200, { live: true, pod });
   if (url.pathname === '/health/ready') return reply(res, ready ? 200 : 503, { ready, pod });
   if (url.pathname === '/metrics') {
@@ -58,7 +70,7 @@ const server = http.createServer(async (req, res) => {
     }, 500);
     res.once('close', () => clearInterval(timer));
   } else {
-    reply(res, 200, { pod, request, connection, ready, active, mode });
+    reply(res, 200, { pod, request, connection, ready, active, mode, keepAliveBudgetMs: server.keepAliveTimeout + (server.keepAliveTimeoutBuffer || 0) });
   }
 });
 server.keepAliveTimeout = 5000;

@@ -42,6 +42,16 @@ duration, pause/scrub/replay, run switching, cleanup cancel/confirm, evidence
 download (including an archived run after cleanup). Watch the browser console
 for JS errors. Capture screenshots for `docs/dashboard.png` and the review.
 
+Reusable scripted acceptance (needs Google Chrome plus
+`npm install --no-save playwright-core` once; needs one free run slot):
+
+```sh
+node scripts/ui-accept.mjs
+```
+
+Every check asserts and the script exits nonzero on any FAIL. Screenshots and
+downloaded evidence land in `results/`.
+
 ## Run isolation checks (API)
 
 ```sh

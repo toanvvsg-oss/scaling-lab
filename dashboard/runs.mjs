@@ -158,7 +158,7 @@ function appManifests(runId, ns) {
               ports: [{ containerPort: 3000 }],
               env: [{ name: 'SHUTDOWN_MODE', value: 'graceful' }, { name: 'SHUTDOWN_MS', value: '24000' }],
               resources: { requests: { cpu: '100m', memory: '64Mi' }, limits: { cpu: '1', memory: '128Mi' } },
-              lifecycle: { preStop: { exec: { command: ['sh', '-c', 'sleep 2'] } } },
+              lifecycle: { preStop: { exec: { command: ['node', '/app/prestop.mjs'] } } },
               startupProbe: { httpGet: { path: '/health/live', port: 3000 }, periodSeconds: 1, failureThreshold: 20 },
               readinessProbe: { httpGet: { path: '/health/ready', port: 3000 }, periodSeconds: 1 },
               livenessProbe: { httpGet: { path: '/health/live', port: 3000 }, periodSeconds: 5 },
@@ -287,21 +287,43 @@ export async function runClusterState(runId, deps = realDeps) {
     const endpoints = JSON.parse(slicesRaw).items.flatMap((x) => x.endpoints || []).map((x) => ({
       pod: x.targetRef?.name, ready: x.conditions?.ready, terminating: x.conditions?.terminating,
     }));
-    const hpa = JSON.parse(hpaRaw).items.find((x) => x.spec?.scaleTargetRef?.name === 'app');
-    // autoscaling/v2 reports observed usage in status.currentMetrics[], not in
-    // a top-level percentage field.
-    const cpuMetric = hpa?.status?.currentMetrics?.find((m) => m.type === 'Resource' && m.resource?.name === 'cpu');
-    return {
-      connected: true, pods, endpoints,
-      hpa: hpa && {
-        name: hpa.metadata.name, current: hpa.status?.currentReplicas, desired: hpa.status?.desiredReplicas,
-        currentCPU: cpuMetric?.resource?.current?.averageUtilization ?? null,
-        metrics: (hpa.spec?.metrics || []).map((m) => ({ type: m.type })),
-      },
-    };
+    return { connected: true, pods, endpoints, hpa: parseHpa(JSON.parse(hpaRaw).items) };
   } catch {
     return { connected: false, pods: [], endpoints: [], hpa: null };
   }
+}
+// Parses Kubernetes quantity strings ("27", "3200m", "42m", "1e3", "10Ki")
+// into plain numbers. Returns null for unknown forms instead of guessing.
+export function parseQuantity(raw) {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+  if (typeof raw !== 'string') return null;
+  const m = /^(-?[0-9.]+(?:[eE][+-]?[0-9]+)?)(n|u|m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/.exec(raw.trim());
+  if (!m) return null;
+  const value = Number(m[1]);
+  if (!Number.isFinite(value)) return null;
+  const factors = { n: 1e-9, u: 1e-6, m: 1e-3, k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18, Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4, Pi: 1024 ** 5, Ei: 1024 ** 6 };
+  return value * (factors[m[2]] ?? 1);
+}
+export function parseHpa(items) {
+  const hpa = (items || []).find((x) => x.spec?.scaleTargetRef?.name === 'app');
+  if (!hpa) return null;
+  const cpuMetric = hpa.status?.currentMetrics?.find((m) => m.type === 'Resource' && m.resource?.name === 'cpu');
+  const extMetric = hpa.status?.currentMetrics?.find((m) => m.type === 'External');
+  const extSpec = (hpa.spec?.metrics || []).find((m) => m.type === 'External');
+  return {
+    name: hpa.metadata.name, current: hpa.status?.currentReplicas, desired: hpa.status?.desiredReplicas,
+    currentCPU: cpuMetric?.resource?.current?.averageUtilization ?? null,
+    cpuTarget: (hpa.spec?.metrics || []).find((m) => m.type === 'Resource' && m.resource?.name === 'cpu')?.resource?.target?.averageUtilization ?? null,
+    external: extMetric ? {
+      name: extMetric.external?.metric?.name || extSpec?.external?.metric?.name || null,
+      // Normalized per-pod request rate; raw strings retained for evidence.
+      current: parseQuantity(extMetric.external?.current?.averageValue),
+      currentRaw: extMetric.external?.current?.averageValue ?? null,
+      target: parseQuantity(extSpec?.external?.target?.averageValue),
+      targetRaw: extSpec?.external?.target?.averageValue ?? null,
+    } : null,
+    metrics: (hpa.spec?.metrics || []).map((m) => ({ type: m.type })),
+  };
 }
 
 async function waitRunReady(runId, deps) {
@@ -329,8 +351,12 @@ async function verifyRunScrape(runId, deps) {
   throw new Error(`Prometheus is not scraping both app pods of run ${runId} (saw ${count}, need 2 for query ${query}). Open Status -> Targets via make prometheus-ui, or re-run make prometheus-up.`);
 }
 
+// Counts every run whose namespace may still be allocated: ready, creating,
+// deleting, degraded, and cleanup-failed all hold (or may hold) cluster
+// resources. Only deleted and failed (namespace provably gone) free a slot.
+const TERMINAL_RUN_STATUS = new Set(['deleted', 'failed']);
 export function activeRuns() {
-  return [...runs.values()].filter((r) => r.status === 'ready' || r.status === 'creating');
+  return [...runs.values()].filter((r) => !TERMINAL_RUN_STATUS.has(r.status));
 }
 
 export function describeRun(run) {
@@ -341,6 +367,9 @@ export function describeRun(run) {
     readopted: Boolean(run.readopted),
     scenario: run.scenario || null,
     scenarioRunning: Boolean(run.scenarioRunning),
+    actionRunning: Boolean(run.actionRunning),
+    hasPendingLong: Boolean(run.pendingLong),
+    actions: run.actions || 0,
     resultStatus: run.result?.status || null,
     resources: {
       appReplicas: 2, appCpuRequest: '100m', appMemoryRequest: '64Mi',
@@ -403,10 +432,25 @@ export async function finishRun(run, onEvent, deps = realDeps) {
     pushMilestone(run.timeline, { kind: 'run', text: `Run ${id} ready in ${ns}${lesson === 'prometheus' ? ` (${targets} Prometheus targets)` : lesson === 'autoscale' ? ' (CPU HPA active)' : ''}.`, detail: 'Traffic for this run is routed to its own edge; other runs are unaffected.', observer: 'run controller' });
     return run;
   } catch (error) {
+    // Creation rollback: if the namespace cannot be deleted, retain a
+    // cleanup-failed record (which keeps its slot) instead of freeing it.
+    try {
+      await deps.exec(kubectlBase(null).concat(['delete', 'namespace', ns])).then((r) => r.stdout);
+    } catch (deleteError) {
+      if (/NotFound/i.test(deleteError.message)) {
+        run.status = 'failed';
+        run.error = error.message;
+        try { if (run.forward) run.forward.close(); } catch { /* ignore */ }
+        throw error;
+      }
+      run.status = 'cleanup-failed';
+      run.error = `Creation failed (${error.message}) and rollback could not delete ${ns}: ${deleteError.message}`;
+      run.cleanupAttempts = (run.cleanupAttempts || 0) + 1;
+      throw new Error(run.error);
+    }
     run.status = 'failed';
     run.error = error.message;
     try { if (run.forward) run.forward.close(); } catch { /* ignore */ }
-    await deps.exec(kubectlBase(null).concat(['delete', 'namespace', ns, '--ignore-not-found'])).catch(() => {});
     throw error;
   }
 }
@@ -431,8 +475,11 @@ export async function cleanupRun(runId, resultsDir, deps = realDeps) {
   if (run.status === 'deleting') throw Object.assign(new Error(`Run ${runId} cleanup is already in progress.`), { status: 409 });
   if (run.status === 'creating') throw Object.assign(new Error(`Run ${runId} is still being created. Wait for it to become ready (or fail) before cleanup.`), { status: 409 });
   if (run.scenarioRunning) throw Object.assign(new Error(`Run ${runId} has a scenario running. Wait for it before cleanup.`), { status: 409 });
+  if (run.actionRunning) throw Object.assign(new Error(`Run ${runId} has a learner action running. Wait for it before cleanup.`), { status: 409 });
+  if (run.pendingLong) throw Object.assign(new Error(`Run ${runId} has a long request in flight. Terminate it (terminate-serving) before cleanup.`), { status: 409 });
   run.status = 'deleting';
   run.error = null;
+  run.cleanupAttempts = (run.cleanupAttempts || 0) + 1;
   try {
     // Stop traffic first and await in-flight requests, so final counts are
     // stable before the snapshot is taken.

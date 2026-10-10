@@ -75,7 +75,11 @@ function get(endpoint, path, agent, timeoutMs = 8000) {
     const req = http.get(`${endpoint}${path}`, { agent, timeout: timeoutMs }, (res) => {
       const chunks = [];
       res.on('data', (x) => chunks.push(x));
-      res.on('end', () => resolve({ ok: res.statusCode === 200, status: res.statusCode, ms: Date.now() - started, pod: res.headers['x-pod'] }));
+      res.on('end', () => resolve({
+        ok: res.statusCode === 200, status: res.statusCode, ms: Date.now() - started,
+        pod: res.headers['x-pod'], requestId: res.headers['x-request-id'],
+        edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'],
+      }));
       res.on('error', (error) => resolve({ ok: false, error: error.code || error.message, ms: Date.now() - started }));
     });
     req.on('timeout', () => req.destroy(new Error('request timeout')));
@@ -168,8 +172,11 @@ export class LoadSession {
     this.achievedLastSecond = 0;
     this._stopRequested = false;
     this._inflight.clear();
+    this._gen = (this._gen || 0) + 1;
+    this._loopDone = null;
     this.emit('load', { text: `Load started: ${profile} (${this.phaseLabel()}) at ${this.targetRps} req/s for ${Math.round(this.durationMs / 1000)}s`, profile, rps: this.targetRps, phase: this.phaseLabel() });
-    this._loop().catch((error) => this.emit('error', { text: `Load loop error: ${error.message}` }));
+    const gen = this._gen;
+    this._loopDone = this._loop(gen).catch((error) => this.emit('error', { text: `Load loop error: ${error.message}` }));
     return this.state();
   }
 
@@ -194,10 +201,7 @@ export class LoadSession {
     return this.setRps(this.targetRps - this.def().step);
   }
 
-  async stop(reason = 'stopped') {
-    if (!this.active) return this.state();
-    this._stopRequested = true;
-    this.emit('load', { text: `Load stopping (${reason}); waiting for ${this._inflight.size} in-flight requests…`, profile: this.profile, rps: 0 });
+  async _drain() {
     const deadline = Date.now() + 10000;
     while (this._inflight.size > 0 && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
@@ -205,6 +209,17 @@ export class LoadSession {
     for (const p of this._inflight) {
       try { await Promise.race([p, new Promise((r) => setTimeout(r, 500))]); } catch { /* ignore */ }
     }
+  }
+
+  async stop(reason = 'stopped') {
+    if (!this.active) return this.state();
+    // Generation bump retires the pacing loop even if it is asleep on its
+    // timer; awaiting loop exit guarantees no two generators ever overlap.
+    this._gen += 1;
+    this._stopRequested = true;
+    this.emit('load', { text: `Load stopping (${reason}); waiting for ${this._inflight.size} in-flight requests…`, profile: this.profile, rps: 0 });
+    if (this._loopDone) await this._loopDone.catch(() => {});
+    await this._drain();
     this.active = false;
     this.stoppedAt = Date.now();
     this.offeredLastSecond = 0;
@@ -213,17 +228,18 @@ export class LoadSession {
     return this.state();
   }
 
-  async _loop() {
+  async _loop(gen) {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 24 });
     const path = this.path || this.def().path;
     let windowStart = Date.now();
     let windowOffered = 0;
     let windowOk = 0;
+    let sampleCount = 0;
     try {
-      while (!this._stopRequested) {
+      while (!this._stopRequested && gen === this._gen) {
         const elapsed = Date.now() - this.startedAt;
         if (elapsed > this.durationMs) {
-          this.emit('load', { text: `Load finished its ${Math.round(this.durationMs / 1000)}s plan`, profile: this.profile, rps: 0 });
+          this.emit('load', { text: `Load finished its ${Math.round(this.durationMs / 1000)}s plan; settling ${this._inflight.size} in-flight requests…`, profile: this.profile, rps: 0 });
           break;
         }
         const phase = this.phaseAt(elapsed);
@@ -238,9 +254,12 @@ export class LoadSession {
           if (r.ok) {
             this.succeeded += 1;
             windowOk += 1;
+            if (++sampleCount % 10 === 0) {
+              this.emit('sample', { pod: r.pod, ok: true, ms: r.ms, requestId: r.requestId, edgeConnection: r.edgeConnection, appConnection: r.appConnection });
+            }
           } else {
             this.failures += 1;
-            this.emit('request', { pod: r.pod, ok: false, status: r.status, error: r.error, ms: r.ms });
+            this.emit('request', { pod: r.pod, ok: false, status: r.status, error: r.error, ms: r.ms, requestId: r.requestId });
           }
           this._inflight.delete(task);
           return r;
@@ -248,15 +267,20 @@ export class LoadSession {
         this._inflight.add(task);
         windowOffered += 1;
         const now = Date.now();
-        if (now - windowStart >= 1000) {
-          this.offeredLastSecond = windowOffered;
-          this.achievedLastSecond = windowOk;
+        const windowElapsed = (now - windowStart) / 1000;
+        if (windowElapsed >= 1) {
+          // Normalize by actual elapsed time: the loop window can exceed 1s.
+          this.offeredLastSecond = Math.round(windowOffered / windowElapsed);
+          this.achievedLastSecond = Math.round(windowOk / windowElapsed);
           windowStart = now;
           windowOffered = 0;
           windowOk = 0;
         }
         await new Promise((r) => setTimeout(r, intervalMs));
       }
+      // Natural completion settles every in-flight request before reporting
+      // inactive, so final counters never change afterwards.
+      await this._drain();
     } finally {
       agent.destroy();
       if (this.active) {
@@ -264,6 +288,7 @@ export class LoadSession {
         this.stoppedAt = Date.now();
         this.offeredLastSecond = 0;
         this.achievedLastSecond = 0;
+        this.emit('load', { text: `Load settled: ${this.total} requests (${this.succeeded} ok, ${this.failures} failures)`, profile: this.profile, rps: 0 });
       }
     }
   }

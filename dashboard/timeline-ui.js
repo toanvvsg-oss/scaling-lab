@@ -1,3 +1,4 @@
+import { marksUpTo, deriveExplanation } from './timeline.mjs';
 const rateBox = document.getElementById('prometheus-rate');
 const timelineBox = document.getElementById('timeline-chart');
 const detailBox = document.getElementById('timeline-detail');
@@ -104,11 +105,6 @@ function legendHtml(lesson) {
     + `<span><i style="background:#c07a2a"></i>HPA desired (pods)</span><span><i style="background:#3a7ca5"></i>ready (pods)</span><span>✕ request failure</span></div>`;
 }
 
-function marksUpTo(timeline, upto) {
-  const marks = (timeline.milestones || []).filter((m) => !upto || new Date(m.at).getTime() <= upto);
-  return marks.slice(-12);
-}
-
 function marksHtml(timeline, upto) {
   const all = timeline.milestones || [];
   const shown = marksUpTo(timeline, upto);
@@ -127,33 +123,33 @@ function bindMarks(timeline) {
   });
 }
 
-// Measured cause→effect delays from the actual points, not a fixed story.
-function deriveExplanation(points, lesson) {
-  if (points.length < 3) return '';
-  const t0 = new Date(points[0].at).getTime();
-  const first = (pred) => points.find(pred);
-  const rise = first((p) => (p.offeredRps || 0) > 2);
-  const seen = first((p) => (p.observedRps || 0) > 2);
-  const want = first((p) => (p.desired || 0) > 2);
-  const pods = first((p) => (p.ready || 0) > 2);
-  const lag = (a, b) => (a && b ? Math.max(0, Math.round(((new Date(b.at) - new Date(a.at)) / 1000))) : null);
-  const parts = [];
-  if (rise) parts.push(`offered traffic rose at +${fmtElapsed(rise.at ? new Date(rise.at).getTime() - t0 : 0)}`);
-  const s1 = lag(rise, seen);
-  if (s1 != null) parts.push(`scraped RPS followed ~${s1}s later (5s scrape + 30s rate window)`);
-  const s2 = lag(seen || rise, want);
-  if (s2 != null) parts.push(`desired replicas followed ~${s2}s later (KEDA poll + HPA sync)`);
-  const s3 = lag(want || seen || rise, pods);
-  if (s3 != null) parts.push(`Ready pods arrived ~${s3}s later (scheduling + readiness)`);
-  if (!parts.length) return lesson === 'autoscale'
-    ? 'No scaling movement yet. Apply CPU load and watch CPU % cross the 60% target before desired replicas move.'
-    : 'No traffic yet. Start a profile and watch offered → scraped → desired → Ready in that order.';
-  return 'Measured in this run: ' + parts.join('; ') + '. Scale-in reverses the order through the 60s stabilization window.';
-}
-
 function currentKey() {
   return `${window.labLesson || ''}:${window.labRun || ''}`;
 }
+
+function freezeAll() {
+  paused = true; frozenKey = currentKey();
+  if (pauseBtn) pauseBtn.textContent = 'Resume';
+  window.dispatchEvent(new CustomEvent('lab:freeze'));
+}
+
+function resumeAll() {
+  clearInterval(replayTimer);
+  replayTimer = null;
+  paused = false; cursor = -1; frozenKey = null;
+  window.labCursor = null;
+  if (pauseBtn) pauseBtn.textContent = 'Pause';
+  window.dispatchEvent(new CustomEvent('lab:resume'));
+}
+
+function cancelReplay() {
+  clearInterval(replayTimer);
+  replayTimer = null;
+  if (paused || cursor >= 0) resumeAll();
+  else update();
+}
+
+window.addEventListener('lab:select', () => { cancelReplay(); });
 
 async function update() {
   try {
@@ -168,6 +164,7 @@ async function update() {
       fetch(runId ? `/api/runs/${encodeURIComponent(runId)}` : '/api/state').then((r) => r.json()).catch(() => ({})),
     ]);
     const lesson = window.labLesson || appState.lesson || 'prometheus';
+    if (paused || cursor >= 0) { frozenKey = currentKey(); return; } // frozen while fetching: keep the frozen view
     const scaling = runId ? true : (appState.load?.active || appState.running || appState.resetting || appState.scenario === 'prometheus' || appState.scenario === 'autoscale');
     const points = (timeline.points || []).slice(-180);
     const frozen = paused || cursor >= 0;
@@ -193,8 +190,8 @@ async function update() {
     const sampledAt = prom && latest.sampleAt ? ` · stored sample ${fmtClock(latest.sampleAt)}` : '';
     const scrapeNote = prom && latest.scrapeOk === false ? ' · scrape FAILED (not zero)' : '';
     const hpaText = latest.desired == null ? 'desired ?' : `desired ${latest.desired}`;
-    rateBox.innerHTML = `<strong>${esc(head)}</strong><span class="timeline-meta">offered ${latest.offeredRps ?? 0} / achieved ${latest.achievedRps ?? 0} req/s (target ${latest.offeredTarget ?? 0})${esc(scrapedAt)}${esc(sampledAt)}${esc(scrapeNote)} · ${esc(hpaText)} · actual ${latest.actual ?? '?'} · ready ${latest.ready ?? '?'}${latest.terminating ? ` · terminating ${latest.terminating}` : ''} · endpoints ${latest.endpoints ?? '?'}${failCount ? ` · ${failCount} failures` : ''}${prom ? ' · target 5 req/s per pod' : ''}${cpu && latest.currentCPU != null ? ' · CPU target 60%' : ''}</span>`
-      + (prom && latest.counterTotal != null ? `<span class="timeline-meta">raw counter ${Math.round(latest.counterTotal)} requests · scrape targets ${latest.scrapeTargets ?? '?'}</span>` : '');
+    rateBox.innerHTML = `<strong>${esc(head)}</strong><span class="timeline-meta">offered ${latest.offeredRps ?? 0} / achieved ${latest.achievedRps ?? 0} req/s (target ${latest.offeredTarget ?? 0})${esc(scrapedAt)}${esc(sampledAt)}${esc(scrapeNote)} · ${esc(hpaText)} · actual ${latest.actual ?? '?'} · ready ${latest.ready ?? '?'}${latest.terminating ? ` · terminating ${latest.terminating}` : ''} · endpoints ${latest.endpoints ?? '?'}${failCount ? ` · ${failCount} failures` : ''}${prom ? ' · target 5 req/s per pod' : ''}${cpu && latest.currentCPU != null ? ` · CPU ${latest.currentCPU}% (target ${latest.cpuTarget ?? 60}%)` : ''}</span>`
+      + (prom && latest.counterTotal != null ? `<span class="timeline-meta">raw counter ${Math.round(latest.counterTotal)} requests · scrape targets ${latest.scrapeTargets ?? '?'}${latest.externalCurrent != null ? ` · KEDA external avg ${latest.externalCurrent} req/s per pod (target ${latest.externalTarget ?? '?'} avg)` : (latest.externalRaw != null ? ` · KEDA external unavailable (raw ${escape(String(latest.externalRaw))})` : '')}</span>` : '');
 
     if (timelineBox) {
       chartSvg.marks = (timeline.milestones || []).filter((m) => m.kind === 'failure');
@@ -229,10 +226,8 @@ function renderCursor(points, timeline, lesson, upto) {
 
 if (pauseBtn) {
   pauseBtn.onclick = () => {
-    paused = !paused;
-    if (!paused) { cursor = -1; frozenKey = null; }
-    else frozenKey = currentKey();
-    pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+    if (paused) resumeAll();
+    else freezeAll();
     if (!paused) update();
   };
 }
@@ -245,9 +240,9 @@ if (scrubInput) {
     ]);
     const points = (timeline.points || []).slice(-180);
     if (!points.length) return;
-    paused = true; frozenKey = currentKey();
-    if (pauseBtn) pauseBtn.textContent = 'Resume';
+    freezeAll();
     cursor = Number(scrubInput.value);
+    window.labCursor = cursor;
     renderCursor(points, timeline, window.labLesson || 'prometheus', cursor);
   };
 }
@@ -259,21 +254,21 @@ if (document.getElementById('timeline-replay')) {
     const timeline = await fetch(runId ? `/api/runs/${encodeURIComponent(runId)}/timeline` : '/api/timeline').then((r) => r.json());
     const points = (timeline.points || []).slice(-180);
     if (!points.length || !timelineBox) return;
-    paused = true; frozenKey = currentKey();
-    if (pauseBtn) pauseBtn.textContent = 'Resume';
+    freezeAll();
     const lesson = window.labLesson || 'prometheus';
     let i = 0;
     replayTimer = setInterval(() => {
       i += 1;
       if (i >= points.length) {
         clearInterval(replayTimer);
-        paused = false; cursor = -1; frozenKey = null;
-        if (pauseBtn) pauseBtn.textContent = 'Pause';
+        replayTimer = null;
+        resumeAll();
         update();
         return;
       }
       const upto = new Date(points[i].at).getTime();
       cursor = upto;
+      window.labCursor = upto;
       if (scrubInput) scrubInput.value = String(upto);
       renderCursor(points.slice(0, i + 1), timeline, lesson, upto);
       if (cursorLabel) cursorLabel.textContent = `Replaying ${i + 1}/${points.length} — live updates paused, raw evidence stays downloadable.`;

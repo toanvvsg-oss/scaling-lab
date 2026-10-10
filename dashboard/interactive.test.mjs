@@ -1,7 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PROFILES, CPU_PROFILES, LOAD_LIMITS, validateProfile, LoadSession } from './load.mjs';
-import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
+import { createHistory, pushPoint, pushMilestone, cursorAt, filterByTime, marksUpTo, deriveExplanation } from './timeline.mjs';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+test('k8s manifests keep metric queries scoped to their namespace', () => {
+  const scaled = readFileSync(join(repoRoot, 'k8s/prometheus-scaledobject.yaml'), 'utf8');
+  assert.match(scaled, /namespace="scaling-lab"/, 'legacy scaler must not observe run traffic');
+  assert.ok(!scaled.includes('{job="scaling-app"}'), 'no unscoped job selector may remain');
+  const prom = readFileSync(join(repoRoot, 'k8s/prometheus.yaml'), 'utf8');
+  assert.match(prom, /scaling-lab\|scaling-run-\[a-z0-9\]\+/);
+  assert.match(prom, /target_label: labrun/);
+  assert.ok(!prom.includes('names:\n              names: [scaling-lab]'), 'exact-name allowlist cannot wildcard run namespaces');
+  const grafana = readFileSync(join(repoRoot, 'k8s/grafana.yaml'), 'utf8');
+  assert.match(grafana, /namespace=~\\"scaling-run-\$run\\"/);
+  assert.ok(!grafana.includes('scaling-lab|scaling-run-$run'), 'run panels must exclude the shared namespace');
+  assert.match(grafana, /namespace=\\"scaling-lab\\"/, 'legacy panel keeps the shared namespace explicitly');
+});
 import { validateResetTarget, RESET_TARGETS } from './reset.mjs';
 import { createRunId, validateRunId, namespaceFor, buildArchive, MAX_ACTIVE_RUNS, RUN_LESSONS } from './runs.mjs';
 import { rateQueryForRun, upQueryForRun, LEGACY_RATE_QUERY } from './prometheus.mjs';
@@ -68,6 +87,55 @@ test('load phases progress over the session duration', () => {
   s.manualDelta = 1000;
   assert.equal(s.effectiveRps(0), 30);
 });
+test('rapid stop/start never runs two generators concurrently', async () => {
+  const { default: http } = await import('node:http');
+  let hits = 0;
+  const srv = http.createServer((req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'x-pod': 'p1', 'x-request-id': 'r', 'x-edge-connection': '1', 'x-app-connection': '1' });
+    res.end('{}');
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+  try {
+    const s = new LoadSession(() => {}, { endpoint: `http://127.0.0.1:${port}`, cpu: true });
+    await s.start('steady', { durationMs: 120000 });
+    await new Promise((r) => setTimeout(r, 300));
+    await s.stop('test');
+    const before = hits;
+    await s.start('steady', { durationMs: 120000 });
+    await new Promise((r) => setTimeout(r, 510));
+    const fresh = hits - before;
+    // 6 rps * 0.51s ≈ 3 new requests; two overlapping loops would send ~6+.
+    assert.ok(fresh <= 4, `expected at most 4 requests after restart, got ${fresh}`);
+    await s.stop('test');
+  } finally {
+    srv.close();
+  }
+});
+test('delayed responses settle before final counters are reported', async () => {
+  const { default: http } = await import('node:http');
+  const srv = http.createServer((req, res) => {
+    setTimeout(() => { res.writeHead(200, { 'x-pod': 'p1', 'x-request-id': 'r', 'x-edge-connection': '1', 'x-app-connection': '1' }); res.end('{}'); }, 250);
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+  try {
+    const events = [];
+    const s = new LoadSession(() => events.push(0), { endpoint: `http://127.0.0.1:${port}` });
+    await s.start('steady', { durationMs: 30000 });
+    await new Promise((r) => setTimeout(r, 2000));
+    const stopped = await s.stop('test');
+    assert.equal(stopped.active, false);
+    const total = s.total;
+    assert.ok(total > 0);
+    await new Promise((r) => setTimeout(r, 800));
+    assert.equal(s.total, total, 'final counters frozen after stop');
+    assert.equal(s._inflight.size, 0);
+  } finally {
+    srv.close();
+  }
+});
 test('load session clamps rate changes to profile bounds and stops cleanly', async () => {
   const events = [];
   const s = new LoadSession((t, d) => events.push([t, d]));
@@ -117,6 +185,30 @@ test('run evidence archive keeps values and timestamps', () => {
   assert.equal(archive.namespace, 'scaling-run-abc12345');
   assert.equal(archive.timeline.points[0].observedAt, 's1');
   assert.ok(archive.archivedAt);
+});
+test('cursor helpers filter points, events, and milestones by time', () => {
+  const pts = [0, 10, 20, 30].map((s) => ({ at: new Date(1000000 + s * 1000).toISOString(), offeredRps: s }));
+  assert.equal(cursorAt(pts, 1000000 + 15000), 1);
+  assert.equal(cursorAt(pts, 0), -1);
+  const evs = [{ at: pts[0].at }, { at: pts[2].at }];
+  assert.equal(filterByTime(evs, null).length, 2);
+  assert.equal(filterByTime(evs, 1000000 + 5000).length, 1);
+  const tl = { milestones: [{ at: pts[1].at, kind: 'a' }, { at: pts[3].at, kind: 'b' }] };
+  assert.deepEqual(marksUpTo(tl, 1000000 + 15000).map((m) => m.kind), ['a']);
+  assert.equal(marksUpTo(tl, null).length, 2);
+});
+
+test('explanation derives measured delays from points', () => {
+  const t0 = 1000000;
+  const pts = [
+    { at: new Date(t0).toISOString(), offeredRps: 0, observedRps: 0, desired: 2, ready: 2 },
+    { at: new Date(t0 + 5000).toISOString(), offeredRps: 30, observedRps: 0, desired: 2, ready: 2 },
+    { at: new Date(t0 + 15000).toISOString(), offeredRps: 30, observedRps: 27, desired: 5, ready: 5 },
+  ];
+  const text = deriveExplanation(pts, 'prometheus');
+  assert.match(text, /Measured in this run/);
+  assert.match(text, /~10s later/);
+  assert.equal(deriveExplanation(pts.slice(0, 1), 'prometheus'), '');
 });
 test('reset accepts only known lesson targets', () => {
   assert.doesNotThrow(() => validateResetTarget('cpu'));

@@ -68,7 +68,7 @@ make down     # delete only the scaling-lab kind cluster
 | Lesson | Experiment | Pass condition |
 | --- | --- | --- |
 | Connection reuse | Eight reused and eight fresh client connections | The reused requests share an edge connection ID; fresh requests have distinct IDs |
-| Idle timeouts | Compare one-second and 6.5-second idle gaps | The client socket remains while the five-second Node.js upstream socket expires |
+| Idle timeouts | Compare one-second and 6.5-second idle gaps | The client socket remains while the ~6s Node.js upstream socket (5s keep-alive + 1s close buffer) expires |
 | Graceful shutdown | Delete the pod serving an eight-second request | That request finishes and sampled background requests have no failures |
 | Abrupt exit | Repeat shutdown with `SHUTDOWN_MODE=abrupt` | The targeted long request is interrupted, demonstrating the failure |
 | Rolling deployment | Change a pod-template environment variable under traffic | A new pod serves traffic and sampled requests have no failures |

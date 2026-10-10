@@ -44,7 +44,7 @@ spec:
           lifecycle:
             preStop:
               exec:
-                command: ["sh", "-c", "sleep 2"]
+                command: ["node", "/app/prestop.mjs"]
           startupProbe:
             httpGet:
               path: /health/live

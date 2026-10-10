@@ -18,7 +18,7 @@ spec:
     - type: prometheus
       metadata:
         serverAddress: http://prometheus.scaling-lab.svc.cluster.local:9090
-        query: sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))
+        query: sum(rate(scaling_lab_http_requests_total{job="scaling-app",namespace="scaling-lab"}[30s]))
         threshold: "5"
         activationThreshold: "1"
         ignoreNullValues: "false"

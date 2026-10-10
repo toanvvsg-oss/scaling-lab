@@ -8,10 +8,11 @@ import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, runReset } from './reset.mjs';
 import { queryPrometheus, queryRunSamples, LEGACY_RATE_QUERY, rateQueryForRun, upQueryForRun, counterSelForRun, upSelForRun } from './prometheus.mjs';
 import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns } from './runs.mjs';
+import { runAction } from './actions.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const resultsDir = join(root, '..', 'results');
-const files = { '/': ['index.html', 'text/html'], '/worksheet': ['worksheet.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/diagram.css': ['diagram.css', 'text/css'], '/app.js': ['app.js', 'text/javascript'], '/diagram.js': ['diagram.js', 'text/javascript'], '/timeline-ui.js': ['timeline-ui.js', 'text/javascript'], '/worksheet.js': ['worksheet.js', 'text/javascript'] };
+const files = { '/': ['index.html', 'text/html'], '/worksheet': ['worksheet.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/diagram.css': ['diagram.css', 'text/css'], '/app.js': ['app.js', 'text/javascript'], '/diagram.js': ['diagram.js', 'text/javascript'], '/timeline-ui.js': ['timeline-ui.js', 'text/javascript'], '/timeline.mjs': ['timeline.mjs', 'text/javascript'], '/worksheet.js': ['worksheet.js', 'text/javascript'] };
 
 export const EXPLANATIONS = {
   connections: 'One TCP connection can carry many requests (keep-alive), but the proxy terminates the client socket and picks its own upstream socket to Node.js. Reused client requests share an edge connection ID; fresh sockets get new ones — the two pools are independent.',
@@ -39,6 +40,7 @@ export const prodDeps = {
   legacyRateQuery: LEGACY_RATE_QUERY,
   rateQueryForRun, upQueryForRun,
   resetApi: { validateResetTarget, runReset },
+  runAction,
   resultsDir,
   profiles: { request: PROFILES, cpu: CPU_PROFILES },
   enableSampler: true,
@@ -64,9 +66,13 @@ export function createApp(overrides = {}) {
       if (data?.ok === false) pushMilestone(store.timeline, { at: event.at, kind: 'failure', text: `Request failure ${data.error || data.status || ''}`, detail: `Pod ${data.pod || 'unknown'} returned an error. Failures do not drive scaling directly; they signal overload or draining pods.`, observer: 'dashboard load client' });
       return event;
     }
-    if (type === 'hpa' || type === 'cluster' || type === 'endpoint' || type === 'load') {
+    // Sampled successful requests and preStop markers feed the trace lanes;
+    // they never become timeline milestones.
+    if (type === 'sample' || type === 'prestop') return event;
+    if (type === 'hpa' || type === 'cluster' || type === 'endpoint' || type === 'load' || type === 'action') {
       const d = data || {};
-      if (type === 'load') pushMilestone(store.timeline, { at: event.at, kind: 'load', text: d.text || 'Load change', detail: `Offered traffic target is now ${d.rps ?? '?'} req/s. Prometheus observes this after its 5s scrape; HPA reacts later.`, observer: 'load controller' });
+      if (type === 'action') pushMilestone(store.timeline, { at: event.at, kind: 'action', text: d.text || 'Learner action', detail: d.detail || '', observer: 'learner' });
+      else if (type === 'load') pushMilestone(store.timeline, { at: event.at, kind: 'load', text: d.text || 'Load change', detail: `Offered traffic target is now ${d.rps ?? '?'} req/s. Prometheus observes this after its 5s scrape; HPA reacts later.`, observer: 'load controller' });
       else if (type === 'hpa') pushMilestone(store.timeline, { at: event.at, kind: 'hpa', text: d.text || 'HPA decision', detail: 'HPA desired replicas changed. Pod creation and readiness lag behind this decision.', observer: 'Kubernetes HPA' });
       else pushMilestone(store.timeline, { at: event.at, kind: type, text: d.text || type, detail: type === 'cluster' ? 'Pod created, became ready/terminating, or was removed. New pods must pass readiness before receiving traffic.' : 'Endpoint readiness changed; the Service only sends traffic to ready, non-terminating endpoints.', observer: type === 'cluster' ? 'kubelet / Deployment' : 'EndpointSlice controller' });
     }
@@ -153,6 +159,11 @@ export function createApp(overrides = {}) {
           scrapeOk: counter.upAllOne,
           desired: snap.hpa?.desired ?? null,
           currentCPU: snap.hpa?.currentCPU ?? null,
+          cpuTarget: snap.hpa?.cpuTarget ?? null,
+          externalCurrent: snap.hpa?.external?.current ?? null,
+          externalRaw: snap.hpa?.external?.currentRaw ?? null,
+          externalTarget: snap.hpa?.external?.target ?? null,
+          externalName: snap.hpa?.external?.name ?? null,
           actual: snap.pods.filter((p) => !p.terminating).length,
           ready: snap.pods.filter((p) => p.ready && !p.terminating).length,
           terminating: snap.pods.filter((p) => p.terminating).length,
@@ -229,6 +240,8 @@ export function createApp(overrides = {}) {
     if (!session) throw new Error(`Run ${run.id} is not ready for traffic yet.`);
     if (run.scenarioRunning) throw Object.assign(new Error('A scenario is running in this run. Stop it before manual load.'), { status: 409 });
     if (action === 'start') {
+      if (run.actionRunning) throw Object.assign(new Error('A learner action is running in this run. Wait for it before manual load.'), { status: 409 });
+      if (run.pendingLong) throw Object.assign(new Error('A guided long request is in flight. Terminate it before manual load.'), { status: 409 });
       if (session.active) throw Object.assign(new Error('A load session is already running for this run. Stop it before starting another.'), { status: 409 });
       const set = lessonProfiles(run.lesson);
       if (!profile || !Object.hasOwn(set, profile)) throw new Error(`Unknown profile for this lesson. Expected ${Object.keys(set).join(', ')}.`);
@@ -242,6 +255,19 @@ export function createApp(overrides = {}) {
     return session.stop('stopped from UI');
   }
 
+function summarizeAction(s) {
+  if (!s || typeof s !== 'object') return '';
+  if (s.shared !== undefined) return s.shared ? 'one shared edge connection' : 'distinct edge connections';
+  if (s.allDistinct !== undefined) return s.allDistinct ? 'all fresh connections distinct' : 'some connections reused';
+  if (s.clientReused !== undefined) return `client ${s.clientReused ? 'reused' : 'renewed'}, upstream ${s.upstream.after[0] === s.upstream.before[0] && s.upstream.after[1] === s.upstream.before[1] ? 'reused' : 'reconnected'}`;
+  if (s.complete !== undefined) return s.complete ? `completed in ${s.ms}ms` : `interrupted (${s.error || 'no response'})`;
+  if (s.pod && !s.complete && s.action?.startsWith('start')) return `serving pod ${s.pod}`;
+  if (s.rolled) return 'rollout finished';
+  if (s.profile) return `background ${s.profile} started`;
+  if (s.total !== undefined) return `${s.total} background requests sent`;
+  return s.action || '';
+}
+
   function predictionScope(input) {
     if (input.run) {
       R.validateRunId(input.run);
@@ -252,18 +278,16 @@ export function createApp(overrides = {}) {
     return { key: 'legacy', lesson: input.lesson || state.scenario || 'prometheus', run: null };
   }
 
-  // Observation must come AFTER the prediction was recorded; earlier lab
-  // activity does not count.
+  // Observation must come AFTER the prediction was recorded, and baseline
+  // sampler points alone never count: only real experiment activity
+  // (scenario, load, or learner action started after predicting) opens reveal.
   function scopeObservedSince(scope, sinceISO) {
     const t = Date.parse(sinceISO);
     if (!Number.isFinite(t)) return false;
     if (scope.run) {
-      return scope.run.timeline.points.some((p) => Date.parse(p.at) >= t)
-        || scope.run.events.some((e) => Date.parse(e.at) >= t);
+      return Boolean(scope.run.experimentAt) && Date.parse(scope.run.experimentAt) >= t;
     }
-    return (state.started && Date.parse(state.started) >= t)
-      || (load.startedAt && load.startedAt >= t)
-      || state.events.some((e) => Date.parse(e.at) >= t);
+    return Boolean(state.experimentAt) && Date.parse(state.experimentAt) >= t;
   }
 
   const server = http.createServer(async (req, res) => {
@@ -317,7 +341,7 @@ export function createApp(overrides = {}) {
         .catch((error) => emit('error', { text: `Run creation failed: ${error.message}` }));
       return;
     }
-    const runMatch = path.match(/^\/api\/runs\/([A-Za-z0-9-]+)(\/(timeline|load|run|cluster))?$/);
+    const runMatch = path.match(/^\/api\/runs\/([A-Za-z0-9-]+)(\/(timeline|load|run|cluster|actions))?$/);
     if (runMatch) {
       let run;
       try { run = getRun(runMatch[1]); } catch (error) { return send(res, 400, { error: error.message }); }
@@ -342,12 +366,16 @@ export function createApp(overrides = {}) {
         if (input.id !== run.lesson) return send(res, 400, { error: `Scenario ${input.id} does not belong to run ${run.id} (lesson ${run.lesson}).` });
         if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before running scenarios.` });
         if (run.scenarioRunning) return send(res, 409, { error: 'A scenario is already running in this run.' });
+        if (run.actionRunning) return send(res, 409, { error: 'A learner action is running in this run. Wait for it before the one-click scenario.' });
+        if (run.pendingLong) return send(res, 409, { error: 'A guided long request is in flight. Terminate it before the one-click scenario.' });
+        if (run.pendingLong) return send(res, 409, { error: 'A guided long request is in flight. Terminate it before the one-click scenario.' });
         if (run.load?.active) return send(res, 409, { error: 'Manual load is running in this run. Stop it before the one-click scenario.' });
         run.scenarioRunning = true;
         run.scenario = input.id;
         run.mode = input.mode;
         run.result = null;
         run.error = null;
+        run.experimentAt = new Date().toISOString();
         send(res, 202, { started: true });
         const stopObs = observeRun(run);
         io.runScenario(input.id, {
@@ -364,13 +392,46 @@ export function createApp(overrides = {}) {
           const input = await readBody(req);
           if (!['start', 'increase', 'decrease', 'stop'].includes(input.action)) return send(res, 400, { error: 'Unknown load action. Expected start, increase, decrease, or stop.' });
           if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before sending traffic.` });
-          return send(res, 200, await runLoadAction(run, input.action, input.profile, input.durationMs));
+          const out = await runLoadAction(run, input.action, input.profile, input.durationMs);
+          if (input.action === 'start') run.experimentAt = new Date().toISOString();
+          return send(res, 200, out);
+        } catch (error) {
+          return send(res, error.status || 400, { error: error.message });
+        }
+      }
+      if (req.method === 'POST' && sub === 'actions') {
+        try {
+          const input = await readBody(req);
+          if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before learner actions.` });
+          if (run.actionRunning) return send(res, 409, { error: 'Another learner action is running in this run. Wait for it.' });
+          if (run.scenarioRunning) return send(res, 409, { error: 'A scenario is running in this run. Wait for it before learner actions.' });
+          // Guided actions observe clean traffic, except the intentional
+          // rollout background sequence (bg-start, bg-stop, trigger-rollout).
+          if (!['bg-start', 'bg-stop', 'trigger-rollout'].includes(input.action) && run.load?.active) {
+            return send(res, 409, { error: 'Manual load is running in this run. Stop it before learner actions (except the rollout traffic sequence).' });
+          }
+          run.actionRunning = true;
+          try {
+            const summary = await io.runAction(run, input.action, input, (t, d) => runEmit(run, t, d));
+            run.actions = (run.actions || 0) + 1;
+            run.experimentAt = new Date().toISOString();
+            runEmit(run, 'action', { text: `${input.action}: ${summarizeAction(summary)}`, detail: JSON.stringify(summary).slice(0, 300), action: input.action });
+            return send(res, 200, summary);
+          } finally {
+            run.actionRunning = false;
+          }
         } catch (error) {
           return send(res, error.status || 400, { error: error.message });
         }
       }
       if (req.method === 'DELETE' && !sub) {
         if (run.status === 'deleted') return send(res, 409, { error: `Run ${run.id} is already deleted.` });
+        // Preflight the same guards cleanupRun enforces, so a rejected
+        // cleanup returns 409 immediately instead of a misleading 202.
+        if (run.status === 'creating') return send(res, 409, { error: `Run ${run.id} is still being created. Wait before cleanup.` });
+        if (run.scenarioRunning) return send(res, 409, { error: `Run ${run.id} has a scenario running. Wait for it before cleanup.` });
+        if (run.actionRunning) return send(res, 409, { error: `Run ${run.id} has a learner action running. Wait for it before cleanup.` });
+        if (run.pendingLong) return send(res, 409, { error: `Run ${run.id} has a long request in flight. Terminate it (terminate-serving) before cleanup.` });
         send(res, 202, { started: true, run: run.id, namespace: run.ns });
         R.cleanupRun(run.id, io.resultsDir)
           .then(() => emit('note', { text: `Run ${run.id} cleaned up (${run.ns} deleted). Evidence remains downloadable.` }))
@@ -418,6 +479,7 @@ export function createApp(overrides = {}) {
           if (load.active) return send(res, 409, { error: 'A load session is already running. Stop it before starting another.' });
           if (!input.profile || !Object.hasOwn(PROFILES, input.profile)) return send(res, 400, { error: 'Unknown profile. Expected steady, ramp, or burst.' });
           await load.start(input.profile, { durationMs: input.durationMs });
+          state.experimentAt = new Date().toISOString();
           await sampleTimeline();
           return send(res, 200, loadState());
         }
@@ -465,7 +527,7 @@ export function createApp(overrides = {}) {
       let input;
       try { input = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
       if (!['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus'].includes(input.id)) return send(res, 400, { error: 'Unknown scenario' });
-      Object.assign(state, { running: true, scenario: input.id, events: [], rev: 0, result: null, error: null, started: new Date().toISOString(), timeline: createHistory(), predictions: {} });
+      Object.assign(state, { running: true, scenario: input.id, events: [], rev: 0, result: null, error: null, started: new Date().toISOString(), experimentAt: new Date().toISOString(), timeline: createHistory(), predictions: {} });
       send(res, 202, { started: true });
       const stopObservation = observeCluster();
       io.runScenario(input.id, { mode: input.mode }, emit)

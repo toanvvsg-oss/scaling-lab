@@ -11,6 +11,8 @@ async function kubectl(ns, ...args) {
   const { stdout } = await runFile('kubectl', ['--context', 'kind-scaling-lab', '-n', ns, ...args], { timeout: 180000 });
   return stdout.trim();
 }
+export const kubectlIn = (ns, ...args) => kubectl(ns, ...args);
+export { startRequest, traffic, watchPodLogs };
 // namespace defaults to scaling-lab so existing CLI lessons keep working.
 export async function clusterState(ns = 'scaling-lab') {
   try {
@@ -43,10 +45,10 @@ function startRequest(path, agent, baseUrl = base) {
   let headerSent = false;
   const req = http.get(`${baseUrl}${path}`, { agent, timeout: 30000 }, res => {
     headerSent = true;
-    onHeaders({ pod: res.headers['x-pod'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], status: res.statusCode });
+    onHeaders({ pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], status: res.statusCode });
     const chunks = [];
     res.on('data', x => chunks.push(x));
-    res.on('end', () => onDone({ ok: res.statusCode === 200, complete: true, status: res.statusCode, pod: res.headers['x-pod'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], ms: Date.now() - started, body: Buffer.concat(chunks).toString() }));
+    res.on('end', () => onDone({ ok: res.statusCode === 200, complete: true, status: res.statusCode, pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], ms: Date.now() - started, body: Buffer.concat(chunks).toString() }));
     res.on('error', error => onDone({ ok: false, complete: false, error: error.code || error.message, pod: res.headers['x-pod'], ms: Date.now() - started }));
   });
   req.on('timeout', () => req.destroy(new Error('request timeout')));
@@ -64,7 +66,11 @@ async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1, 
   const until = Date.now() + durationMs;
   while (Date.now() < until) {
     const task = startRequest(path, agent, baseUrl).done.then(x => {
-      if (++observed % emitEvery === 0 || !x.ok) emit('request', { pod: x.pod, ok: x.ok, status: x.status, error: x.error, ms: x.ms });
+      const n = ++observed;
+      // Successful samples go to the trace as 'sample' (no milestone);
+      // failures keep the 'request' type so they milestone.
+      if (x.ok && (n % emitEvery === 0)) emit('sample', { pod: x.pod, ok: true, ms: x.ms, requestId: x.requestId, edgeConnection: x.edgeConnection, appConnection: x.appConnection });
+      else if (!x.ok) emit('request', { pod: x.pod, ok: x.ok, status: x.status, error: x.error, ms: x.ms, requestId: x.requestId });
       return x;
     });
     requests.push(task);
@@ -98,9 +104,12 @@ function watchPodLogs(pod, emit, ns = 'scaling-lab') {
     const lines = pending.split('\n');
     pending = lines.pop();
     for (const line of lines) {
+      const pre = /^prestop-(start|end)\b.*$/.exec(line.trim());
+      if (pre) { emit('prestop', { text: `preStop ${pre[1]} · ${pod}`, phase: pre[1], pod }); continue; }
       try {
         const entry = JSON.parse(line);
         if (entry.event?.startsWith('shutdown-')) emit('app-signal', { text: `${entry.event} · ${entry.pod} · active ${entry.active}`, ...entry });
+        else if (entry.event?.startsWith('prestop-')) emit('prestop', { text: `${entry.event} · ${entry.pod || pod} · ${entry.at || ''}`, phase: entry.event.replace('prestop-', ''), pod: entry.pod || pod, at: entry.at });
       } catch { /* ignore non-JSON kubectl output */ }
     }
   });
