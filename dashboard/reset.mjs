@@ -1,8 +1,24 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { queryPrometheus } from './prometheus.mjs';
 
 const runFile = promisify(execFile);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Legacy-namespace scrape check: the namespace label keeps this scoped to
+// scaling-lab even when run namespaces add more scaling-app targets.
+const LEGACY_UP_QUERY = 'count(up{job="scaling-app",namespace="scaling-lab"} == 1)';
+
+export async function verifyLegacyScrape(minTargets = 2, attempts = 12) {
+  let count = 0;
+  for (let i = 0; i < attempts; i++) {
+    const r = await queryPrometheus(LEGACY_UP_QUERY);
+    if (!r.stale) count = r.value;
+    if (count >= minTargets) return count;
+    await sleep(5000);
+  }
+  throw new Error(`Prometheus is not scraping both legacy app pods (saw ${count}, need ${minTargets} for ${LEGACY_UP_QUERY}). Open Status -> Targets via make prometheus-ui, or re-run make prometheus-up.`);
+}
 
 export const RESET_TARGETS = {
   cpu: { lesson: 'autoscale', hpa: 'app', make: 'make hpa-up' },
@@ -100,6 +116,8 @@ export async function runReset(target, emit) {
       if (competing.length) throw new Error(`Competing HPA remains for Deployment/app: ${competing.map((h) => h.metadata.name).join(', ')}`);
       const so = state.scaled.find((s) => s.metadata?.name === 'app-prometheus');
       if (!so) throw new Error('ScaledObject app-prometheus is missing. Run make prometheus-up.');
+      record('verify-scrape', true, 'Verifying Prometheus scrapes both legacy app targets before declaring readiness.');
+      await verifyLegacyScrape();
     }
     if (target === 'baseline' && state.hpas.length) {
       throw new Error(`Expected no HPA after baseline reset, found: ${state.hpas.map((h) => h.metadata.name).join(', ')}`);

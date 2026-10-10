@@ -18,10 +18,10 @@ export function validateProfile(profile) {
   return profile;
 }
 
-function get(path, agent, timeoutMs = 8000) {
+function get(endpoint, path, agent, timeoutMs = 8000) {
   return new Promise((resolve) => {
     const started = Date.now();
-    const req = http.get(`${LOAD_LIMITS.endpoint}${path}`, { agent, timeout: timeoutMs }, (res) => {
+    const req = http.get(`${endpoint}${path}`, { agent, timeout: timeoutMs }, (res) => {
       const chunks = [];
       res.on('data', (x) => chunks.push(x));
       res.on('end', () => resolve({ ok: res.statusCode === 200, status: res.statusCode, ms: Date.now() - started, pod: res.headers['x-pod'] }));
@@ -33,8 +33,10 @@ function get(path, agent, timeoutMs = 8000) {
 }
 
 export class LoadSession {
-  constructor(emit) {
+  constructor(emit, opts = {}) {
     this.emit = emit;
+    this.endpoint = opts.endpoint || LOAD_LIMITS.endpoint;
+    this.path = opts.path || LOAD_LIMITS.path;
     this.active = false;
     this.profile = null;
     this.targetRps = 0;
@@ -128,7 +130,7 @@ export class LoadSession {
           break;
         }
         const intervalMs = 1000 / Math.max(1, this.targetRps);
-        const task = get(LOAD_LIMITS.path, agent).then((r) => {
+        const task = get(this.endpoint, this.path, agent).then((r) => {
           this.total += 1;
           if (!r.ok) {
             this.failures += 1;

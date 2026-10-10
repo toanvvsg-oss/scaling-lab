@@ -76,11 +76,13 @@ function marksHtml(timeline) {
 
 async function update() {
   try {
+    const runId = window.labRun && window.labLesson === 'prometheus' ? window.labRun : null;
     const [timeline, appState] = await Promise.all([
-      fetch('/api/timeline').then((r) => r.json()),
-      fetch('/api/state').then((r) => r.json()).catch(() => ({})),
+      fetch(runId ? `/api/runs/${encodeURIComponent(runId)}/timeline` : '/api/timeline').then((r) => r.json()),
+      fetch(runId ? `/api/runs/${encodeURIComponent(runId)}` : '/api/state').then((r) => r.json()).catch(() => ({})),
     ]);
-    const scaling = appState.load?.active || appState.running || appState.resetting || appState.scenario === 'prometheus' || appState.scenario === 'autoscale';
+    const scaling = runId ? (appState.status === 'ready' || appState.load?.active)
+      : (appState.load?.active || appState.running || appState.resetting || appState.scenario === 'prometheus' || appState.scenario === 'autoscale');
     const points = (timeline.points || []).slice(-120);
     if (!scaling || !points.length) {
       rateBox.innerHTML = '<span class="timeline-empty">Switch to lesson 06/07, start manual load, or run the experiment to observe.</span>';
@@ -90,8 +92,9 @@ async function update() {
     const latest = points.at(-1);
     const stale = latest.stale || latest.observedRps == null;
     const rateText = stale ? 'stale — no fresh Prometheus sample (not zero)' : `${Number(latest.observedRps).toFixed(1)} requests / second`;
+    const scrapedAt = !stale && latest.observedAt ? ` · scraped ${new Date(latest.observedAt).toLocaleTimeString()}` : '';
     const hpaText = latest.desired == null ? 'desired ?' : `desired ${latest.desired}`;
-    rateBox.innerHTML = `<strong>${esc(rateText)}</strong><span class="timeline-meta">offered ${latest.offeredRps ?? 0} req/s (target ${latest.offeredTarget ?? 0}) · ${esc(hpaText)} · actual ${latest.actual ?? '?'} · ready ${latest.ready ?? '?'} · target 5 req/s per pod</span>`;
+    rateBox.innerHTML = `<strong>${esc(rateText)}</strong><span class="timeline-meta">offered ${latest.offeredRps ?? 0} req/s (target ${latest.offeredTarget ?? 0})${esc(scrapedAt)} · ${esc(hpaText)} · actual ${latest.actual ?? '?'} · ready ${latest.ready ?? '?'} · target 5 req/s per pod</span>`;
 
     if (timelineBox && !replaying) {
       timelineBox.innerHTML = chartSvg(points) + legendHtml() + marksHtml(timeline);
@@ -103,7 +106,8 @@ async function update() {
 if (document.getElementById('timeline-replay')) {
   document.getElementById('timeline-replay').onclick = async () => {
     clearInterval(replayTimer);
-    const timeline = await fetch('/api/timeline').then((r) => r.json());
+    const runId = window.labRun && window.labLesson === 'prometheus' ? window.labRun : null;
+    const timeline = await fetch(runId ? `/api/runs/${encodeURIComponent(runId)}/timeline` : '/api/timeline').then((r) => r.json());
     const points = timeline.points || [];
     if (!points.length || !timelineBox) return;
     replaying = true;

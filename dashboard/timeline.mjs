@@ -7,6 +7,7 @@ export function createHistory() {
 export function pushPoint(history, point) {
   history.points.push({
     at: point.at || new Date().toISOString(),
+    observedAt: point.observedAt || null,
     offeredRps: point.offeredRps ?? null,
     offeredTarget: point.offeredTarget ?? null,
     observedRps: 'observedRps' in point ? point.observedRps : null,

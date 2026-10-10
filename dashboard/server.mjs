@@ -1,5 +1,4 @@
 import http from 'node:http';
-import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -7,80 +6,56 @@ import { clusterState, runScenario } from './runner.mjs';
 import { LoadSession, PROFILES } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, runReset } from './reset.mjs';
+import { queryPrometheus, LEGACY_RATE_QUERY, rateQueryForRun } from './prometheus.mjs';
+import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, createRun, cleanupRun, runClusterState, buildArchive } from './runs.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
+const resultsDir = join(root, '..', 'results');
 const files = { '/': ['index.html', 'text/html'], '/worksheet': ['worksheet.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/diagram.css': ['diagram.css', 'text/css'], '/app.js': ['app.js', 'text/javascript'], '/diagram.js': ['diagram.js', 'text/javascript'], '/timeline-ui.js': ['timeline-ui.js', 'text/javascript'], '/worksheet.js': ['worksheet.js', 'text/javascript'] };
 const state = { running: false, scenario: null, events: [], result: null, error: null, started: null, resetting: false, resetSteps: [], load: null, timeline: createHistory(), prediction: null };
 function send(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(value));
 }
-function emit(type, data) {
+// store is { events, timeline }: the global dashboard state or one run record.
+// Run milestones stay in the run's own timeline; the legacy timeline is untouched.
+function pushEvent(store, type, data) {
   const event = { at: new Date().toISOString(), type, data };
-  state.events.push(event);
-  if (state.events.length > 2500) state.events.shift();
+  store.events.push(event);
+  if (store.events.length > 2500) store.events.shift();
   // Only failures become milestones. Successful sampled requests stay in the
   // event log; milestone history is reserved for load changes, HPA decisions,
   // pod/endpoint changes, and request failures.
   if (type === 'request') {
-    if (data?.ok === false) pushMilestone(state.timeline, { at: event.at, kind: 'failure', text: `Request failure ${data.error || data.status || ''}`, detail: `Pod ${data.pod || 'unknown'} returned an error. Failures do not drive scaling directly; they signal overload or draining pods.`, observer: 'dashboard load client' });
+    if (data?.ok === false) pushMilestone(store.timeline, { at: event.at, kind: 'failure', text: `Request failure ${data.error || data.status || ''}`, detail: `Pod ${data.pod || 'unknown'} returned an error. Failures do not drive scaling directly; they signal overload or draining pods.`, observer: 'dashboard load client' });
     return event;
   }
   if (type === 'hpa' || type === 'cluster' || type === 'endpoint' || type === 'load') {
     const d = data || {};
-    if (type === 'load') pushMilestone(state.timeline, { at: event.at, kind: 'load', text: d.text || 'Load change', detail: `Offered traffic target is now ${d.rps ?? '?'} req/s. Prometheus observes this after its 5s scrape; HPA reacts later.`, observer: 'load controller' });
-    else if (type === 'hpa') pushMilestone(state.timeline, { at: event.at, kind: 'hpa', text: d.text || 'HPA decision', detail: 'HPA desired replicas changed. Pod creation and readiness lag behind this decision.', observer: 'Kubernetes HPA' });
-    else pushMilestone(state.timeline, { at: event.at, kind: type, text: d.text || type, detail: type === 'cluster' ? 'Pod created, became ready/terminating, or was removed. New pods must pass readiness before receiving traffic.' : 'Endpoint readiness changed; the Service only sends traffic to ready, non-terminating endpoints.', observer: type === 'cluster' ? 'kubelet / Deployment' : 'EndpointSlice controller' });
+    if (type === 'load') pushMilestone(store.timeline, { at: event.at, kind: 'load', text: d.text || 'Load change', detail: `Offered traffic target is now ${d.rps ?? '?'} req/s. Prometheus observes this after its 5s scrape; HPA reacts later.`, observer: 'load controller' });
+    else if (type === 'hpa') pushMilestone(store.timeline, { at: event.at, kind: 'hpa', text: d.text || 'HPA decision', detail: 'HPA desired replicas changed. Pod creation and readiness lag behind this decision.', observer: 'Kubernetes HPA' });
+    else pushMilestone(store.timeline, { at: event.at, kind: type, text: d.text || type, detail: type === 'cluster' ? 'Pod created, became ready/terminating, or was removed. New pods must pass readiness before receiving traffic.' : 'Endpoint readiness changed; the Service only sends traffic to ready, non-terminating endpoints.', observer: type === 'cluster' ? 'kubelet / Deployment' : 'EndpointSlice controller' });
   }
   return event;
+}
+function emit(type, data) {
+  return pushEvent(state, type, data);
+}
+function runEmit(run, type, data) {
+  return pushEvent(run, type, { ...data, run: run.id });
 }
 
 const load = new LoadSession(emit);
 function loadState() { return load.state(); }
 
-// --- Prometheus sampler for the unified timeline ---
-let promForward = null;
-let promPort = null;
-async function ensurePromForward() {
-  if (promForward && promPort) return promPort;
-  const child = spawn('kubectl', ['--context', 'kind-scaling-lab', '-n', 'scaling-lab', 'port-forward', '--address', '127.0.0.1', 'service/prometheus', ':9090'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  const port = await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => { child.kill(); reject(new Error('Prometheus port-forward did not start')); }, 12000);
-    let output = '';
-    const inspect = (chunk) => {
-      output += chunk.toString();
-      const m = output.match(/Forwarding from 127\.0\.0\.1:(\d+)/);
-      if (m) { clearTimeout(timeout); resolve(Number(m[1])); }
-    };
-    child.stdout.on('data', inspect);
-    child.stderr.on('data', inspect);
-    child.on('error', (e) => { clearTimeout(timeout); reject(e); });
-    child.on('exit', (code) => { clearTimeout(timeout); reject(new Error(`Prometheus port-forward exited ${code}`)); });
-  }).catch((e) => { try { child.kill(); } catch { /* ignore */ } promForward = null; promPort = null; throw e; });
-  promForward = child;
-  promPort = port;
-  child.on('exit', () => { promForward = null; promPort = null; });
-  return port;
-}
-const REQUEST_RATE_QUERY = 'sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))';
-async function queryPromRate() {
-  try {
-    const port = await ensurePromForward();
-    const response = await fetch(`http://127.0.0.1:${port}/api/v1/query?query=${encodeURIComponent(REQUEST_RATE_QUERY)}`, { signal: AbortSignal.timeout(5000) });
-    if (!response.ok) return { value: null, stale: true };
-    const data = await response.json();
-    if (data.status !== 'success') return { value: null, stale: true };
-    const v = data.data?.result?.[0]?.value?.[1];
-    return v == null ? { value: null, stale: true } : { value: Number(v), stale: false };
-  } catch { return { value: null, stale: true }; }
-}
+const profilesPayload = () => Object.fromEntries(Object.entries(PROFILES).map(([k, v]) => [k, { initialRps: v.initialRps, minRps: v.minRps, maxRps: v.maxRps, step: v.step }]));
 
 let sampling = false;
 async function sampleTimeline() {
   if (sampling) return;
   sampling = true;
   try {
-    const [cluster, rate] = await Promise.all([clusterState(), queryPromRate()]);
+    const [cluster, rate] = await Promise.all([clusterState(), queryPrometheus(LEGACY_RATE_QUERY)]);
     if (!cluster.connected) return;
     const actual = cluster.pods.filter((p) => !p.terminating).length;
     const ready = cluster.pods.filter((p) => p.ready && !p.terminating).length;
@@ -88,13 +63,57 @@ async function sampleTimeline() {
       offeredRps: load.active ? load.offeredLastSecond : 0,
       offeredTarget: load.active ? load.targetRps : 0,
       observedRps: rate.value,
+      observedAt: rate.at,
       stale: rate.stale,
       desired: cluster.hpa?.desired ?? null,
       actual, ready,
     });
   } finally { sampling = false; }
 }
-setInterval(sampleTimeline, 5000);
+
+function diffRunState(run, now) {
+  const prev = run.prev;
+  if (prev) {
+    const oldPods = new Map(prev.pods.map((x) => [x.name, x]));
+    for (const pod of now.pods) {
+      const old = oldPods.get(pod.name);
+      if (!old) runEmit(run, 'cluster', { text: `${pod.name} created` });
+      else if (old.terminating !== pod.terminating || old.ready !== pod.ready) runEmit(run, 'cluster', { text: `${pod.name}: ${pod.terminating ? 'terminating' : pod.ready ? 'ready' : 'not ready'}` });
+      oldPods.delete(pod.name);
+    }
+    for (const name of oldPods.keys()) runEmit(run, 'cluster', { text: `${name} removed` });
+    const oldEndpoints = new Map(prev.endpoints.map((x) => [x.pod, x]));
+    for (const endpoint of now.endpoints) {
+      const old = oldEndpoints.get(endpoint.pod);
+      if (!old || old.ready !== endpoint.ready || old.terminating !== endpoint.terminating) runEmit(run, 'endpoint', { text: `${endpoint.pod}: ${endpoint.terminating ? 'terminating' : endpoint.ready ? 'ready' : 'not ready'}` });
+    }
+    if (now.hpa?.desired !== prev.hpa?.desired) runEmit(run, 'hpa', { text: `Desired replicas: ${now.hpa?.desired ?? 'none'}` });
+  }
+  run.prev = now;
+}
+
+async function sampleRuns() {
+  for (const run of runs.values()) {
+    if (run.status !== 'ready') continue;
+    try {
+      const [snap, rate] = await Promise.all([runClusterState(run.id), queryPrometheus(rateQueryForRun(run.id))]);
+      if (!snap.connected) continue;
+      diffRunState(run, snap);
+      pushPoint(run.timeline, {
+        offeredRps: run.load?.active ? run.load.offeredLastSecond : 0,
+        offeredTarget: run.load?.active ? run.load.targetRps : 0,
+        observedRps: rate.value,
+        observedAt: rate.at,
+        stale: rate.stale,
+        desired: snap.hpa?.desired ?? null,
+        actual: snap.pods.filter((p) => !p.terminating).length,
+        ready: snap.pods.filter((p) => p.ready && !p.terminating).length,
+      });
+    } catch { /* skip this round for this run */ }
+  }
+}
+
+setInterval(async () => { await sampleTimeline(); await sampleRuns(); }, 5000);
 
 function observeCluster() {
   let previous = null, busy = false;
@@ -135,16 +154,95 @@ async function readBody(req, limit = 4096) {
   return body ? JSON.parse(body) : {};
 }
 
+function getRun(id) {
+  validateRunId(id);
+  const run = runs.get(id);
+  if (!run) return null;
+  return run;
+}
+
+async function runLoadAction(run, action, profile) {
+  const session = run.load;
+  if (!session) throw new Error(`Run ${run.id} is not ready for traffic yet.`);
+  if (action === 'start') {
+    if (session.active) throw Object.assign(new Error('A load session is already running for this run. Stop it before starting another.'), { status: 409 });
+    if (!profile || !Object.hasOwn(PROFILES, profile)) throw new Error('Unknown profile. Expected steady, ramp, or burst.');
+    await session.start(profile);
+    await sampleRuns();
+    return session.state();
+  }
+  if (!session.active) throw new Error('No active load session for this run.');
+  if (action === 'increase') return session.increase();
+  if (action === 'decrease') return session.decrease();
+  return session.stop('stopped from UI');
+}
+
 const server = http.createServer(async (req, res) => {
-  const path = new URL(req.url, 'http://localhost').pathname;
+  const url = new URL(req.url, 'http://localhost');
+  const path = url.pathname;
   if (req.method === 'GET' && path === '/api/state') {
-    return send(res, 200, { ...state, load: loadState(), profiles: Object.fromEntries(Object.entries(PROFILES).map(([k, v]) => [k, { initialRps: v.initialRps, minRps: v.minRps, maxRps: v.maxRps, step: v.step }])) });
+    return send(res, 200, { ...state, load: loadState(), profiles: profilesPayload(), runs: [...runs.values()].map(describeRun), archivedRuns: [...archives.keys()] });
   }
   if (req.method === 'GET' && path === '/api/cluster') return send(res, 200, await clusterState());
   if (req.method === 'GET' && path === '/api/load') return send(res, 200, loadState());
   if (req.method === 'GET' && path === '/api/timeline') return send(res, 200, state.timeline);
   if (req.method === 'GET' && path === '/api/evidence') {
+    const runParam = url.searchParams.get('run');
+    if (runParam) {
+      try { validateRunId(runParam); } catch (error) { return send(res, 400, { error: error.message }); }
+      const live = runs.get(runParam);
+      if (live) return send(res, 200, buildArchive(live));
+      const archived = archives.get(runParam);
+      if (archived) return send(res, 200, archived);
+      return send(res, 404, { error: `Unknown run: ${runParam}` });
+    }
     return send(res, 200, { scenario: state.scenario, started: state.started, result: state.result, error: state.error, load: loadState(), timeline: state.timeline, events: state.events });
+  }
+  if (req.method === 'GET' && path === '/api/runs') {
+    return send(res, 200, [...runs.values()].map(describeRun));
+  }
+  if (req.method === 'POST' && path === '/api/runs') {
+    let input;
+    try { input = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
+    if (!RUN_LESSONS.has(input.lesson)) return send(res, 400, { error: 'Unknown run lesson. Expected prometheus.' });
+    if (activeRuns().length >= MAX_ACTIVE_RUNS) return send(res, 409, { error: `Run limit reached (${MAX_ACTIVE_RUNS} active runs: ${activeRuns().map((r) => r.id).join(', ')}). Clean up a run before creating another.` });
+    send(res, 202, { started: true });
+    createRun(input.lesson, emit)
+      .then((run) => {
+        run.load = new LoadSession((t, d) => runEmit(run, t, d));
+        run.load.endpoint = `http://127.0.0.1:${run.forwardPort}`;
+        emit('note', { text: `Run ${run.id} ready in ${run.ns}.` });
+      })
+      .catch((error) => emit('error', { text: `Run creation failed: ${error.message}` }));
+    return;
+  }
+  const runMatch = path.match(/^\/api\/runs\/([A-Za-z0-9-]+)(\/(timeline|load))?$/);
+  if (runMatch) {
+    let run;
+    try { run = getRun(runMatch[1]); } catch (error) { return send(res, 400, { error: error.message }); }
+    if (!run) return send(res, 404, { error: `Unknown run: ${runMatch[1]}` });
+    const sub = runMatch[3];
+    if (req.method === 'GET' && !sub) return send(res, 200, { ...describeRun(run), events: run.events.slice(-200) });
+    if (req.method === 'GET' && sub === 'timeline') return send(res, 200, run.timeline);
+    if (req.method === 'POST' && sub === 'load') {
+      try {
+        const input = await readBody(req);
+        if (!['start', 'increase', 'decrease', 'stop'].includes(input.action)) return send(res, 400, { error: 'Unknown load action. Expected start, increase, decrease, or stop.' });
+        if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before sending traffic.` });
+        return send(res, 200, await runLoadAction(run, input.action, input.profile));
+      } catch (error) {
+        return send(res, error.status || 400, { error: error.message });
+      }
+    }
+    if (req.method === 'DELETE' && !sub) {
+      if (run.status === 'deleting' || run.status === 'deleted') return send(res, 409, { error: `Run ${run.id} is already ${run.status}.` });
+      send(res, 202, { started: true, run: run.id, namespace: run.ns });
+      cleanupRun(run.id, resultsDir)
+        .then(() => emit('note', { text: `Run ${run.id} cleaned up (${run.ns} deleted). Evidence remains downloadable.` }))
+        .catch((error) => emit('error', { text: `Run cleanup failed: ${error.message}` }));
+      return;
+    }
+    return send(res, 405, { error: 'Method not allowed for this run resource.' });
   }
   if (req.method === 'POST' && path === '/api/predict') {
     try {

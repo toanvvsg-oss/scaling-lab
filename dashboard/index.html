@@ -25,9 +25,16 @@
         <div class="concept"><div class="concept-label">THE IDEA</div><p id="lesson-concept"></p></div>
         <div class="diagram"><div class="section-head"><h3>Concept in motion</h3><button id="replay" class="replay">↻ Replay</button></div><div id="diagram-track" class="diagram-track"><div class="diagram-node" id="diagram-client"><small>01</small>Client</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-edge"><small>02</small>Edge</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-service"><small>03</small>Service</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-pod"><small>04</small>Pod</div></div><div class="diagram-caption"><span id="diagram-step"></span><p id="diagram-text"></p></div><div id="diagram-dots" class="diagram-dots"></div></div>
         <div class="experiment"><div class="section-head"><h3>Run the experiment</h3><span class="step">01 / OBSERVE</span></div><p id="lesson-task"></p><div id="options"></div><div class="actions"><button id="run" class="primary">Run experiment <span>→</span></button><span id="run-state"></span></div>
+          <div id="run-panel" hidden>
+            <h4>Isolated runs (Prometheus lesson)</h4>
+            <p class="micro">Each run gets its own namespace <code>scaling-run-&lt;id&gt;</code> with app, edge, and KEDA scaler (max 2 active). Switching runs never touches another run.</p>
+            <div class="actions"><button id="run-new">New run</button><select id="run-select"></select><button id="run-evidence">Download evidence</button><button id="run-cleanup-open">Clean up run…</button></div>
+            <p id="run-panel-state" class="micro">No runs yet — create one to start.</p>
+            <p id="archived-list" class="micro"></p>
+          </div>
           <div id="load-panel" hidden>
             <h4>Manual traffic (lesson 07 walkthrough)</h4>
-            <p class="micro">Profiles are bounded for a laptop kind cluster (5–40 req/s, 5 min safety limit). Uses the lab edge at 127.0.0.1:8080.</p>
+            <p class="micro">Profiles are bounded for a laptop kind cluster (5–40 req/s, 5 min safety limit). CPU lesson uses the lab edge at 127.0.0.1:8080; Prometheus runs route to the selected run's own edge.</p>
             <div class="actions"><select id="load-profile"><option value="steady">steady · 15 req/s</option><option value="ramp">ramp · starts 5 req/s</option><option value="burst">burst · 30 req/s</option></select><button id="load-start">Start</button><button id="load-inc">Increase</button><button id="load-dec">Decrease</button><button id="load-stop">Stop</button></div>
             <p id="load-state" class="micro">Manual load idle.</p>
             <div class="predict"><p><strong>Predict:</strong> what will the metric and replicas do next?</p><div class="actions"><button data-guess="up">Scale up</button><button data-guess="same">Stay</button><button data-guess="down">Scale down</button><button id="predict-reveal">Reveal explanation</button></div><p id="predict-state" class="micro"></p></div>
@@ -57,6 +64,17 @@
     <p>This is separate from lesson reset. It deletes <strong>only</strong> the <code>kind-scaling-lab</code> cluster. Lesson switching never deletes the cluster.</p>
     <p>Run in a terminal: <code>make down</code></p>
     <div class="actions"><button id="delete-cancel">Cancel</button></div>
+  </dialog>
+  <dialog id="cleanup-dialog">
+    <h3>Clean up run?</h3>
+    <p id="cleanup-text"></p>
+    <ul>
+      <li>Stops the run's traffic and deletes its namespace and all its resources (app, edge, scaler).</li>
+      <li>Other runs keep their namespaces, traffic routes, graphs, and evidence.</li>
+      <li>The run's evidence snapshot stays downloadable afterwards.</li>
+    </ul>
+    <p id="cleanup-status" class="micro"></p>
+    <div class="actions"><button id="cleanup-download">Download evidence first</button><button id="cleanup-cancel">Cancel (changes nothing)</button><button id="cleanup-confirm" class="primary">Confirm cleanup</button></div>
   </dialog>
   <script type="module" src="/app.js"></script>
   <script type="module" src="/diagram.js"></script>

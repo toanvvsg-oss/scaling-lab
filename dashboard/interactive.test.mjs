@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { PROFILES, LOAD_LIMITS, validateProfile, LoadSession } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, RESET_TARGETS } from './reset.mjs';
+import { createRunId, validateRunId, namespaceFor, buildArchive, MAX_ACTIVE_RUNS, RUN_LESSONS } from './runs.mjs';
+import { rateQueryForRun, upQueryForRun, LEGACY_RATE_QUERY } from './prometheus.mjs';
 
 test('load profiles stay within laptop-safe bounds', () => {
   for (const [name, p] of Object.entries(PROFILES)) {
@@ -54,6 +56,38 @@ test('load session clamps rate changes to profile bounds and stops cleanly', asy
   assert.equal(stopped.offeredLastSecond, 0);
   const idle = await s.stop('test');
   assert.equal(idle.active, false);
+});
+test('run ids are server-shaped, validated, and scoped to one namespace', () => {
+  assert.match(createRunId(), /^[a-z0-9]{8}$/);
+  assert.equal(namespaceFor('abc12345'), 'scaling-run-abc12345');
+  assert.throws(() => validateRunId('../evil'), /Invalid run id/);
+  assert.throws(() => validateRunId('scaling-lab'), /Invalid run id/);
+  assert.throws(() => validateRunId(undefined), /Invalid run id/);
+  assert.throws(() => namespaceFor('app'), /Invalid run id/);
+  assert.ok(RUN_LESSONS.has('prometheus'));
+  assert.equal(MAX_ACTIVE_RUNS, 2);
+});
+
+test('run metric queries carry the run selector, legacy query stays namespaced', () => {
+  assert.ok(rateQueryForRun('abc12345').includes('labrun="abc12345"'));
+  assert.ok(upQueryForRun('abc12345').includes('labrun="abc12345"'));
+  assert.ok(LEGACY_RATE_QUERY.includes('namespace="scaling-lab"'));
+  assert.throws(() => rateQueryForRun('../../x'), /Invalid run id/);
+});
+
+test('run evidence archive keeps values and timestamps', () => {
+  const fake = {
+    id: 'abc12345', lesson: 'prometheus', ns: 'scaling-run-abc12345',
+    createdAt: '2026-10-10T00:00:00.000Z', status: 'ready', error: null, steps: [],
+    load: { state: () => ({ active: false, total: 10 }) }, result: { status: 'pass' },
+    timeline: { points: [{ at: 't1', observedAt: 's1', offeredRps: 5 }], milestones: [] },
+    events: [{ at: 't0', type: 'run', data: {} }],
+  };
+  const archive = buildArchive(fake);
+  assert.equal(archive.run, 'abc12345');
+  assert.equal(archive.namespace, 'scaling-run-abc12345');
+  assert.equal(archive.timeline.points[0].observedAt, 's1');
+  assert.ok(archive.archivedAt);
 });
 test('reset accepts only known lesson targets', () => {
   assert.doesNotThrow(() => validateResetTarget('cpu'));

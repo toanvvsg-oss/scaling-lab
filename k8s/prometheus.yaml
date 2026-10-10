@@ -28,6 +28,28 @@ roleRef:
   name: prometheus-pod-discovery
   apiGroup: rbac.authorization.k8s.io
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-discovery
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-discovery
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: scaling-lab
+roleRef:
+  kind: ClusterRole
+  name: prometheus-discovery
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -41,11 +63,15 @@ data:
     scrape_configs:
       - job_name: scaling-app
         metrics_path: /metrics
+        # No namespaces.names allowlist: that field is exact-name only and
+        # cannot wildcard scaling-run-*. Discover pods in all namespaces and
+        # keep only the legacy lab namespace plus run namespaces below.
         kubernetes_sd_configs:
           - role: pod
-            namespaces:
-              names: [scaling-lab]
         relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace]
+            action: keep
+            regex: scaling-lab|scaling-run-[a-z0-9]+
           - source_labels: [__meta_kubernetes_pod_label_app]
             action: keep
             regex: scaling-app
@@ -54,6 +80,8 @@ data:
             replacement: $1:3000
           - source_labels: [__meta_kubernetes_namespace]
             target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_label_labrun]
+            target_label: labrun
       - job_name: kube-state-metrics
         metrics_path: /metrics
         kubernetes_sd_configs:

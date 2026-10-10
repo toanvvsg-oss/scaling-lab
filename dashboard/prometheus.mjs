@@ -1,0 +1,54 @@
+import { spawn } from 'node:child_process';
+
+export const LEGACY_RATE_QUERY = 'sum(rate(scaling_lab_http_requests_total{job="scaling-app",namespace="scaling-lab"}[30s]))';
+export const SCRAPE_TARGET = 5;
+
+export function rateQueryForRun(runId) {
+  if (!/^[a-z0-9]{8}$/.test(runId)) throw new Error(`Invalid run id: ${runId}`);
+  return `sum(rate(scaling_lab_http_requests_total{job="scaling-app",labrun="${runId}"}[30s]))`;
+}
+
+export function upQueryForRun(runId) {
+  if (!/^[a-z0-9]{8}$/.test(runId)) throw new Error(`Invalid run id: ${runId}`);
+  return `count(up{job="scaling-app",labrun="${runId}"} == 1)`;
+}
+
+let forward = null;
+let port = null;
+
+export async function prometheusPort() {
+  if (forward && port) return port;
+  const child = spawn('kubectl', ['--context', 'kind-scaling-lab', '-n', 'scaling-lab', 'port-forward', '--address', '127.0.0.1', 'service/prometheus', ':9090'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const found = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { child.kill(); reject(new Error('Prometheus port-forward did not start')); }, 12000);
+    let output = '';
+    const inspect = (chunk) => {
+      output += chunk.toString();
+      const m = output.match(/Forwarding from 127\.0\.0\.1:(\d+)/);
+      if (m) { clearTimeout(timeout); resolve(Number(m[1])); }
+    };
+    child.stdout.on('data', inspect);
+    child.stderr.on('data', inspect);
+    child.on('error', (e) => { clearTimeout(timeout); reject(e); });
+    child.on('exit', (code) => { clearTimeout(timeout); reject(new Error(`Prometheus port-forward exited ${code}`)); });
+  }).catch((e) => { try { child.kill(); } catch { /* ignore */ } forward = null; port = null; throw e; });
+  forward = child;
+  port = found;
+  child.on('exit', () => { forward = null; port = null; });
+  return port;
+}
+
+// Returns { value, at, stale }. `at` is the Prometheus sample timestamp
+// (seconds since epoch from the result vector), not the dashboard poll time.
+export async function queryPrometheus(query) {
+  try {
+    const p = await prometheusPort();
+    const response = await fetch(`http://127.0.0.1:${p}/api/v1/query?query=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) return { value: null, at: null, stale: true };
+    const data = await response.json();
+    if (data.status !== 'success') return { value: null, at: null, stale: true };
+    const sample = data.data?.result?.[0]?.value;
+    if (sample == null) return { value: null, at: null, stale: true };
+    return { value: Number(sample[1]), at: new Date(Number(sample[0]) * 1000).toISOString(), stale: false };
+  } catch { return { value: null, at: null, stale: true }; }
+}

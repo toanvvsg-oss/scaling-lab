@@ -134,7 +134,10 @@ async function prometheusValue(port, query) {
   return value == null ? null : Number(value);
 }
 
-const REQUEST_RATE_QUERY = 'sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))';
+const REQUEST_RATE_QUERY = 'sum(rate(scaling_lab_http_requests_total{job="scaling-app",namespace="scaling-lab"}[30s]))';
+// Legacy-namespace scrape check: namespace label keeps CLI verification scoped
+// to scaling-lab when run namespaces add more scaling-app targets.
+const SCRAPE_UP_QUERY = 'count(up{job="scaling-app",namespace="scaling-lab"} == 1)';
 
 export function requireAutoscaler(state, kind) {
   const hpa = state.hpa;
@@ -152,7 +155,7 @@ async function runPrometheusScenario(emit) {
   try {
     let scrapeTargets = 0;
     for (let attempt = 0; attempt < 12; attempt++) {
-      scrapeTargets = await prometheusValue(forward.port, 'count(up{job="scaling-app"} == 1)') ?? 0;
+      scrapeTargets = await prometheusValue(forward.port, SCRAPE_UP_QUERY) ?? 0;
       if (scrapeTargets >= 2) break;
       await sleep(5000);
     }
