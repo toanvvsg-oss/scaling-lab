@@ -47,10 +47,18 @@ Reusable scripted acceptance (needs Google Chrome plus
 
 ```sh
 node scripts/ui-accept.mjs
+node scripts/ui-race.mjs
+node scripts/ui-history.mjs
 ```
 
 Every check asserts and the script exits nonzero on any FAIL. Screenshots and
 downloaded evidence land in `results/`.
+
+`ui-history.mjs` requires a Ready Prometheus run and uses controlled browser
+responses to check historical pod/endpoint snapshots, request trace filtering,
+rate headlines, and resume. It does not mutate the cluster. `ui-race.mjs`
+requires one free run slot and a retained Prometheus run; it deletes only its
+own temporary run. Both exit nonzero when an assertion fails.
 
 ## Run isolation checks (API)
 

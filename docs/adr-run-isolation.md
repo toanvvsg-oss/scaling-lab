@@ -1,12 +1,12 @@
 # ADR: Run isolation for interactive autoscaling labs
 
-Status: Reviewed implementation pending final verification — the behaviors below are implemented and live-verified; the reviewer re-runs targeted checks before acceptance.
+Status: Accepted — reviewed on 2026-10-10 with live kind isolation/cleanup, guided shutdown/streaming, browser history and selection checks, and 55 passing unit tests. See `docs/kind-acceptance.md` for repeatable verification.
 
 Extended slice: all seven lessons now run isolated. `dashboard/runner.mjs` threads `namespace`/`endpoint` (defaults preserve the legacy `scaling-lab` + `:8080` CLI path); `POST /api/runs/:id/run` executes any matching scenario inside the run namespace; the UI provisions a fresh run per lesson on Run. Autoscale runs provision a CPU HPA; the other five get app + edge only.
 
 ## Problem
 
-All seven lessons share namespace `scaling-lab` and edge endpoint `127.0.0.1:8080`. Switching lessons deletes the active HPA/ScaledObject and restarts `app`/`edge`, so run A cannot survive while the learner experiments with run B. Prometheus queries (`sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))`) have no run selector, so traffic from one run would move another run's graph and scaler.
+Previously, all seven lessons shared namespace `scaling-lab` and edge endpoint `127.0.0.1:8080`. Switching lessons deleted the active HPA/ScaledObject and restarted `app`/`edge`, so run A could not survive while the learner experimented with run B. Prometheus queries without a run selector also mixed traffic from different runs.
 
 ## Decision
 
@@ -30,7 +30,7 @@ Every server-side kubectl call pins `--context kind-scaling-lab` and the run nam
 
 ### Traffic routing
 
-The dashboard keeps one managed `kubectl port-forward` per active run (`svc/edge` in the run namespace to a server-picked localhost port). Each run owns one `LoadSession` aimed at its forwarded port: request profiles (`steady`/`ramp`/`burst` with phases) or CPU-work profiles for autoscale runs, with duration controls (30s–5min cap). Stopping a run's load or deleting the run kills its forward and awaits in-flight requests; a browser refresh reconnects to the server-side session (lesson/run selection persists locally). The legacy fixed edge `127.0.0.1:8080` and `/api/run`, `/api/load`, `/api/reset` remain only as a compatibility path for direct API/CLI use; the UI drives all lessons through runs.
+The dashboard keeps one managed `kubectl port-forward` per active run (`svc/edge` in the run namespace to a server-picked localhost port). Each run owns one `LoadSession` aimed at its forwarded port: request profiles (`steady`/`ramp`/`burst` with phases) or CPU-work profiles for autoscale runs, with duration controls (30s–5min cap). Stopping load awaits in-flight requests and keeps the route available for the next action; deleting a run also closes its forward. A browser refresh reconnects to the server-side session (lesson/run selection persists locally). The legacy fixed edge `127.0.0.1:8080` and `/api/run`, `/api/load`, `/api/reset` remain only as a compatibility path for direct API/CLI use; the UI drives all lessons through runs.
 
 ### Metric labels and timestamps
 
@@ -44,7 +44,7 @@ The dashboard keeps one managed `kubectl port-forward` per active run (`svc/edge
 - `DELETE /api/runs/<id>` rejects synchronously (409) while creation, a scenario, a learner action, or a guided long request is active. Otherwise it stops traffic first, snapshots evidence (run metadata, events, timeline with all timestamps, load totals, verification state), writes and re-reads `results/archive-<id>.json`, keeps it in memory, then deletes the namespace idempotently (`--ignore-not-found`; an already-absent namespace succeeds and frees the slot). `GET /api/evidence?run=<id>` serves live, in-memory, or on-disk snapshots after cleanup.
 - "New run" for any lesson creates a fresh run instead of mutating anything; lesson switching never touches another run.
 - Active-run limit is **2**, counting every non-terminal run (`ready`, `creating`, `deleting`, `degraded`, `cleanup-failed`) — only `deleted` and confirmed-gone `failed` free a slot. Creation beyond the limit is rejected with the IDs of active runs to clean up.
-- Guided learner actions (`POST /api/runs/<id>/actions`) execute one observable step per lesson (connection batches, gap probes, long-request start/terminate, rollout traffic + trigger) with mutual exclusion against scenarios, loads, and cleanup; the preStop lifecycle hook reports through an app-local `/lifecycle` endpoint.
+- Guided learner actions (`POST /api/runs/<id>/actions`) execute one observable step per lesson (connection batches, gap probes, long-request start/terminate, rollout traffic + trigger) with mutual exclusion against scenarios, loads, and cleanup; the preStop lifecycle hook reports through an app-local `/lifecycle/prestop` endpoint.
 - Guided predictions are scoped per run/lesson with per-lesson explanations; reveal requires experiment activity recorded after the prediction.
 
 ## Compatibility and known limits
