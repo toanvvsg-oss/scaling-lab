@@ -76,7 +76,7 @@ function marksHtml(timeline) {
 
 async function update() {
   try {
-    const runId = window.labRun && window.labLesson === 'prometheus' ? window.labRun : null;
+    const runId = window.labRun ? window.labRun : null;
     const [timeline, appState] = await Promise.all([
       fetch(runId ? `/api/runs/${encodeURIComponent(runId)}/timeline` : '/api/timeline').then((r) => r.json()),
       fetch(runId ? `/api/runs/${encodeURIComponent(runId)}` : '/api/state').then((r) => r.json()).catch(() => ({})),
@@ -106,7 +106,7 @@ async function update() {
 if (document.getElementById('timeline-replay')) {
   document.getElementById('timeline-replay').onclick = async () => {
     clearInterval(replayTimer);
-    const runId = window.labRun && window.labLesson === 'prometheus' ? window.labRun : null;
+    const runId = window.labRun ? window.labRun : null;
     const timeline = await fetch(runId ? `/api/runs/${encodeURIComponent(runId)}/timeline` : '/api/timeline').then((r) => r.json());
     const points = timeline.points || [];
     if (!points.length || !timelineBox) return;

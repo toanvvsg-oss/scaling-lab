@@ -9,7 +9,10 @@ const runFile = promisify(execFile);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export const MAX_ACTIVE_RUNS = 2;
-export const RUN_LESSONS = new Set(['prometheus']);
+// Every lesson can run isolated. Only the autoscaling lessons add a scaler;
+// the other five get app + edge only.
+export const RUN_LESSONS = new Set(['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus']);
+const SCALER_LESSON = { autoscale: 'cpu-hpa', prometheus: 'keda' };
 const RUN_ID_RE = /^[a-z0-9]{8}$/;
 
 export function createRunId() {
@@ -29,6 +32,52 @@ export function namespaceFor(runId) {
 
 export const runs = new Map();
 export const archives = new Map();
+
+// Re-adopt run namespaces left behind by a dashboard restart. Strictly scoped:
+// the name must match scaling-run-<8 hex>, the owner label must be exactly
+// "dashboard", and the lesson must be one the dashboard can drive. Anything
+// else is never touched. Adopted runs resume sampling under a new edge
+// forward; their previous in-memory events are gone (archive files persist).
+export async function adoptOrphanRuns() {
+  const adopted = [];
+  let items = [];
+  try {
+    const raw = await kubectl('get', 'namespaces', '-l', 'scaling.lab/owner=dashboard', '-o', 'json');
+    items = JSON.parse(raw).items;
+  } catch {
+    return adopted;
+  }
+  for (const ns of items) {
+    const name = ns.metadata?.name || '';
+    const labels = ns.metadata?.labels || {};
+    const m = /^scaling-run-([a-z0-9]{8})$/.exec(name);
+    if (!m) continue;
+    if (labels['scaling.lab/owner'] !== 'dashboard') continue;
+    if (!RUN_LESSONS.has(labels['scaling.lab/lesson'])) continue;
+    const id = m[1];
+    if (runs.has(id)) continue;
+    const present = await kubectl('-n', name, 'get', 'deployment/app', 'deployment/edge', '-o', 'name').catch(() => null);
+    const run = {
+      id, ns: name, lesson: labels['scaling.lab/lesson'], status: present ? 'ready' : 'degraded',
+      error: present ? null : 'Run namespace is missing its app or edge deployment.',
+      createdAt: ns.metadata.creationTimestamp || new Date().toISOString(),
+      steps: [], events: [], timeline: createHistory(), result: null,
+      load: null, forward: null, forwardPort: null, prev: null, readopted: true,
+    };
+    if (present) {
+      try {
+        const fwd = await startEdgeForward(id);
+        run.forward = fwd; run.forwardPort = fwd.port;
+      } catch (error) {
+        run.status = 'degraded';
+        run.error = error.message;
+      }
+    }
+    runs.set(id, run);
+    adopted.push(run);
+  }
+  return adopted;
+}
 
 function kubectlBase(ns) {
   return ['--context', 'kind-scaling-lab', ...(ns ? ['-n', ns] : [])];
@@ -142,6 +191,19 @@ function edgeManifests(ns) {
   ];
 }
 
+function cpuHpaManifest(ns) {
+  return {
+    apiVersion: 'autoscaling/v2', kind: 'HorizontalPodAutoscaler',
+    metadata: { name: 'app', namespace: ns },
+    spec: {
+      scaleTargetRef: { apiVersion: 'apps/v1', kind: 'Deployment', name: 'app' },
+      minReplicas: 2, maxReplicas: 5,
+      behavior: { scaleDown: { stabilizationWindowSeconds: 60 } },
+      metrics: [{ type: 'Resource', resource: { name: 'cpu', target: { type: 'Utilization', averageUtilization: 60 } } }],
+    },
+  };
+}
+
 function scaledObjectManifest(runId, ns) {
   return {
     apiVersion: 'keda.sh/v1alpha1', kind: 'ScaledObject',
@@ -253,6 +315,10 @@ export function describeRun(run) {
     id: run.id, lesson: run.lesson, namespace: run.ns, status: run.status,
     createdAt: run.createdAt, error: run.error || null, steps: run.steps,
     load: run.load ? run.load.state() : { active: false },
+    readopted: Boolean(run.readopted),
+    scenario: run.scenario || null,
+    scenarioRunning: Boolean(run.scenarioRunning),
+    resultStatus: run.result?.status || null,
     resources: {
       appReplicas: 2, appCpuRequest: '100m', appMemoryRequest: '64Mi',
       edgeReplicas: 1, note: 'Fixed footprint per run: 2 app pods (100m/64Mi each) + 1 edge pod. Active-run limit keeps laptop usage bounded.',
@@ -261,7 +327,7 @@ export function describeRun(run) {
 }
 
 export async function createRun(lesson, onEvent) {
-  if (!RUN_LESSONS.has(lesson)) throw new Error(`Unknown run lesson: ${lesson}. Expected prometheus.`);
+  if (!RUN_LESSONS.has(lesson)) throw new Error(`Unknown run lesson: ${lesson}. Expected one of ${[...RUN_LESSONS].join(', ')}.`);
   if (activeRuns().length >= MAX_ACTIVE_RUNS) {
     throw new Error(`Run limit reached (${MAX_ACTIVE_RUNS} active runs: ${activeRuns().map((r) => r.id).join(', ')}). Clean up a run before creating another.`);
   }
@@ -280,8 +346,11 @@ export async function createRun(lesson, onEvent) {
   try {
     step('create-namespace', `Creating namespace ${ns} with run/lesson/owner labels.`);
     await applyJson(null, namespaceManifest(id, lesson));
-    step('apply-manifests', 'Applying fixed app, edge, and KEDA ScaledObject manifests scoped to the run namespace.');
-    for (const obj of [...appManifests(id, ns), ...edgeManifests(ns), scaledObjectManifest(id, ns)]) {
+    step('apply-manifests', 'Applying fixed app, edge, and scaler manifests scoped to the run namespace.');
+    const objs = [...appManifests(id, ns), ...edgeManifests(ns)];
+    if (SCALER_LESSON[lesson] === 'keda') objs.push(scaledObjectManifest(id, ns));
+    if (SCALER_LESSON[lesson] === 'cpu-hpa') objs.push(cpuHpaManifest(ns));
+    for (const obj of objs) {
       await applyJson(ns, obj);
     }
     step('wait-rollout', 'Waiting for app and edge rollouts.');
@@ -289,13 +358,19 @@ export async function createRun(lesson, onEvent) {
     await kubectl('-n', ns, 'rollout', 'status', 'deployment/edge', '--timeout=180s');
     step('wait-ready', 'Waiting for exactly two Ready, non-terminating app pods and Ready endpoints.');
     await waitRunReady(id, step);
-    step('verify-scrape', `Verifying Prometheus scrapes both run targets (${upQueryForRun(id)}).`);
-    const targets = await verifyRunScrape(id);
+    if (lesson === 'prometheus') {
+      step('verify-scrape', `Verifying Prometheus scrapes both run targets (${upQueryForRun(id)}).`);
+      var targets = await verifyRunScrape(id);
+    }
+    if (lesson === 'autoscale') {
+      step('verify-scaler', 'Verifying the CPU HPA is present for the run deployment.');
+      await kubectl('-n', ns, 'get', 'hpa', 'app', '-o', 'name');
+    }
     step('start-route', 'Starting the run traffic route (edge port-forward).');
     const fwd = await startEdgeForward(id);
     run.forward = fwd; run.forwardPort = fwd.port;
     run.status = 'ready';
-    pushMilestone(run.timeline, { kind: 'run', text: `Run ${id} ready in ${ns} (${targets} Prometheus targets).`, detail: 'Traffic for this run is routed to its own edge; other runs are unaffected.', observer: 'run controller' });
+    pushMilestone(run.timeline, { kind: 'run', text: `Run ${id} ready in ${ns}${lesson === 'prometheus' ? ` (${targets} Prometheus targets)` : lesson === 'autoscale' ? ' (CPU HPA active)' : ''}.`, detail: 'Traffic for this run is routed to its own edge; other runs are unaffected.', observer: 'run controller' });
     return run;
   } catch (error) {
     run.status = 'failed';

@@ -6,8 +6,8 @@ import { clusterState, runScenario } from './runner.mjs';
 import { LoadSession, PROFILES } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, runReset } from './reset.mjs';
-import { queryPrometheus, LEGACY_RATE_QUERY, rateQueryForRun } from './prometheus.mjs';
-import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, createRun, cleanupRun, runClusterState, buildArchive } from './runs.mjs';
+import { queryPrometheus, LEGACY_RATE_QUERY, rateQueryForRun, upQueryForRun } from './prometheus.mjs';
+import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns } from './runs.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const resultsDir = join(root, '..', 'results');
@@ -47,6 +47,11 @@ function runEmit(run, type, data) {
 
 const load = new LoadSession(emit);
 function loadState() { return load.state(); }
+
+function wireRunLoad(run) {
+  run.load = new LoadSession((t, d) => runEmit(run, t, d));
+  if (run.forwardPort) run.load.endpoint = `http://127.0.0.1:${run.forwardPort}`;
+}
 
 const profilesPayload = () => Object.fromEntries(Object.entries(PROFILES).map(([k, v]) => [k, { initialRps: v.initialRps, minRps: v.minRps, maxRps: v.maxRps, step: v.step }]));
 
@@ -114,6 +119,20 @@ async function sampleRuns() {
 }
 
 setInterval(async () => { await sampleTimeline(); await sampleRuns(); }, 5000);
+
+function observeRun(run) {
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const now = await runClusterState(run.id);
+      if (!now.connected) return;
+      diffRunState(run, now);
+    } finally { busy = false; }
+  }, 750);
+  return () => clearInterval(timer);
+}
 
 function observeCluster() {
   let previous = null, busy = false;
@@ -215,14 +234,13 @@ const server = http.createServer(async (req, res) => {
     send(res, 202, { started: true });
     createRun(input.lesson, emit)
       .then((run) => {
-        run.load = new LoadSession((t, d) => runEmit(run, t, d));
-        run.load.endpoint = `http://127.0.0.1:${run.forwardPort}`;
+        wireRunLoad(run);
         emit('note', { text: `Run ${run.id} ready in ${run.ns}.` });
       })
       .catch((error) => emit('error', { text: `Run creation failed: ${error.message}` }));
     return;
   }
-  const runMatch = path.match(/^\/api\/runs\/([A-Za-z0-9-]+)(\/(timeline|load))?$/);
+  const runMatch = path.match(/^\/api\/runs\/([A-Za-z0-9-]+)(\/(timeline|load|run|cluster))?$/);
   if (runMatch) {
     let run;
     try { run = getRun(runMatch[1]); } catch (error) { return send(res, 400, { error: error.message }); }
@@ -230,6 +248,31 @@ const server = http.createServer(async (req, res) => {
     const sub = runMatch[3];
     if (req.method === 'GET' && !sub) return send(res, 200, { ...describeRun(run), events: run.events.slice(-200) });
     if (req.method === 'GET' && sub === 'timeline') return send(res, 200, run.timeline);
+    if (req.method === 'GET' && sub === 'cluster') return send(res, 200, await runClusterState(run.id));
+    if (req.method === 'POST' && sub === 'run') {
+      const valid = ['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus'];
+      let input;
+      try { input = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
+      if (!valid.includes(input.id)) return send(res, 400, { error: 'Unknown scenario' });
+      if (input.id !== run.lesson) return send(res, 400, { error: `Scenario ${input.id} does not belong to run ${run.id} (lesson ${run.lesson}).` });
+      if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before running scenarios.` });
+      if (run.scenarioRunning) return send(res, 409, { error: 'A scenario is already running in this run.' });
+      if (run.load?.active) return send(res, 409, { error: 'Manual load is running in this run. Stop it before the one-click scenario.' });
+      run.scenarioRunning = true;
+      run.scenario = input.id;
+      run.result = null;
+      run.error = null;
+      send(res, 202, { started: true });
+      const stopObs = observeRun(run);
+      runScenario(input.id, {
+        mode: input.mode, namespace: run.ns, endpoint: `http://127.0.0.1:${run.forwardPort}`,
+        rateQuery: rateQueryForRun(run.id), upQuery: upQueryForRun(run.id),
+      }, (t, d) => runEmit(run, t, d))
+        .then((result) => { run.result = result; runEmit(run, 'result', { status: result.status }); })
+        .catch((error) => { run.error = error.message; runEmit(run, 'error', { text: error.message }); })
+        .finally(() => { run.scenarioRunning = false; stopObs(); });
+      return;
+    }
     if (req.method === 'POST' && sub === 'load') {
       try {
         const input = await readBody(req);
@@ -351,3 +394,11 @@ const server = http.createServer(async (req, res) => {
   send(res, 404, { error: 'Not found' });
 });
 server.listen(4173, '127.0.0.1', () => console.log('Dashboard: http://127.0.0.1:4173'));
+adoptOrphanRuns()
+  .then((adopted) => {
+    for (const run of adopted) {
+      if (run.status === 'ready') wireRunLoad(run);
+      emit('note', { text: `Re-adopted run ${run.id} (${run.ns}): ${run.status}${run.error ? ' — ' + run.error : ''}. Previous in-memory events are gone; archive files persist.` });
+    }
+  })
+  .catch((error) => emit('error', { text: `Run re-adoption failed: ${error.message}` }));

@@ -7,16 +7,17 @@ const runFile = promisify(execFile);
 const base = 'http://127.0.0.1:8080';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function kubectl(...args) {
-  const { stdout } = await runFile('kubectl', ['--context', 'kind-scaling-lab', '-n', 'scaling-lab', ...args], { timeout: 180000 });
+async function kubectl(ns, ...args) {
+  const { stdout } = await runFile('kubectl', ['--context', 'kind-scaling-lab', '-n', ns, ...args], { timeout: 180000 });
   return stdout.trim();
 }
-export async function clusterState() {
+// namespace defaults to scaling-lab so existing CLI lessons keep working.
+export async function clusterState(ns = 'scaling-lab') {
   try {
     const [pods, endpoints, hpa] = await Promise.all([
-      kubectl('get', 'pods', '-l', 'app=scaling-app', '-o', 'json'),
-      kubectl('get', 'endpointslices', '-l', 'kubernetes.io/service-name=app', '-o', 'json'),
-      kubectl('get', 'hpa', '-o', 'json').catch(() => null)
+      kubectl(ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json'),
+      kubectl(ns, 'get', 'endpointslices', '-l', 'kubernetes.io/service-name=app', '-o', 'json'),
+      kubectl(ns, 'get', 'hpa', '-o', 'json').catch(() => null)
     ]);
     const p = JSON.parse(pods).items.map(x => ({
       name: x.metadata.name, phase: x.status.phase,
@@ -34,13 +35,13 @@ export async function clusterState() {
   } catch (error) { return { connected: false, error: error.message, pods: [], endpoints: [] }; }
 }
 
-function startRequest(path, agent) {
+function startRequest(path, agent, baseUrl = base) {
   let onHeaders, onDone;
   const headers = new Promise(resolve => { onHeaders = resolve; });
   const done = new Promise(resolve => { onDone = resolve; });
   const started = Date.now();
   let headerSent = false;
-  const req = http.get(`${base}${path}`, { agent, timeout: 30000 }, res => {
+  const req = http.get(`${baseUrl}${path}`, { agent, timeout: 30000 }, res => {
     headerSent = true;
     onHeaders({ pod: res.headers['x-pod'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], status: res.statusCode });
     const chunks = [];
@@ -56,13 +57,13 @@ function startRequest(path, agent) {
   return { headers, done };
 }
 
-async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1) {
+async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1, baseUrl = base) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: 12 });
   const requests = [];
   let observed = 0;
   const until = Date.now() + durationMs;
   while (Date.now() < until) {
-    const task = startRequest(path, agent).done.then(x => {
+    const task = startRequest(path, agent, baseUrl).done.then(x => {
       if (++observed % emitEvery === 0 || !x.ok) emit('request', { pod: x.pod, ok: x.ok, status: x.status, error: x.error, ms: x.ms });
       return x;
     });
@@ -74,23 +75,23 @@ async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1) 
   return results;
 }
 
-async function podNames() {
-  const raw = await kubectl('get', 'pods', '-l', 'app=scaling-app', '-o', 'json');
+async function podNames(ns = 'scaling-lab') {
+  const raw = await kubectl(ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json');
   return JSON.parse(raw).items.filter(x => !x.metadata.deletionTimestamp).map(x => x.metadata.name);
 }
 
-async function waitStablePods(expected = 2, timeoutMs = 45000) {
+async function waitStablePods(ns = 'scaling-lab', expected = 2, timeoutMs = 45000) {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
-    const state = await clusterState();
+    const state = await clusterState(ns);
     if (state.connected && state.pods.length === expected && state.pods.every(x => x.ready && !x.terminating)) return;
     await sleep(1000);
   }
   throw new Error('Application pods did not settle before the experiment');
 }
 
-function watchPodLogs(pod, emit) {
-  const child = spawn('kubectl', ['--context', 'kind-scaling-lab', '-n', 'scaling-lab', 'logs', '-f', `pod/${pod}`], { stdio: ['ignore', 'pipe', 'ignore'] });
+function watchPodLogs(pod, emit, ns = 'scaling-lab') {
+  const child = spawn('kubectl', ['--context', 'kind-scaling-lab', '-n', ns, 'logs', '-f', `pod/${pod}`], { stdio: ['ignore', 'pipe', 'ignore'] });
   let pending = '';
   child.stdout.on('data', chunk => {
     pending += chunk.toString();
@@ -148,19 +149,23 @@ export function requireAutoscaler(state, kind) {
     : 'The Prometheus KEDA HPA is not active. Run make prometheus-up before the Prometheus lesson.');
 }
 
-async function runPrometheusScenario(emit) {
-  await kubectl('get', 'scaledobject', 'app-prometheus', '-o', 'name').catch(() => { throw new Error('Prometheus scaler is missing. Run make prometheus-up first.'); });
-  await waitStablePods();
+async function runPrometheusScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const rateQuery = opts.rateQuery || REQUEST_RATE_QUERY;
+  const upQuery = opts.upQuery || SCRAPE_UP_QUERY;
+  await kubectl(ns, 'get', 'scaledobject', 'app-prometheus', '-o', 'name').catch(() => { throw new Error('Prometheus scaler is missing. Run make prometheus-up first.'); });
+  await waitStablePods(ns);
   const forward = await startPrometheusForward();
   try {
     let scrapeTargets = 0;
     for (let attempt = 0; attempt < 12; attempt++) {
-      scrapeTargets = await prometheusValue(forward.port, SCRAPE_UP_QUERY) ?? 0;
+      scrapeTargets = await prometheusValue(forward.port, upQuery) ?? 0;
       if (scrapeTargets >= 2) break;
       await sleep(5000);
     }
     if (scrapeTargets < 2) throw new Error('Prometheus is not scraping both app pods yet. Check the prometheus targets page.');
-    const initialState = await clusterState();
+    const initialState = await clusterState(ns);
     requireAutoscaler(initialState, 'prometheus');
     const initial = initialState.pods.filter(x => !x.terminating).length;
     let peak = initial;
@@ -170,7 +175,7 @@ async function runPrometheusScenario(emit) {
       if (monitoring) return;
       monitoring = true;
       try {
-        const [rps, state] = await Promise.all([prometheusValue(forward.port, REQUEST_RATE_QUERY), clusterState()]);
+        const [rps, state] = await Promise.all([prometheusValue(forward.port, rateQuery), clusterState(ns)]);
         peakRps = Math.max(peakRps, rps ?? 0);
         peak = Math.max(peak, state.pods.filter(x => !x.terminating).length);
         emit('prometheus', { rps, pods: state.pods.length, desired: state.hpa?.desired, text: `${rps == null ? 'warming up' : rps.toFixed(1) + ' req/s'} · ${state.pods.length} pods · desired ${state.hpa?.desired ?? '?'}` });
@@ -179,7 +184,7 @@ async function runPrometheusScenario(emit) {
     };
     emit('note', { text: `Prometheus is scraping ${scrapeTargets} app pods. Sending request load.` });
     const timer = setInterval(sample, 5000);
-    const load = await traffic(80000, '/fast', emit, 30, 15);
+    const load = await traffic(80000, '/fast', emit, 30, 15, baseUrl);
     clearInterval(timer);
     await sample();
     emit('note', { text: `Load stopped. Peak observed rate ${peakRps.toFixed(1)} req/s; watching scale down.` });
@@ -188,9 +193,9 @@ async function runPrometheusScenario(emit) {
     const drain = [];
     const until = Date.now() + 180000;
     while (Date.now() < until && !stableDown) {
-      drain.push(...await traffic(5000, '/fast', emit, 500, 5));
+      drain.push(...await traffic(5000, '/fast', emit, 500, 5, baseUrl));
       await sample();
-      const state = await clusterState();
+      const state = await clusterState(ns);
       final = state.pods.filter(x => !x.terminating).length;
       stableDown = state.pods.length === initial && state.pods.every(x => x.ready && !x.terminating);
     }
@@ -204,25 +209,27 @@ async function runPrometheusScenario(emit) {
     return {
       status: checks.every(x => x.pass) ? 'pass' : 'fail',
       checks,
-      evidence: { query: REQUEST_RATE_QUERY, thresholdRpsPerPod: 5, scrapeTargets, initial, peak, final, peakRps, loadRequests: load.length, loadFailures: load.filter(x => !x.ok).length, drainRequests: drain.length, drainFailures: drain.filter(x => !x.ok).slice(0, 10) }
+      evidence: { query: rateQuery, thresholdRpsPerPod: 5, scrapeTargets, initial, peak, final, peakRps, loadRequests: load.length, loadFailures: load.filter(x => !x.ok).length, drainRequests: drain.length, drainFailures: drain.filter(x => !x.ok).slice(0, 10) }
     };
   } finally { forward.close(); }
 }
 
 export async function runScenario(id, options, emit) {
+  const ns = options.namespace || 'scaling-lab';
+  const baseUrl = options.endpoint || base;
   emit('note', { text: `Starting ${id}` });
   if (id === 'connections') {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
     const reused = [];
     const fresh = [];
     for (let i = 0; i < 8; i++) {
-      const r = await startRequest('/fast', agent).done;
+      const r = await startRequest('/fast', agent, baseUrl).done;
       reused.push(r.edgeConnection);
       emit('request', { group: 'keep-alive', ...r, body: undefined });
     }
     agent.destroy();
     for (let i = 0; i < 8; i++) {
-      const r = await startRequest('/fast', false).done;
+      const r = await startRequest('/fast', false, baseUrl).done;
       fresh.push(r.edgeConnection);
       emit('request', { group: 'new connection', ...r, body: undefined });
     }
@@ -231,10 +238,10 @@ export async function runScenario(id, options, emit) {
   if (id === 'timeouts') {
     async function pair(gapMs) {
       const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
-      const first = await startRequest('/fast', agent).done;
+      const first = await startRequest('/fast', agent, baseUrl).done;
       emit('request', { group: `${gapMs}ms idle`, ...first, body: undefined });
       await sleep(gapMs);
-      const second = await startRequest('/fast', agent).done;
+      const second = await startRequest('/fast', agent, baseUrl).done;
       emit('request', { group: `${gapMs}ms idle`, ...second, body: undefined });
       agent.destroy();
       return [first, second];
@@ -246,18 +253,18 @@ export async function runScenario(id, options, emit) {
   if (id === 'shutdown') {
     const mode = options.mode === 'abrupt' ? 'abrupt' : 'graceful';
     emit('note', { text: `Deploying ${mode} shutdown mode` });
-    await kubectl('set', 'env', 'deployment/app', `SHUTDOWN_MODE=${mode}`);
-    await kubectl('rollout', 'status', 'deployment/app', '--timeout=180s');
-    await waitStablePods();
-    const slowReq = startRequest('/slow?ms=8000', new http.Agent({ keepAlive: true }));
+    await kubectl(ns, 'set', 'env', 'deployment/app', `SHUTDOWN_MODE=${mode}`);
+    await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
+    await waitStablePods(ns);
+    const slowReq = startRequest('/slow?ms=8000', new http.Agent({ keepAlive: true }), baseUrl);
     const slowHeaders = await slowReq.headers;
     if (!slowHeaders.pod) throw new Error(`Long request did not reach a pod: ${slowHeaders.error}`);
     emit('slow-start', slowHeaders);
-    const stopLogWatch = watchPodLogs(slowHeaders.pod, emit);
-    const background = traffic(11000, '/fast', emit);
+    const stopLogWatch = watchPodLogs(slowHeaders.pod, emit, ns);
+    const background = traffic(11000, '/fast', emit, 120, 1, baseUrl);
     await sleep(900);
     emit('pod-delete', { pod: slowHeaders.pod });
-    await kubectl('delete', 'pod', slowHeaders.pod, '--wait=false');
+    await kubectl(ns, 'delete', 'pod', slowHeaders.pod, '--wait=false');
     const slow = { ...await slowReq.done, pod: slowHeaders.pod };
     emit('slow-end', slow);
     const samples = await background;
@@ -265,43 +272,43 @@ export async function runScenario(id, options, emit) {
     return gradeShutdown({ slow, samples, deletedPod: slowHeaders.pod, mode });
   }
   if (id === 'rollout') {
-    await kubectl('set', 'env', 'deployment/app', 'SHUTDOWN_MODE=graceful');
-    await kubectl('rollout', 'status', 'deployment/app', '--timeout=180s');
-    await waitStablePods();
-    const before = await podNames();
-    const background = traffic(15000, '/fast', emit);
+    await kubectl(ns, 'set', 'env', 'deployment/app', 'SHUTDOWN_MODE=graceful');
+    await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
+    await waitStablePods(ns);
+    const before = await podNames(ns);
+    const background = traffic(15000, '/fast', emit, 120, 1, baseUrl);
     await sleep(1000);
     emit('rollout', { text: 'Starting rolling update' });
-    await kubectl('set', 'env', 'deployment/app', `LAB_REV=${Date.now()}`);
-    await kubectl('rollout', 'status', 'deployment/app', '--timeout=180s');
+    await kubectl(ns, 'set', 'env', 'deployment/app', `LAB_REV=${Date.now()}`);
+    await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
     const samples = await background;
-    const after = await podNames();
+    const after = await podNames(ns);
     return gradeRollout(samples, before, after);
   }
   if (id === 'streaming') {
-    await kubectl('set', 'env', 'deployment/app', 'SHUTDOWN_MODE=graceful');
-    await kubectl('rollout', 'status', 'deployment/app', '--timeout=180s');
-    await waitStablePods();
-    const streamRequest = startRequest('/stream', new http.Agent({ keepAlive: true }));
+    await kubectl(ns, 'set', 'env', 'deployment/app', 'SHUTDOWN_MODE=graceful');
+    await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
+    await waitStablePods(ns);
+    const streamRequest = startRequest('/stream', new http.Agent({ keepAlive: true }), baseUrl);
     const streamHeaders = await streamRequest.headers;
     if (!streamHeaders.pod) throw new Error(`Stream did not reach a pod: ${streamHeaders.error}`);
     emit('stream-start', streamHeaders);
-    const stopLogWatch = watchPodLogs(streamHeaders.pod, emit);
+    const stopLogWatch = watchPodLogs(streamHeaders.pod, emit, ns);
     await sleep(1100);
     emit('pod-delete', { pod: streamHeaders.pod });
-    await kubectl('delete', 'pod', streamHeaders.pod, '--wait=false');
+    await kubectl(ns, 'delete', 'pod', streamHeaders.pod, '--wait=false');
     const stream = { ...await streamRequest.done, pod: streamHeaders.pod };
     emit('stream-end', { pod: stream.pod, complete: stream.complete, error: stream.error });
     stopLogWatch();
     return gradeStream({ stream, deletedPod: streamHeaders.pod });
   }
   if (id === 'autoscale') {
-    const state = await clusterState();
+    const state = await clusterState(ns);
     requireAutoscaler(state, 'cpu');
     const initial = state.pods.filter(x => !x.terminating).length;
     emit('note', { text: `Starting CPU load with ${initial} pods` });
-    const samples = await traffic(75000, '/cpu?ms=120', emit, 150);
-    const scaled = await clusterState();
+    const samples = await traffic(75000, '/cpu?ms=120', emit, 150, 1, baseUrl);
+    const scaled = await clusterState(ns);
     const peak = scaled.pods.filter(x => !x.terminating).length;
     emit('note', { text: `CPU load stopped at ${peak} pods; watching scale down` });
     let final = peak;
@@ -309,8 +316,8 @@ export async function runScenario(id, options, emit) {
     const drainSamples = [];
     const until = Date.now() + 180000;
     while (Date.now() < until && !stableDown) {
-      drainSamples.push(...await traffic(5000, '/fast', emit, 250));
-      const current = await clusterState();
+      drainSamples.push(...await traffic(5000, '/fast', emit, 250, 1, baseUrl));
+      const current = await clusterState(ns);
       final = current.pods.filter(x => !x.terminating).length;
       stableDown = current.pods.length === initial && current.pods.every(x => x.ready && !x.terminating);
       emit('hpa', { text: `Current ${final}, desired ${current.hpa?.desired ?? '?'} replicas` });
@@ -328,6 +335,6 @@ export async function runScenario(id, options, emit) {
       evidence: { initial, peak, final, stableDown, loadRequests: samples.length, loadFailures: samples.filter(x => !x.ok).length, drainRequests: drainSamples.length, drainFailures: drainSamples.filter(x => !x.ok).slice(0, 10) }
     };
   }
-  if (id === 'prometheus') return runPrometheusScenario(emit);
+  if (id === 'prometheus') return runPrometheusScenario(emit, options);
   throw new Error('Unknown scenario');
 }

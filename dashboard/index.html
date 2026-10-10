@@ -4,13 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Scaling Lab · Connection & shutdown field guide</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/diagram.css">
 </head>
 <body>
   <header class="topbar">
     <div class="brand"><span class="mark">↗</span><span>SCALING LAB</span><small>Field guide</small></div>
-    <div class="status"><span id="cluster-dot" class="dot"></span><span id="cluster-label">Checking cluster…</span><button id="reset-open" class="ghost-btn">Reset lesson</button></div>
+    <div class="status"><span id="cluster-dot" class="dot"></span><span id="cluster-label">Checking cluster…</span><button id="reset-open" class="ghost-btn">New run</button></div>
   </header>
   <main>
     <section class="hero">
@@ -25,9 +26,9 @@
         <div class="concept"><div class="concept-label">THE IDEA</div><p id="lesson-concept"></p></div>
         <div class="diagram"><div class="section-head"><h3>Concept in motion</h3><button id="replay" class="replay">↻ Replay</button></div><div id="diagram-track" class="diagram-track"><div class="diagram-node" id="diagram-client"><small>01</small>Client</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-edge"><small>02</small>Edge</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-service"><small>03</small>Service</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-pod"><small>04</small>Pod</div></div><div class="diagram-caption"><span id="diagram-step"></span><p id="diagram-text"></p></div><div id="diagram-dots" class="diagram-dots"></div></div>
         <div class="experiment"><div class="section-head"><h3>Run the experiment</h3><span class="step">01 / OBSERVE</span></div><p id="lesson-task"></p><div id="options"></div><div class="actions"><button id="run" class="primary">Run experiment <span>→</span></button><span id="run-state"></span></div>
-          <div id="run-panel" hidden>
-            <h4>Isolated runs (Prometheus lesson)</h4>
-            <p class="micro">Each run gets its own namespace <code>scaling-run-&lt;id&gt;</code> with app, edge, and KEDA scaler (max 2 active). Switching runs never touches another run.</p>
+          <div id="run-panel">
+            <h4>Isolated runs</h4>
+            <p class="micro">Each run gets its own namespace <code>scaling-run-&lt;id&gt;</code> with app and edge (plus the lesson scaler for autoscaling lessons). Max 2 active runs; switching lessons never touches another run.</p>
             <div class="actions"><button id="run-new">New run</button><select id="run-select"></select><button id="run-evidence">Download evidence</button><button id="run-cleanup-open">Clean up run…</button></div>
             <p id="run-panel-state" class="micro">No runs yet — create one to start.</p>
             <p id="run-footprint" class="micro"></p>
@@ -48,17 +49,15 @@
     </div>
   </main>
   <dialog id="reset-dialog">
-    <h3>Reset lesson</h3>
-    <p>Switching between CPU and Prometheus lessons replaces the autoscaler. Opening another lesson never changes the cluster until you confirm here.</p>
+    <h3>Fresh run</h3>
+    <p id="reset-text"></p>
     <ul>
-      <li>Active traffic stops (manual load and one-click scenario lock).</li>
-      <li>Removes the old <code>HPA app</code> or <code>ScaledObject app-prometheus</code> / <code>HPA keda-hpa-app-prometheus</code>.</li>
-      <li>Restores <code>app</code>/<code>edge</code> manifests to baseline; app pods may restart.</li>
-      <li>Waits for exactly two Ready, non-terminating app pods and Ready endpoints.</li>
+      <li>Provisions a new <code>scaling-run-&lt;id&gt;</code> namespace with fixed app, edge, and lesson scaler manifests.</li>
+      <li>Waits for exactly two Ready app pods (plus the scaler check for autoscaling lessons).</li>
+      <li>Existing runs keep their namespaces, traffic routes, graphs, and evidence.</li>
     </ul>
-    <label>Reset target <select id="reset-target"><option value="prometheus">Prometheus (KEDA HPA)</option><option value="cpu">CPU (HPA app)</option><option value="baseline">Baseline (no autoscaler)</option></select></label>
     <p id="reset-status" class="micro"></p>
-    <div class="actions"><button id="reset-download">Download evidence first</button><button id="reset-cancel">Cancel (changes nothing)</button><button id="reset-confirm" class="primary">Confirm reset</button></div>
+    <div class="actions"><button id="reset-download">Download current run evidence</button><button id="reset-cancel">Cancel (changes nothing)</button><button id="reset-confirm" class="primary">Create fresh run</button></div>
   </dialog>
   <dialog id="delete-dialog">
     <h3>Delete kind cluster?</h3>

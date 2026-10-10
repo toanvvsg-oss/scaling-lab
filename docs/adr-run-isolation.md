@@ -2,6 +2,8 @@
 
 Status: Proposed — awaiting review. Do not treat as accepted until the run-isolation slice is reviewed.
 
+Extended slice: all seven lessons now run isolated. `dashboard/runner.mjs` threads `namespace`/`endpoint` (defaults preserve the legacy `scaling-lab` + `:8080` CLI path); `POST /api/runs/:id/run` executes any matching scenario inside the run namespace; the UI auto-creates a run per lesson on Run. Autoscale runs provision a CPU HPA; the other five get app + edge only.
+
 ## Problem
 
 All seven lessons share namespace `scaling-lab` and edge endpoint `127.0.0.1:8080`. Switching lessons deletes the active HPA/ScaledObject and restarts `app`/`edge`, so run A cannot survive while the learner experiments with run B. Prometheus queries (`sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))`) have no run selector, so traffic from one run would move another run's graph and scaler.

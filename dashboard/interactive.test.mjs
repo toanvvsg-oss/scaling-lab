@@ -75,6 +75,12 @@ test('run metric queries carry the run selector, legacy query stays namespaced',
   assert.throws(() => rateQueryForRun('../../x'), /Invalid run id/);
 });
 
+test('every lesson can run isolated', () => {
+  for (const id of ['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus']) {
+    assert.ok(RUN_LESSONS.has(id), id);
+  }
+  assert.equal(RUN_LESSONS.size, 7);
+});
 test('run evidence archive keeps values and timestamps', () => {
   const fake = {
     id: 'abc12345', lesson: 'prometheus', ns: 'scaling-run-abc12345',
