@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scaling Lab · Connection & shutdown field guide</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/diagram.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark">↗</span><span>SCALING LAB</span><small>Field guide</small></div>
+    <div class="status"><span id="cluster-dot" class="dot"></span><span id="cluster-label">Checking cluster…</span></div>
+  </header>
+  <main>
+    <section class="hero">
+      <div><p class="eyebrow">A HANDS-ON SYSTEMS LAB</p><h1>Watch a request<br><em>survive change.</em></h1><p class="lede">Explore keep-alive connections, Node.js shutdown, deployments, and autoscaling in a real kind cluster. Run an experiment, follow the evidence, and verify what happened.</p></div>
+      <div class="topology" aria-label="Traffic path"><span>CLIENT</span><b>→</b><span>EDGE PROXY</span><b>→</b><span>SERVICE</span><b>→</b><span>NODE.JS PODS</span></div>
+    </section>
+    <div class="layout">
+      <aside class="sidebar"><p class="side-label">LABS / 06</p><nav id="lessons"></nav><div class="hint"><strong>Before you begin</strong><p>Run <code>make up</code>, then <code>make dashboard</code>. Each experiment changes only the dedicated <code>scaling-lab</code> cluster.</p><p><a href="/worksheet">Open configuration worksheet →</a></p></div></aside>
+      <section class="workspace">
+        <div class="lesson-head"><span id="lesson-number" class="lesson-number"></span><span id="lesson-time" class="lesson-time"></span></div>
+        <h2 id="lesson-title"></h2><p id="lesson-intro" class="intro"></p>
+        <div class="concept"><div class="concept-label">THE IDEA</div><p id="lesson-concept"></p></div>
+        <div class="diagram"><div class="section-head"><h3>Concept in motion</h3><button id="replay" class="replay">↻ Replay</button></div><div id="diagram-track" class="diagram-track"><div class="diagram-node" id="diagram-client"><small>01</small>Client</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-edge"><small>02</small>Edge</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-service"><small>03</small>Service</div><div class="diagram-link"><i></i></div><div class="diagram-node" id="diagram-pod"><small>04</small>Pod</div></div><div class="diagram-caption"><span id="diagram-step"></span><p id="diagram-text"></p></div><div id="diagram-dots" class="diagram-dots"></div></div>
+        <div class="experiment"><div class="section-head"><h3>Run the experiment</h3><span class="step">01 / OBSERVE</span></div><p id="lesson-task"></p><div id="options"></div><div class="actions"><button id="run" class="primary">Run experiment <span>→</span></button><span id="run-state"></span></div></div>
+        <div class="verify"><div class="section-head"><h3>Verification</h3><span class="step">02 / CHECK</span></div><div id="verdict" class="empty">Run the experiment to see evidence and checks.</div></div>
+        <div class="quiz"><div class="section-head"><h3>Check your understanding</h3><span class="step">03 / EXPLAIN</span></div><p id="quiz-question"></p><div id="quiz-options"></div><p id="quiz-feedback" aria-live="polite"></p></div>
+      </section>
+      <aside class="observe"><div class="observe-title"><h3>Live observation</h3><span id="live-pill">IDLE</span></div><div class="observe-block"><p class="micro">APPLICATION PODS</p><div id="pods">Waiting for cluster…</div></div><div class="observe-block"><p class="micro">SERVICE ENDPOINTS</p><div id="endpoints">—</div></div><div class="observe-block timeline-block"><p class="micro">EVENT TIMELINE</p><div id="timeline"><p class="timeline-empty">Events appear here as the scenario runs.</p></div></div></aside>
+    </div>
+  </main>
+  <script type="module" src="/app.js"></script>
+  <script type="module" src="/diagram.js"></script>
+</body>
+</html>

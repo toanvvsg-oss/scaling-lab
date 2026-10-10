@@ -1,0 +1,10 @@
+{
+  "name": "scaling-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dashboard": "node dashboard/server.mjs",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=22" }
+}

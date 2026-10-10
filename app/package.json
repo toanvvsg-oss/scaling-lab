@@ -1,0 +1,6 @@
+{
+  "name": "scaling-lab-service",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" }
+}

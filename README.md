@@ -1,0 +1,78 @@
+# Scaling Lab
+
+A guided local lab for HTTP connection reuse, Node.js graceful shutdown, Kubernetes rollouts, and CPU autoscaling. The web dashboard pairs each experiment with a live pod/endpoint view, request timeline, conceptual question, and evidence-backed verification result.
+
+![Scaling Lab dashboard](docs/dashboard.png)
+
+## Requirements
+
+- Docker-compatible daemon, `kind`, `kubectl`, `make`, `curl`, and Node.js 22 or later
+- About 4 GB free memory and network access for the first image pulls
+- Port 8080 (lab proxy) and 4173 (dashboard) available on localhost
+
+## Start
+
+```sh
+make up
+make dashboard
+```
+
+Open <http://127.0.0.1:4173>. `make up` creates a three-node kind cluster, builds the Node.js image, and deploys two app pods plus an NGINX edge proxy. `make check` confirms readiness. The dashboard uses the fixed `kind-scaling-lab` context and `scaling-lab` namespace.
+
+On a Colima VM already running several clusters, kind startup may fail if containerd reports `failed to create fsnotify watcher: too many open files`. Raise the VM's inotify instance limit, then retry `make up`:
+
+```sh
+colima ssh -- sudo sysctl -w fs.inotify.max_user_instances=1024
+```
+
+For the autoscaling lesson, run `make hpa-up` first. This installs the pinned metrics-server release and sets `--kubelet-insecure-tls` for the local kind cluster, then creates the CPU HPA. Give metrics collection a minute before running the experiment.
+
+```sh
+make reset    # restore the baseline app configuration and remove the HPA
+make test     # verifier unit tests
+make verify   # run the connection lesson and save evidence to results/
+make down     # delete only the scaling-lab kind cluster
+```
+
+## Lessons and verification
+
+| Lesson | Experiment | Pass condition |
+| --- | --- | --- |
+| Connection reuse | Eight reused and eight fresh client connections | The reused requests share an edge connection ID; fresh requests have distinct IDs |
+| Idle timeouts | Compare one-second and 6.5-second idle gaps | The client socket remains while the five-second Node.js upstream socket expires |
+| Graceful shutdown | Delete the pod serving an eight-second request | That request finishes and sampled background requests have no failures |
+| Abrupt exit | Repeat shutdown with `SHUTDOWN_MODE=abrupt` | The targeted long request is interrupted, demonstrating the failure |
+| Rolling deployment | Change a pod-template environment variable under traffic | A new pod serves traffic and sampled requests have no failures |
+| Streaming drain | Delete a pod during a 20-tick response | The stream completes with all 20 ticks |
+| Autoscaling | Sustain CPU-intensive requests, then stop the load | The HPA adds replicas, returns to baseline, and sampled scale-down requests succeed |
+
+Checks may return **inconclusive** if the intended race or enough traffic was not observed. The result includes raw request and pod evidence. A passing local experiment is evidence for this topology and workload, not a guarantee for a different ingress, service mesh, or cloud load balancer.
+
+You can run any lesson without the browser using `make verify SCENARIO=shutdown MODE=graceful` (or `connections`, `timeouts`, `rollout`, `streaming`, `autoscale`). The command writes a JSON evidence report under `results/` and exits nonzero for a failed or inconclusive check.
+
+Use the dashboard's **configuration worksheet** after the lessons. It checks shutdown timing and compares measured per-pod capacity with peak demand and HPA replica limits. It exports a JSON record of your choices. The worksheet is a consistency check; rerun live experiments with the actual settings before applying them elsewhere.
+
+## What to observe
+
+The edge proxy exposes `X-Edge-Connection`; the app exposes `X-App-Connection`, `X-Pod`, and `X-Request-Id`. Client and upstream connection IDs represent different connection pools. The proxy disables response buffering so the shutdown runner can identify and delete the serving pod while its response is still active. The app logs JSON events for connection opening/closing, request start/end, and shutdown. Use `kubectl --context kind-scaling-lab -n scaling-lab logs deployment/app --all-pods=true --prefix=true` to inspect them.
+
+The app is configured with a two-second `preStop`, a 30-second pod grace period, and a 24-second app shutdown deadline. These are experiment values, not universal production settings. The `preStop` duration is part of the pod's grace period. The app uses Node.js 24's `server.close()` behavior for idle and active HTTP/1.1 connections. Streaming is available at `/stream` for manual exploration; upgraded WebSocket connections need separate handling in a real app.
+
+## Project layout
+
+```text
+app/          Instrumented Node.js service and Dockerfile
+dashboard/    Guided UI, scenario runner, and verifier
+k8s/          kind, Deployment, Service, proxy, and HPA manifests
+Makefile      Setup, reset, test, and teardown commands
+```
+
+The dashboard binds to `127.0.0.1` and exposes only predefined scenarios against the dedicated lab context. It does not accept arbitrary shell commands.
+
+## Reference documentation
+
+- [Node.js HTTP server connection and shutdown behavior](https://nodejs.org/api/http.html)
+- [Kubernetes pod and endpoint termination flow](https://kubernetes.io/docs/tutorials/services/pods-and-endpoint-termination-flow/)
+- [Kubernetes container lifecycle hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
+- [Kubernetes HPA behavior](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/)
+- [kind cluster configuration](https://kind.sigs.k8s.io/docs/user/configuration/)
