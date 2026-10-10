@@ -36,9 +36,40 @@ function methodName(method) {
 
 function statusClassOf(status) {
   if (status >= 200 && status < 300) return '2xx';
+  if (status >= 300 && status < 400) return '3xx';
   if (status >= 400 && status < 500) return '4xx';
   if (status >= 500 && status < 600) return '5xx';
   return 'other';
+}
+
+// Simple response-duration histogram by bounded route label only, for p95
+// panels. Buckets in seconds; _sum/_count enable histogram_quantile.
+const DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
+const durationsByRoute = new Map();
+function recordDuration(route, seconds) {
+  let entry = durationsByRoute.get(route);
+  if (!entry) {
+    entry = { buckets: DURATION_BUCKETS.map(() => 0), sum: 0, count: 0 };
+    durationsByRoute.set(route, entry);
+  }
+  for (let i = 0; i < DURATION_BUCKETS.length; i++) {
+    if (seconds <= DURATION_BUCKETS[i]) entry.buckets[i] += 1;
+  }
+  entry.sum += seconds;
+  entry.count += 1;
+}
+
+function renderDurations(label) {
+  const lines = [];
+  for (const [route, entry] of [...durationsByRoute.entries()].sort()) {
+    for (let i = 0; i < DURATION_BUCKETS.length; i++) {
+      lines.push(`scaling_lab_http_response_duration_seconds_bucket{pod=${label},route="${route}",le="${DURATION_BUCKETS[i]}"} ${entry.buckets[i]}`);
+    }
+    lines.push(`scaling_lab_http_response_duration_seconds_bucket{pod=${label},route="${route}",le="+Inf"} ${entry.count}`);
+    lines.push(`scaling_lab_http_response_duration_seconds_sum{pod=${label},route="${route}"} ${entry.sum}`);
+    lines.push(`scaling_lab_http_response_duration_seconds_count{pod=${label},route="${route}"} ${entry.count}`);
+  }
+  return lines.join('\n');
 }
 
 function recordResponse(method, route, status) {
@@ -83,7 +114,8 @@ const server = http.createServer(async (req, res) => {
     const label = JSON.stringify(pod);
     res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' });
     const responses = renderResponses(label);
-    res.end(`# HELP scaling_lab_http_requests_total Application HTTP requests excluding probes and metrics\n# TYPE scaling_lab_http_requests_total counter\nscaling_lab_http_requests_total{pod=${label}} ${requestsTotal}\n# HELP scaling_lab_http_responses_total Completed HTTP responses by bounded method/route/status; excludes probes and lifecycle\n# TYPE scaling_lab_http_responses_total counter\n${responses ? responses + '\n' : ''}# HELP scaling_lab_http_inflight_requests Requests currently being handled\n# TYPE scaling_lab_http_inflight_requests gauge\nscaling_lab_http_inflight_requests{pod=${label}} ${active}\n# HELP scaling_lab_http_open_sockets Currently open TCP sockets\n# TYPE scaling_lab_http_open_sockets gauge\nscaling_lab_http_open_sockets{pod=${label}} ${openSockets}\n`);
+    const durations = renderDurations(label);
+    res.end(`# HELP scaling_lab_http_requests_total Application HTTP requests excluding probes and metrics\n# TYPE scaling_lab_http_requests_total counter\nscaling_lab_http_requests_total{pod=${label}} ${requestsTotal}\n# HELP scaling_lab_http_responses_total Completed HTTP responses by bounded method/route/status; excludes probes and lifecycle\n# TYPE scaling_lab_http_responses_total counter\n${responses ? responses + '\n' : ''}# HELP scaling_lab_http_response_duration_seconds Learner response latency by bounded route; excludes probes and lifecycle\n# TYPE scaling_lab_http_response_duration_seconds histogram\n${durations ? durations + '\n' : ''}# HELP scaling_lab_http_inflight_requests Learner requests currently being handled; excludes probes, metrics scrapes, and lifecycle\n# TYPE scaling_lab_http_inflight_requests gauge\nscaling_lab_http_inflight_requests{pod=${label}} ${active}\n# HELP scaling_lab_http_open_sockets Currently open TCP sockets including probes and metrics scrapes\n# TYPE scaling_lab_http_open_sockets gauge\nscaling_lab_http_open_sockets{pod=${label}} ${openSockets}\n`);
     return;
   }
   requestsTotal++;
@@ -91,7 +123,13 @@ const server = http.createServer(async (req, res) => {
   const request = req.headers['x-request-id'] || randomUUID();
   const route = routeName(url.pathname);
   const method = methodName(req.method);
-  const finishWith = (status) => { try { recordResponse(method, route, status); } catch { /* metrics never break responses */ } };
+  const startedAt = performance.now();
+  const finishWith = (status) => {
+    try {
+      recordResponse(method, route, status);
+      recordDuration(route, (performance.now() - startedAt) / 1000);
+    } catch { /* metrics never break responses */ }
+  };
   res.on('finish', () => finishWith(res.statusCode));
   res.setHeader('x-pod', pod);
   res.setHeader('x-app-connection', String(connection));

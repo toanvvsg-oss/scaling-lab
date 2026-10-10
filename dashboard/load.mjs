@@ -56,7 +56,8 @@ export const LOAD_LIMITS = {
   maxRps: 40,
   maxDurationMs: 5 * 60 * 1000,
   minDurationMs: 30 * 1000,
-  endpoint: 'http://127.0.0.1:8080',
+  // Narrow test-harness override (ephemeral edge route). Default :8080.
+  endpoint: process.env.SCALING_LAB_EDGE_URL || 'http://127.0.0.1:8080',
 };
 
 export function profileSet(cpu) {

@@ -4,7 +4,9 @@ import { promisify } from 'node:util';
 import { gradeAutoscale, gradeConnections, gradePrometheus, gradeTimeout, gradeShutdown, gradeRollout, gradeStream } from './grade.mjs';
 
 const runFile = promisify(execFile);
-const base = 'http://127.0.0.1:8080';
+// Narrow test-harness override: the disposable kind harness points this at an
+// ephemeral edge port-forward. Default keeps normal `make verify` on :8080.
+const base = process.env.SCALING_LAB_EDGE_URL || 'http://127.0.0.1:8080';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function kubectl(ns, ...args) {

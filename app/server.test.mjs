@@ -31,3 +31,21 @@ test('lifecycle hook logs preStop markers without touching request counters', as
   assert.ok(m, 'counter present');
   assert.equal(Number(m[1]), 1, 'lifecycle call excluded from learner request counter');
 });
+
+test('probes stay out of learner counters while completed responses and latency histogram record bounded labels', async (t) => {
+  const child = await boot(13992);
+  t.after(() => child.kill());
+  await fetch('http://127.0.0.1:13992/health/live');
+  await fetch('http://127.0.0.1:13992/health/ready');
+  await fetch('http://127.0.0.1:13992/fast');
+  await fetch('http://127.0.0.1:13992/demo/500');
+  const metrics = await (await fetch('http://127.0.0.1:13992/metrics')).text();
+  const total = metrics.match(/scaling_lab_http_requests_total\{pod="[^"]*"\} (\d+)/);
+  assert.equal(Number(total[1]), 2, 'only learner routes count');
+  assert.match(metrics, /scaling_lab_http_responses_total\{pod="[^"]*",method="GET",route="fast",status="200",status_class="2xx"\} 1/);
+  assert.match(metrics, /scaling_lab_http_responses_total\{pod="[^"]*",method="GET",route="demo-500",status="500",status_class="5xx"\} 1/);
+  assert.ok(!metrics.includes('route="/fast"'), 'no raw paths as label values');
+  assert.match(metrics, /scaling_lab_http_response_duration_seconds_count\{pod="[^"]*",route="fast"\} 1/);
+  assert.match(metrics, /scaling_lab_http_response_duration_seconds_bucket\{pod="[^"]*",route="fast",le="\+Inf"\} 1/);
+  assert.match(metrics, /scaling_lab_http_inflight_requests\{pod="[^"]*"\} 0/);
+});

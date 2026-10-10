@@ -610,7 +610,10 @@ function summarizeAction(s) {
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
+  // PORT override lets the disposable kind harness run the dashboard on an
+  // ephemeral port without touching the normal :4173 default.
+  const listenPort = Number(process.env.PORT || 4173);
   const { server, boot } = createApp();
-  server.listen(4173, '127.0.0.1', () => console.log('Dashboard: http://127.0.0.1:4173'));
+  server.listen(listenPort, '127.0.0.1', () => console.log(`Dashboard: http://127.0.0.1:${listenPort}`));
   boot();
 }
