@@ -8,6 +8,7 @@ export function pushPoint(history, point) {
   history.points.push({
     at: point.at || new Date().toISOString(),
     offeredRps: point.offeredRps ?? null,
+    offeredTarget: point.offeredTarget ?? null,
     observedRps: 'observedRps' in point ? point.observedRps : null,
     desired: point.desired ?? null,
     actual: point.actual ?? null,

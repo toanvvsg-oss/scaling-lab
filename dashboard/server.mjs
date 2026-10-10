@@ -19,10 +19,16 @@ function emit(type, data) {
   const event = { at: new Date().toISOString(), type, data };
   state.events.push(event);
   if (state.events.length > 2500) state.events.shift();
-  if (type === 'hpa' || type === 'cluster' || type === 'endpoint' || type === 'load' || type === 'request') {
+  // Only failures become milestones. Successful sampled requests stay in the
+  // event log; milestone history is reserved for load changes, HPA decisions,
+  // pod/endpoint changes, and request failures.
+  if (type === 'request') {
+    if (data?.ok === false) pushMilestone(state.timeline, { at: event.at, kind: 'failure', text: `Request failure ${data.error || data.status || ''}`, detail: `Pod ${data.pod || 'unknown'} returned an error. Failures do not drive scaling directly; they signal overload or draining pods.`, observer: 'dashboard load client' });
+    return event;
+  }
+  if (type === 'hpa' || type === 'cluster' || type === 'endpoint' || type === 'load') {
     const d = data || {};
-    if (type === 'request' && d.ok === false) pushMilestone(state.timeline, { at: event.at, kind: 'failure', text: `Request failure ${d.error || d.status || ''}`, detail: `Pod ${d.pod || 'unknown'} returned an error. Failures do not drive scaling directly; they signal overload or draining pods.`, observer: 'dashboard load client' });
-    else if (type === 'load') pushMilestone(state.timeline, { at: event.at, kind: 'load', text: d.text || 'Load change', detail: `Offered traffic target is now ${d.rps ?? '?'} req/s. Prometheus observes this after its 5s scrape; HPA reacts later.`, observer: 'load controller' });
+    if (type === 'load') pushMilestone(state.timeline, { at: event.at, kind: 'load', text: d.text || 'Load change', detail: `Offered traffic target is now ${d.rps ?? '?'} req/s. Prometheus observes this after its 5s scrape; HPA reacts later.`, observer: 'load controller' });
     else if (type === 'hpa') pushMilestone(state.timeline, { at: event.at, kind: 'hpa', text: d.text || 'HPA decision', detail: 'HPA desired replicas changed. Pod creation and readiness lag behind this decision.', observer: 'Kubernetes HPA' });
     else pushMilestone(state.timeline, { at: event.at, kind: type, text: d.text || type, detail: type === 'cluster' ? 'Pod created, became ready/terminating, or was removed. New pods must pass readiness before receiving traffic.' : 'Endpoint readiness changed; the Service only sends traffic to ready, non-terminating endpoints.', observer: type === 'cluster' ? 'kubelet / Deployment' : 'EndpointSlice controller' });
   }
@@ -79,7 +85,8 @@ async function sampleTimeline() {
     const actual = cluster.pods.filter((p) => !p.terminating).length;
     const ready = cluster.pods.filter((p) => p.ready && !p.terminating).length;
     pushPoint(state.timeline, {
-      offeredRps: load.active ? load.targetRps : 0,
+      offeredRps: load.active ? load.offeredLastSecond : 0,
+      offeredTarget: load.active ? load.targetRps : 0,
       observedRps: rate.value,
       stale: rate.stale,
       desired: cluster.hpa?.desired ?? null,
@@ -192,6 +199,8 @@ const server = http.createServer(async (req, res) => {
         emit(type, data);
       });
       state.resetting = false;
+      state.timeline = createHistory();
+      pushMilestone(state.timeline, { kind: 'reset', text: `Reset to ${input.target} complete: ${result.readyPods} Ready pods.`, detail: 'Timeline restarts here; earlier points belonged to the previous scaler and are kept in downloaded evidence.', observer: 'reset controller' });
       emit('note', { text: `Reset to ${input.target} complete: ${result.readyPods} Ready pods.` });
       await sampleTimeline();
     } catch (error) {

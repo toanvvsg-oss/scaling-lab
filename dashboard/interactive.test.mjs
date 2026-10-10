@@ -34,6 +34,27 @@ test('timeline history is bounded and distinguishes stale from zero', () => {
   assert.equal(h.milestones.length, 1);
 });
 
+test('timeline points keep measured offered rate plus target, stale stays null', () => {
+  const h = createHistory();
+  pushPoint(h, { offeredRps: 14, offeredTarget: 15, observedRps: null, stale: true, desired: 2, actual: 2, ready: 2 });
+  assert.equal(h.points[0].offeredRps, 14);
+  assert.equal(h.points[0].offeredTarget, 15);
+  assert.equal(h.points[0].observedRps, null);
+  assert.equal(h.points[0].stale, true);
+});
+
+test('load session clamps rate changes to profile bounds and stops cleanly', async () => {
+  const events = [];
+  const s = new LoadSession((t, d) => events.push([t, d]));
+  await s.start('steady');
+  assert.equal(s.setRps(1000).targetRps, 30);
+  assert.equal(s.setRps(-100).targetRps, 5);
+  const stopped = await s.stop('test');
+  assert.equal(stopped.active, false);
+  assert.equal(stopped.offeredLastSecond, 0);
+  const idle = await s.stop('test');
+  assert.equal(idle.active, false);
+});
 test('reset accepts only known lesson targets', () => {
   assert.doesNotThrow(() => validateResetTarget('cpu'));
   assert.doesNotThrow(() => validateResetTarget('prometheus'));

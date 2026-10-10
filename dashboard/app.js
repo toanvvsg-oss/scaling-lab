@@ -10,13 +10,14 @@ const lessons = [
 const $ = id => document.getElementById(id);
 let current = 0, lastEventCount = 0, pendingLesson = null;
 function escape(s){return String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function select(index){
+function select(index, force = false){
   // Opening another lesson never mutates the cluster. If the target lesson needs a
   // different autoscaler, prompt for a confirmed reset instead of switching silently.
+  // force=true is only used after a confirmed, successful reset.
   const next = lessons[index];
   const needs = next.reset;
   const currentReset = lessons[current]?.reset;
-  if (pendingLesson == null && needs !== currentReset && (needs === 'cpu' || needs === 'prometheus' || currentReset === 'cpu' || currentReset === 'prometheus')) {
+  if (!force && pendingLesson == null && needs !== currentReset && (needs === 'cpu' || needs === 'prometheus' || currentReset === 'cpu' || currentReset === 'prometheus')) {
     pendingLesson = index;
     $('reset-target').value = needs;
     $('reset-status').textContent = `Lesson “${next.title}” needs the ${needs === 'cpu' ? 'CPU HPA (make hpa-up)' : 'Prometheus KEDA scaler (make prometheus-up)'}. Confirm to replace the autoscaler, or Cancel to stay.`;
@@ -49,10 +50,18 @@ async function refresh(){
     $('live-pill').textContent=state.resetting?'RESETTING':state.running||load?.active?'LIVE':'IDLE';
     if (load?.active) {
       const secs = Math.floor((load.elapsedMs||0)/1000);
-      $('load-state').textContent = `${load.profile} · target ${load.targetRps} req/s · elapsed ${secs}s · total ${load.total} (${load.failures} failures) · phase ${load.profile}`;
+      $('load-state').textContent = `${load.profile} · target ${load.targetRps} req/s · measured ${load.offeredLastSecond ?? 0} req/s · elapsed ${secs}s · total ${load.total} (${load.failures} failures)`;
     } else {$('load-state').textContent = state.resetting ? 'Reset in progress — traffic stopped.' : 'Manual load idle.';}
     if(state.resetting && $('reset-dialog').open){$('reset-status').textContent='Reset running: stopping traffic, removing old scaler, restoring baseline, waiting for 2 Ready pods…';}
-    if(!state.resetting && $('reset-dialog').open && /Reset running/.test($('reset-status').textContent)){$('reset-dialog').close(); if(pendingLesson!=null){const i=pendingLesson; pendingLesson=null; select(i);} refresh();}
+    if(!state.resetting && $('reset-dialog').open && /Reset running/.test($('reset-status').textContent)){
+      if(state.error){
+        $('reset-status').textContent=`Reset failed: ${state.error} — fix the cause or run the matching make target in a terminal, then Confirm to retry. Cancel changes nothing.`;
+      } else {
+        $('reset-dialog').close();
+        if(pendingLesson!=null){const i=pendingLesson; select(i, true);}
+        refresh();
+      }
+    }
     if(state.events.length!==lastEventCount){renderEvents(state.events);lastEventCount=state.events.length;}
     if(state.result&&state.scenario===lessons[current].id)renderResult(state.result);
     if(state.error&&!state.resetting)$('run-state').textContent=state.error;
