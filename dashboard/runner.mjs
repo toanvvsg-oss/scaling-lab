@@ -27,7 +27,10 @@ export async function clusterState() {
       pod: x.targetRef?.name, ready: x.conditions?.ready, terminating: x.conditions?.terminating
     }));
     const h = hpa && JSON.parse(hpa).items.find(x => x.spec?.scaleTargetRef?.name === 'app');
-    return { connected: true, pods: p, endpoints: e, hpa: h && { name: h.metadata.name, current: h.status?.currentReplicas, desired: h.status?.desiredReplicas } };
+    return { connected: true, pods: p, endpoints: e, hpa: h && {
+      name: h.metadata.name, current: h.status?.currentReplicas, desired: h.status?.desiredReplicas,
+      metrics: (h.spec?.metrics || []).map(metric => ({ type: metric.type, resource: metric.resource?.name }))
+    } };
   } catch (error) { return { connected: false, error: error.message, pods: [], endpoints: [] }; }
 }
 
@@ -133,6 +136,15 @@ async function prometheusValue(port, query) {
 
 const REQUEST_RATE_QUERY = 'sum(rate(scaling_lab_http_requests_total{job="scaling-app"}[30s]))';
 
+export function requireAutoscaler(state, kind) {
+  const hpa = state.hpa;
+  if (kind === 'cpu' && hpa?.name === 'app' && hpa.metrics?.some(metric => metric.type === 'Resource' && metric.resource === 'cpu')) return;
+  if (kind === 'prometheus' && hpa?.name === 'keda-hpa-app-prometheus' && hpa.metrics?.some(metric => metric.type === 'External')) return;
+  throw new Error(kind === 'cpu'
+    ? 'The CPU HPA is not active. Run make hpa-up before the CPU autoscaling lesson.'
+    : 'The Prometheus KEDA HPA is not active. Run make prometheus-up before the Prometheus lesson.');
+}
+
 async function runPrometheusScenario(emit) {
   await kubectl('get', 'scaledobject', 'app-prometheus', '-o', 'name').catch(() => { throw new Error('Prometheus scaler is missing. Run make prometheus-up first.'); });
   await waitStablePods();
@@ -146,7 +158,7 @@ async function runPrometheusScenario(emit) {
     }
     if (scrapeTargets < 2) throw new Error('Prometheus is not scraping both app pods yet. Check the prometheus targets page.');
     const initialState = await clusterState();
-    if (!initialState.hpa?.name?.startsWith('keda-hpa-')) throw new Error('KEDA has not created its HPA yet. Wait a moment and retry.');
+    requireAutoscaler(initialState, 'prometheus');
     const initial = initialState.pods.filter(x => !x.terminating).length;
     let peak = initial;
     let peakRps = 0;
@@ -282,7 +294,7 @@ export async function runScenario(id, options, emit) {
   }
   if (id === 'autoscale') {
     const state = await clusterState();
-    if (!state.hpa) throw new Error('HPA is missing. Run make hpa-up after installing metrics-server.');
+    requireAutoscaler(state, 'cpu');
     const initial = state.pods.filter(x => !x.terminating).length;
     emit('note', { text: `Starting CPU load with ${initial} pods` });
     const samples = await traffic(75000, '/cpu?ms=120', emit, 150);
