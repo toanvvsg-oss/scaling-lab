@@ -24,6 +24,7 @@ dashboard:
 	node dashboard/server.mjs
 
 ui-build:
+	npm --prefix dashboard/ui install
 	npm --prefix dashboard/ui run build
 
 ui-dev:

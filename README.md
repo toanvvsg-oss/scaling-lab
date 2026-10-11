@@ -1,8 +1,8 @@
 # Scaling Lab
 
-A guided local lab for HTTP connection reuse, Node.js graceful shutdown, Kubernetes rollouts, CPU autoscaling, and Prometheus request-rate autoscaling. The web dashboard pairs each experiment with a live pod/endpoint view, request timeline, conceptual question, and evidence-backed verification result.
+A guided local lab for HTTP connection reuse, Node.js graceful shutdown, Kubernetes rollouts, CPU autoscaling, and Prometheus request-rate autoscaling. The web console (React + Tailwind) pairs each experiment with a live pod/endpoint view, an embedded Grafana HTTP-code pane, request timeline, conceptual question, and evidence-backed verification result.
 
-![Scaling Lab dashboard](docs/dashboard.png)
+![Scaling Lab console](docs/dashboard.png)
 
 ## Requirements
 
@@ -14,10 +14,11 @@ A guided local lab for HTTP connection reuse, Node.js graceful shutdown, Kuberne
 
 ```sh
 make up
+make ui-build   # one-time: installs dashboard deps and builds the console (dist/ is gitignored)
 make dashboard
 ```
 
-Open <http://127.0.0.1:4173>. `make up` creates a three-node kind cluster, builds the Node.js image, and deploys two app pods plus an NGINX edge proxy. `make check` confirms readiness. The dashboard uses context `kind-scaling-lab`, shared infrastructure in `scaling-lab`, and a separate `scaling-run-<id>` namespace for each experiment.
+Open <http://127.0.0.1:4173>. `make up` creates a three-node kind cluster, builds the Node.js image, and deploys two app pods plus an NGINX edge proxy. `make check` confirms readiness. The console uses context `kind-scaling-lab`, shared infrastructure in `scaling-lab`, and a separate `scaling-run-<id>` namespace for each experiment. The configuration worksheet lives at `/worksheet`; `make ui-dev` serves the console from source with hot reload instead.
 
 On a Colima VM already running several clusters, kind startup may fail if containerd reports `failed to create fsnotify watcher: too many open files`. Raise the VM's inotify instance limit, then retry `make up`:
 
@@ -36,15 +37,15 @@ make dashboard
 
 In another terminal, `make prometheus-ui` optionally opens a port-forward for Prometheus at <http://127.0.0.1:19090>.
 
-In Prometheus, inspect **Status → Target health** and query `sum(rate(scaling_lab_http_requests_total{job="scaling-app",namespace="scaling-lab"}[30s]))` for the CLI lab. For a dashboard run, replace the namespace selector with `labrun="<run-id>"`. App pods expose the counter at `/metrics`. Prometheus scrapes each pod every five seconds, KEDA reads the query, and its generated HPA changes the Deployment replica count.
+In Prometheus, inspect **Status → Target health** and query `sum(rate(scaling_lab_http_requests_total{job="scaling-app",namespace="scaling-lab"}[30s]))` for the CLI lab. For a dashboard run, replace the namespace selector with `labrun="<run-id>"`. App pods expose request/response counters at `/metrics` (`scaling_lab_http_requests_total`, `scaling_lab_http_responses_total` by method/route/status/class, a latency histogram, inflight and open-socket gauges). Prometheus scrapes each pod every five seconds, KEDA reads the query, and its generated HPA changes the Deployment replica count.
 
 The dashboard's lesson 07 adds manual traffic controls (`steady`, `ramp`, `burst` profiles bounded for a laptop kind cluster), a predict-before-reveal step, and one synchronized cause→effect timeline: offered RPS, Prometheus observed RPS (stale samples are marked, not shown as zero), HPA desired replicas, actual replicas, and Ready replicas, with milestones for load changes, HPA decisions, pod/endpoint changes, and request failures. The one-click scenario and pass/fail verification still work, and raw evidence stays downloadable for replay.
 
-Prometheus experiments run isolated: creating a run provisions its own `scaling-run-<id>` namespace (app, edge, KEDA scaler) while KEDA, Prometheus, and the dashboard stay shared. The same isolation now covers all seven lessons — each lesson runs one-click scenarios inside its own namespace (autoscaling lessons add their own HPA), with per-lesson traffic routing and evidence. Traffic is routed per run, Prometheus queries filter by the run label, and at most two runs are active (laptop limit). Cleaning up a run snapshots its evidence first; the snapshot stays downloadable afterwards, including after a dashboard restart. The legacy `scaling-lab` namespace and `make verify` CLI paths keep working unchanged. See `docs/adr-run-isolation.md`.
+Prometheus experiments run isolated: creating a run provisions its own `scaling-run-<id>` namespace (app, edge, KEDA scaler) while KEDA, Prometheus, and the dashboard stay shared. The same isolation now covers all seven lessons — each lesson runs one-click scenarios inside its own namespace (autoscaling lessons add their own HPA), with per-lesson traffic routing and evidence. Traffic is routed per run, Prometheus queries filter by the run label, and at most seven runs are active (laptop limit). Cleaning up a run snapshots its evidence first; the snapshot stays downloadable afterwards, including after a dashboard restart. The legacy `scaling-lab` namespace and `make verify` CLI paths keep working unchanged. See `docs/adr-run-isolation.md`.
 
-Use **New run** in the top bar to provision a fresh isolated run for the current lesson. Opening another lesson or creating runs never mutates other runs; each run keeps its own namespace, traffic route, graph, and evidence. Cleaning up a run (with its own confirmation naming the namespace and effects) snapshots evidence first, which stays downloadable afterwards. **Delete kind cluster** (`make down`, only the `scaling-lab` cluster) stays separate and is never part of lesson work. CLI setup targets switch the *shared* legacy namespace only: `make hpa-up` installs the CPU scaler and `make prometheus-up` installs the Prometheus/KEDA scaler there for `make verify`; dashboard runs are independent of both.
+Use **New run** in the experiment controls to provision a fresh isolated run for the current lesson. Opening another lesson or creating runs never mutates other runs; each run keeps its own namespace, traffic route, graph, and evidence. The **All runs** panel shows runs across every lesson and lets you open or close any run. Closing confirms the affected namespace, stops traffic, terminates any guided request, and saves evidence before deleting resources. The panel shows cleanup stages, disables repeated close clicks while cleanup is in progress, and offers **Retry close** if it fails. Evidence stays downloadable afterwards. **Delete kind cluster** (`make down`, only the `scaling-lab` cluster) stays separate and is never part of lesson work. CLI setup targets switch the *shared* legacy namespace only: `make hpa-up` installs the CPU scaler and `make prometheus-up` installs the Prometheus/KEDA scaler there for `make verify`; dashboard runs are independent of both.
 
-Grafana is an optional advanced exercise; all guided lessons work without it. After the built-in timeline, try `make grafana-up` (pins `grafana/grafana:11.3.0` plus `kube-state-metrics:v2.12.0`, local only) and `make grafana-ui` (port-forward `service/grafana` to `127.0.0.1:3003`, login `admin` / `scaling-lab`). The provisioned **Scaling Lab - request rate vs replicas** dashboard shows request rate, scrape targets, HPA desired/current replicas, Ready pods, and how to compare with the guided UI.
+Grafana is installed by default and embedded in the console: the Live observation card shows the run-scoped **Completed app responses by HTTP code** pane (light theme, no login — anonymous Viewer, served through a dashboard-managed localhost forward; `GET /api/grafana?run=<id>`). `make grafana-up` (pins `grafana/grafana:11.3.0` plus `kube-state-metrics:v2.12.0`, local only, restarts Grafana so dashboard edits apply) provisions the **Scaling Lab · HTTP and pod lifecycle** dashboard; `make grafana-ui` (port-forward `service/grafana` to `127.0.0.1:3003`, login `admin` / `scaling-lab`) opens the full dashboard with request rate, HTTP status/error ratio, latency, active requests, sockets, scrape freshness and pod/HPA state, scoped to the selected run. Guided controls and evidence also work when monitoring is unavailable.
 
 ```mermaid
 flowchart LR
@@ -59,6 +60,7 @@ flowchart LR
 ```sh
 make reset    # restore the baseline app configuration and remove the HPA
 make test     # verifier unit tests
+make ui-build # install console deps and rebuild dashboard/dist
 make verify   # run the connection lesson and save evidence to results/
 make down     # delete only the scaling-lab kind cluster
 ```
@@ -92,12 +94,13 @@ The app is configured with a two-second `preStop`, a 30-second pod grace period,
 
 ```text
 app/          Instrumented Node.js service and Dockerfile
-dashboard/    Guided UI, scenario runner, and verifier
+dashboard/    Console (React source in ui/, built assets in dist/), scenario runner, and verifier
+dashboard/ui/ React + Tailwind console source (Vite; needs make ui-build once)
 k8s/          kind, app, proxy, Prometheus, and scaler manifests
 Makefile      Setup, reset, test, and teardown commands
 ```
 
-The dashboard binds to `127.0.0.1` and exposes only predefined scenarios against the dedicated lab context. It does not accept arbitrary shell commands.
+The console at `/` is built output (`dashboard/dist/`, gitignored — run `make ui-build` after a fresh clone); `/worksheet` keeps its classic page. The dashboard binds to `127.0.0.1` and exposes only predefined scenarios against the dedicated lab context. It does not accept arbitrary shell commands. The managed `GET /api/grafana` route forwards only the provisioned Grafana service over an ephemeral localhost port.
 
 The next implementation checklist, including kind access and live acceptance steps, is in [docs/opencode-handoff.md](docs/opencode-handoff.md).
 
