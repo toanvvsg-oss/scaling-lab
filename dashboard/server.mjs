@@ -9,10 +9,12 @@ import { validateResetTarget, runReset } from './reset.mjs';
 import { queryPrometheus, queryRunSamples, LEGACY_RATE_QUERY, rateQueryForRun, upQueryForRun, counterSelForRun, upSelForRun } from './prometheus.mjs';
 import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns } from './runs.mjs';
 import { runAction } from './actions.mjs';
+import { grafanaStatus, closeGrafanaForward, dashboardUrl, panelEmbedUrl } from './grafana.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
-const resultsDir = join(root, '..', 'results');
-const files = { '/': ['index.html', 'text/html'], '/worksheet': ['worksheet.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/diagram.css': ['diagram.css', 'text/css'], '/app.js': ['app.js', 'text/javascript'], '/diagram.js': ['diagram.js', 'text/javascript'], '/timeline-ui.js': ['timeline-ui.js', 'text/javascript'], '/timeline.mjs': ['timeline.mjs', 'text/javascript'], '/worksheet.js': ['worksheet.js', 'text/javascript'] };
+const resultsDir = process.env.SCALING_LAB_RESULTS_DIR ? resolve(process.env.SCALING_LAB_RESULTS_DIR) : join(root, '..', 'results');
+// Worksheet keeps its classic page; the lab console itself is the built React app in dist/.
+const files = { '/worksheet': ['worksheet.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/worksheet.js': ['worksheet.js', 'text/javascript'] };
 
 export const EXPLANATIONS = {
   connections: 'One TCP connection can carry many requests (keep-alive), but the proxy terminates the client socket and picks its own upstream socket to Node.js. Reused client requests share an edge connection ID; fresh sockets get new ones — the two pools are independent.',
@@ -41,6 +43,10 @@ export const prodDeps = {
   rateQueryForRun, upQueryForRun,
   resetApi: { validateResetTarget, runReset },
   runAction,
+  // Managed local-only Grafana route lifecycle (fixed service, ephemeral
+  // localhost port). Injected so tests can stub availability without
+  // ever spawning kubectl against a live cluster.
+  grafanaApi: { status: () => grafanaStatus(), close: () => closeGrafanaForward() },
   resultsDir,
   profiles: { request: PROFILES, cpu: CPU_PROFILES },
   enableSampler: true,
@@ -300,6 +306,30 @@ function summarizeAction(s) {
       return send(res, 200, { ...state, load: loadState(), profiles: profilesPayload(), runs: [...R.runs.values()].map(R.describeRun), archivedRuns: [...R.archives.keys()], maxActiveRuns: R.MAX_ACTIVE_RUNS, booted, legacyPrediction: legacy ? { guess: legacy.guess, lesson: legacy.lesson, revealed: legacy.revealed } : null });
     }
     if (req.method === 'GET' && path === '/api/cluster') return send(res, 200, await io.clusterState());
+    // Managed local-only Grafana route (fixed service, ephemeral localhost
+    // port). Never a generic proxy: only the provisioned Grafana service.
+    // The run parameter is validated BEFORE starting any route, so unknown
+    // runs never spawn a forward.
+    if (req.method === 'GET' && path === '/api/grafana') {
+      const runParam = url.searchParams.get('run');
+      if (runParam) {
+        try {
+          R.validateRunId(runParam);
+          if (!R.runs.has(runParam) && !R.archives.has(runParam)) throw new Error('unknown run');
+        } catch {
+          return send(res, 404, { error: `Unknown run: ${runParam}` });
+        }
+      }
+      const status = await io.grafanaApi.status().catch(() => ({ available: false, baseUrl: null }));
+      if (!status.available) return send(res, 200, { available: false, baseUrl: null, dashboardUrl: null });
+      let runUrl = dashboardUrl(status.baseUrl);
+      let embedUrl = null;
+      if (runParam) {
+        runUrl = dashboardUrl(status.baseUrl, runParam);
+        embedUrl = panelEmbedUrl(status.baseUrl, runParam);
+      }
+      return send(res, 200, { available: true, baseUrl: status.baseUrl, dashboardUrl: dashboardUrl(status.baseUrl), runUrl, embedUrl });
+    }
     if (req.method === 'GET' && path === '/api/load') return send(res, 200, loadState());
     if (req.method === 'GET' && path === '/api/timeline') return send(res, 200, state.timeline);
     if (req.method === 'GET' && path === '/api/evidence') {
@@ -537,6 +567,25 @@ function summarizeAction(s) {
         .finally(() => { state.running = false; stopObservation(); sampleTimeline(); });
       return;
     }
+    if (req.method === 'GET' && (path === '/' || path === '/ui' || path === '/ui/')) {
+      try {
+        const content = await readFile(join(root, 'dist', 'index.html'));
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(content);
+      } catch { send(res, 404, { error: 'Console not built. Run make ui-build.' }); }
+      return;
+    }
+    if (req.method === 'GET' && (path.startsWith('/assets/') || path.startsWith('/ui/'))) {
+      const rel = path.startsWith('/ui/') ? path.slice(4) : path.slice(1);
+      if (!rel || rel.includes('..') || rel.includes('\0')) return send(res, 400, { error: 'Invalid path' });
+      const contentType = rel.endsWith('.js') ? 'text/javascript' : rel.endsWith('.css') ? 'text/css' : rel.endsWith('.html') ? 'text/html' : rel.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream';
+      try {
+        const content = await readFile(join(root, 'dist', rel));
+        res.writeHead(200, { 'content-type': `${contentType}; charset=utf-8`, 'cache-control': 'no-store' });
+        res.end(content);
+      } catch { send(res, 404, { error: 'Not found' }); }
+      return;
+    }
     if (req.method === 'GET' && files[path]) {
       const [name, contentType] = files[path];
       try {
@@ -583,12 +632,23 @@ function summarizeAction(s) {
 
   if (io.enableSampler) setInterval(async () => { await sampleTimeline(); await sampleRuns(); }, 5000);
 
-  return { server, state, boot, isBooted: () => booted };
+  // App-level close: HTTP server plus ONLY this process's Grafana forward.
+  // Never touches clusters, namespaces, or anything else kubectl owns.
+  function close(done) {
+    try { io.grafanaApi.close(); } catch { /* ignore */ }
+    if (typeof done === 'function') server.close(done);
+    else return new Promise((resolve) => server.close(resolve));
+  }
+
+  return { server, state, boot, isBooted: () => booted, close };
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  const { server, boot } = createApp();
+  const { server, boot, close } = createApp();
   server.listen(4173, '127.0.0.1', () => console.log('Dashboard: http://127.0.0.1:4173'));
+  const shutdown = () => close(() => process.exit(0));
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
   boot();
 }

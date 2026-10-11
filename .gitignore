@@ -1,3 +1,5 @@
 node_modules/
+dashboard/ui/node_modules/
+dashboard/dist/
 .DS_Store
 results/
