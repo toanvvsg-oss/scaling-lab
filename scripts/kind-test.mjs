@@ -217,7 +217,13 @@ try {
       await waitFor(async () => !(await api('/api/runs/' + id)).scenarioRunning, phase, 420_000);
       const evidence = await api('/api/evidence?run=' + id);
       await writeFile(join(out, phase + '.json'), JSON.stringify(evidence, null, 2));
-      check(phase + ' actual verifier passes', evidence.result?.status === 'pass' && evidence.result.checks.every(c => c.pass), evidence.result || evidence.error);
+      // Abrupt exit intentionally permits background failures. Its required
+      // targets are deleting the serving pod and interrupting the long response;
+      // keep the background check/failure evidence visible without treating an
+      // expected abrupt-exit observation as a broken graceful-shutdown lab.
+      const requiredChecks = lesson === 'shutdown' && shutdownMode === 'abrupt'
+        ? evidence.result?.checks.slice(0, 2) : evidence.result?.checks;
+      check(phase + ' actual verifier passes', evidence.result?.status === 'pass' && requiredChecks?.length > 0 && requiredChecks.every(c => c.pass), evidence.result || evidence.error);
       if (lesson === 'shutdown' && shutdownMode === 'abrupt') {
         check('expected abrupt pass still records interrupted HTTP response', evidence.statusStats?.transport > 0, evidence.statusStats);
       }

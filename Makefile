@@ -80,7 +80,7 @@ grafana-up: prometheus-base-up
 	$(KUBECTL) -n scaling-lab rollout status deployment/kube-state-metrics --timeout=180s
 	$(KUBECTL) -n scaling-lab rollout status deployment/grafana --timeout=180s
 	$(KUBECTL) -n scaling-lab rollout status deployment/prometheus --timeout=60s || true
-	@echo 'Grafana is local only. Run make grafana-ui, login admin/scaling-lab, open "Scaling Lab - request rate vs replicas". Compare with the guided timeline: offered RPS, scraped RPS, desired replicas, Ready pods.'
+	@echo 'Grafana is local only. Run make grafana-ui, login admin/scaling-lab, open "Scaling Lab · HTTP and pod lifecycle". Compare with the guided timeline: offered RPS, scraped RPS, desired replicas, Ready pods.'
 
 grafana-ui:
 	$(KUBECTL) -n scaling-lab port-forward service/grafana 3003:3000

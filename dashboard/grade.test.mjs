@@ -93,3 +93,15 @@ test('abrupt shutdown pass is still an observed transport error in metrics', () 
   assert.equal(gradeShutdown({ slow, samples, deletedPod: 'p1', mode: 'abrupt' }).status, 'pass');
   assert.equal(classifyResult(slow).kind, 'transport');
 });
+
+test('abrupt shutdown preserves background failures while graceful requires clean traffic', () => {
+  const samples = [...okLoad(24), { ok: false, error: 'ECONNRESET' }];
+  const input = { slow: { pod: 'p1', complete: false }, samples, deletedPod: 'p1' };
+  const abrupt = gradeShutdown({ ...input, mode: 'abrupt' });
+  assert.equal(abrupt.status, 'pass');
+  assert.equal(abrupt.checks[2].pass, false);
+  assert.equal(abrupt.evidence.failures.length, 1);
+  assert.equal(gradeShutdown({ ...input, slow: { pod: 'p1', complete: true }, mode: 'graceful' }).status, 'fail');
+  assert.equal(gradeShutdown({ ...input, slow: { pod: 'p1', complete: true }, mode: 'abrupt' }).status, 'fail');
+  assert.equal(gradeShutdown({ ...input, deletedPod: 'other', mode: 'abrupt' }).status, 'inconclusive');
+});
