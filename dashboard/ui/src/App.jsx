@@ -3,8 +3,9 @@ import { Button } from './components/button.jsx';
 import { Card, CardContent } from './components/card.jsx';
 import { TimelineChart } from './components/timeline.jsx';
 import { Diagram } from './components/diagram.jsx';
+import { RunsPanel } from './components/runs-panel.jsx';
 import { LESSONS, ACTION_DEFS, TIMELINE_HEADINGS, STEPS } from './lessons.js';
-import { getJSON, postJSON, delJSON, downloadBlob } from './api.js';
+import { getJSON, postJSON, downloadBlob } from './api.js';
 
 function shortPod(v) {
   if (!v) return '?';
@@ -26,7 +27,6 @@ export default function App() {
   const [notice, setNotice] = useState('');
   const [guess, setGuess] = useState(null);
   const [quizPick, setQuizPick] = useState(null);
-  const [cleanupConfirm, setCleanupConfirm] = useState(false);
   const [evidence, setEvidence] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
@@ -147,22 +147,6 @@ export default function App() {
     }
   };
 
-  const cleanup = async () => {
-    if (!selectedRun) return;
-    setBusy('Cleaning up…');
-    try {
-      await delJSON(`/api/runs/${selectedRun}`);
-      setNotice(`Run ${selectedRun} cleanup started. Evidence stays downloadable.`);
-      setSelectedRun(null);
-      setCleanupConfirm(false);
-    } catch (e) {
-      setNotice(`Cleanup failed: ${e.message}`);
-    } finally {
-      setBusy('');
-      refreshState();
-    }
-  };
-
   const downloadEvidence = async (id) => {
     try {
       const data = await getJSON(id ? `/api/evidence?run=${id}` : '/api/evidence');
@@ -213,6 +197,21 @@ export default function App() {
   const checks = evidence?.result?.checks || null;
   const verdict = evidence?.result?.status || active?.resultStatus || null;
   const archived = state?.archivedRuns || [];
+  const maxActiveRuns = state?.maxActiveRuns ?? 7;
+  const atRunLimit = (state?.runs || []).filter((r) => !['deleted', 'failed'].includes(r.status)).length >= maxActiveRuns;
+  const runUnavailable = Boolean(busy || !active || active.status !== 'ready' || active.actionRunning || active.scenarioRunning);
+  const openRun = (run) => {
+    const idx = LESSONS.findIndex((l) => l.id === run.lesson);
+    if (idx < 0) return;
+    setLessonIdx(idx);
+    setSelectedRun(run.id);
+    setRunDetail(null);
+    setRunCluster(null);
+    setTimeline(null);
+    setEvidence(null);
+    setGuess(null);
+    setQuizPick(null);
+  };
   const defs = ACTION_DEFS[lesson.id] || [];
   const done = {
     baseline: active?.status === 'ready',
@@ -225,23 +224,29 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
-      <header className="flex items-center justify-between bg-[#112a22] px-6 py-3 text-white">
+      <header className="border-b border-white/10 bg-[#112a22] text-white">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-4">
         <div className="flex items-center gap-2 text-sm font-bold tracking-widest">
           <span className="grid h-7 w-7 place-items-center rounded-md bg-lime-300 text-green-900">↗</span>
-          SCALING LAB <span className="font-normal text-white/60">Field guide · shadcn console</span>
+          SCALING LAB <span className="ml-3 hidden text-xs font-normal tracking-normal text-white/45 md:inline">Interactive systems lab</span>
         </div>
-        <div className="flex items-center gap-3 text-xs text-white/70">
-          <span>{cluster?.connected ? '● kind cluster connected' : '○ checking cluster…'}</span>
-          <button className="rounded border border-white/30 px-2 py-1 underline" onClick={() => setSidebarOpen((v) => !v)} aria-expanded={sidebarOpen}>
+        <div className="flex flex-wrap items-center gap-4 text-[11px] text-white/60">
+          <span className="inline-flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${cluster?.connected ? 'bg-emerald-400' : 'bg-slate-400'}`} />{cluster?.connected ? 'Cluster connected' : 'Connecting…'}</span>
+          <button className="rounded-md border border-white/15 px-2.5 py-1.5 transition-colors hover:bg-white/10" onClick={() => setSidebarOpen((v) => !v)} aria-expanded={sidebarOpen}>
             {sidebarOpen ? 'Hide lessons' : 'Show lessons'}
           </button>
           <a className="underline" href="/worksheet">Worksheet</a>
         </div>
+        </div>
       </header>
+
+      <div className="mx-auto max-w-7xl px-4">
+        <RunsPanel runs={state?.runs || []} archived={archived} maxActiveRuns={maxActiveRuns} selectedRun={selectedRun} onOpen={openRun} onRefresh={refreshState} onDownload={downloadEvidence} />
+      </div>
 
       <div className={`mx-auto grid max-w-7xl gap-4 p-4 ${sidebarOpen ? 'lg:grid-cols-[220px_minmax(0,1fr)_340px]' : 'lg:grid-cols-[minmax(0,1fr)_340px]'}`}>
         {sidebarOpen && (
-        <aside className="space-y-2">
+        <aside className="min-w-0 space-y-2">
           <p className="font-mono text-[10px] tracking-widest text-muted-foreground">LABS / 07</p>
           {LESSONS.map((l, i) => (
             <button
@@ -267,7 +272,7 @@ export default function App() {
         </aside>
         )}
 
-        <section className="space-y-4">
+        <section className="min-w-0 space-y-4">
           <div>
             <p className="font-mono text-[10px] tracking-widest text-muted-foreground">LAB 0{lessonIdx + 1} / 07 · {lesson.time}</p>
             <h1 className="text-3xl font-semibold tracking-tight">{lesson.title}</h1>
@@ -300,9 +305,9 @@ export default function App() {
                 <span key={s} className={`rounded-full border px-2 py-1 font-mono text-[10px] ${done[s] ? 'border-green-600 bg-green-50 text-green-800' : 'text-muted-foreground'}`}>{s}</span>
               ))}
             </div>
-            <div className="flex items-center gap-2">
-              <Button onClick={runScenario}>New run + verify →</Button>
-              <Button variant="outline" onClick={createRun}>New run</Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button disabled={active ? runUnavailable || active.hasPendingLong || active.load?.active : Boolean(busy || atRunLimit)} onClick={runScenario}>{selectedRun ? 'Run + verify →' : 'New run →'}</Button>
+              <Button variant="outline" disabled={Boolean(busy || atRunLimit)} onClick={createRun}>New run</Button>
               {busy && <span className="text-xs text-muted-foreground">{busy}</span>}
             </div>
             {defs.length > 0 && (
@@ -311,7 +316,7 @@ export default function App() {
                 <p className="text-xs text-muted-foreground">Small steps you can run and inspect before the one-click verifier.</p>
                 <div className="flex flex-wrap gap-2">
                   {defs.map(([v, label]) => (
-                    <Button key={v} variant="outline" size="sm" onClick={() => runAction(v)}>{label}</Button>
+                    <Button key={v} variant="outline" size="sm" disabled={runUnavailable || (v === 'terminate-serving' ? !active?.hasPendingLong : active?.hasPendingLong)} onClick={() => runAction(v)}>{busy === `Running ${v}…` ? `${label}…` : label}</Button>
                   ))}
                 </div>
               </div>
@@ -319,28 +324,20 @@ export default function App() {
             <div className="space-y-2 border-t pt-2">
               <h4 className="text-sm font-semibold">Isolated runs</h4>
               <div className="flex flex-wrap items-center gap-2">
-                <select value={selectedRun || ''} onChange={(e) => setSelectedRun(e.target.value || null)} className="rounded-md border p-1 text-sm">
+                <select value={selectedRun || ''} onChange={(e) => setSelectedRun(e.target.value || null)} className="max-w-full rounded-md border p-1 text-sm">
                   <option value="">no runs</option>
                   {lessonRuns.map((r) => (
                     <option key={r.id} value={r.id}>{r.id} · {r.status} · {r.namespace}</option>
                   ))}
                 </select>
                 <Button variant="outline" size="sm" onClick={() => downloadEvidence(selectedRun)}>Download evidence</Button>
-                {!cleanupConfirm ? (
-                  <Button variant="outline" size="sm" onClick={() => setCleanupConfirm(true)}>Clean up run…</Button>
-                ) : (
-                  <span className="flex items-center gap-2 text-xs">
-                    Delete scaling-run-{selectedRun}? Evidence stays downloadable.
-                    <Button size="sm" onClick={cleanup}>Confirm cleanup</Button>
-                    <Button variant="ghost" size="sm" onClick={() => setCleanupConfirm(false)}>Cancel</Button>
-                  </span>
-                )}
+                <a className="text-xs underline" href="#all-runs">Manage / close runs ↑</a>
               </div>
               <p className="font-mono text-[11px] text-muted-foreground">
                 {active ? `run ${active.id} · ${active.status} · ${active.namespace} · ${pods.filter((p) => p.ready && !p.terminating).length} Ready pods` : 'No runs for this lesson — create one to start.'}
               </p>
               <p className="text-xs text-green-700">
-                Footprint: {(state?.runs || []).filter((r) => r.status !== 'deleted' && r.status !== 'failed').length}/{state?.maxActiveRuns || 2} active runs · 100m CPU / 64Mi per app pod.
+                Footprint: {(state?.runs || []).filter((r) => r.status !== 'deleted' && r.status !== 'failed').length}/{maxActiveRuns} active runs · 100m CPU / 64Mi per app pod.
               </p>
               <div className="text-xs">
                 <span className="font-mono text-muted-foreground">Archived evidence ({archived.length}): </span>
@@ -363,10 +360,10 @@ export default function App() {
               <div className="space-y-2 border-t pt-2">
                 <h4 className="text-sm font-semibold">Manual traffic</h4>
                 <div className="flex flex-wrap gap-2">
-                  <Button variant="outline" size="sm" onClick={() => loadAction('start', lesson.id === 'autoscale' ? 'cpu-steady' : 'steady')}>Start</Button>
-                  <Button variant="outline" size="sm" onClick={() => loadAction('increase')}>Increase</Button>
-                  <Button variant="outline" size="sm" onClick={() => loadAction('decrease')}>Decrease</Button>
-                  <Button variant="outline" size="sm" onClick={() => loadAction('stop')}>Stop</Button>
+                  <Button variant="outline" size="sm" disabled={runUnavailable || active?.hasPendingLong || active?.load?.active} onClick={() => loadAction('start', lesson.id === 'autoscale' ? 'cpu-steady' : 'steady')}>Start</Button>
+                  <Button variant="outline" size="sm" disabled={runUnavailable || !active?.load?.active} onClick={() => loadAction('increase')}>Increase</Button>
+                  <Button variant="outline" size="sm" disabled={runUnavailable || !active?.load?.active} onClick={() => loadAction('decrease')}>Decrease</Button>
+                  <Button variant="outline" size="sm" disabled={runUnavailable || !active?.load?.active} onClick={() => loadAction('stop')}>Stop</Button>
                 </div>
                 <p className="text-xs text-muted-foreground">{active?.load?.active ? `${active.load.profile} · target ${active.load.targetRps} req/s · total ${active.load.total}` : 'Manual load idle.'}</p>
               </div>
@@ -416,7 +413,7 @@ export default function App() {
           </CardContent></Card>
         </section>
 
-        <aside className="space-y-3">
+        <aside className="min-w-0 space-y-3">
           <Card className="border-0 bg-transparent shadow-none"><CardContent className="space-y-2 px-0">
             <h3 className="text-sm font-semibold">Live observation {active?.load?.active ? '· LIVE' : '· IDLE'}</h3>
             {grafana?.available ? (
@@ -425,7 +422,7 @@ export default function App() {
               <div className="space-y-1">
                 <p className="text-xs text-muted-foreground">Monitoring integration is unavailable on this server (no <code>/api/grafana</code>). Use the manual path:</p>
                 <pre className="overflow-auto rounded bg-muted p-2 font-mono text-[10px]">make grafana-up{'\n'}make grafana-ui  # http://127.0.0.1:3003</pre>
-                <p className="text-xs text-muted-foreground">Login <code>admin</code> / <code>scaling-lab</code>, open “Scaling Lab - request rate vs replicas”.</p>
+                <p className="text-xs text-muted-foreground">Login <code>admin</code> / <code>scaling-lab</code>, open “Scaling Lab · HTTP and pod lifecycle”.</p>
               </div>
             )}
             {grafana?.embedUrl && selectedRun && (

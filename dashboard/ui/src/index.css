@@ -4,17 +4,17 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 140 20% 12%;
+    --background: 210 20% 98%;
+    --foreground: 215 25% 17%;
     --card: 0 0% 100%;
     --card-foreground: 140 20% 12%;
     --primary: 142 45% 32%;
     --primary-foreground: 0 0% 100%;
     --secondary: 120 20% 95%;
     --secondary-foreground: 140 20% 20%;
-    --muted: 120 15% 95%;
-    --muted-foreground: 140 10% 40%;
-    --border: 130 15% 86%;
+    --muted: 210 20% 96%;
+    --muted-foreground: 215 12% 46%;
+    --border: 214 20% 90%;
     --radius: 0.625rem;
   }
   * {
@@ -23,4 +23,23 @@
   body {
     @apply bg-background text-foreground antialiased;
   }
+}
+
+.run-cleanup-progress {
+  appearance: none;
+  border: 0;
+  background: hsl(var(--border));
+  color: hsl(var(--primary));
+}
+.run-cleanup-progress::-webkit-progress-bar {
+  background: hsl(var(--border));
+  border-radius: 999px;
+}
+.run-cleanup-progress::-webkit-progress-value {
+  background: hsl(var(--primary));
+  border-radius: 999px;
+}
+.run-cleanup-progress::-moz-progress-bar {
+  background: hsl(var(--primary));
+  border-radius: 999px;
 }

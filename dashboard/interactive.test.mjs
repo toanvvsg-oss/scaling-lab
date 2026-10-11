@@ -156,7 +156,7 @@ test('run ids are server-shaped, validated, and scoped to one namespace', () => 
   assert.throws(() => validateRunId(undefined), /Invalid run id/);
   assert.throws(() => namespaceFor('app'), /Invalid run id/);
   assert.ok(RUN_LESSONS.has('prometheus'));
-  assert.equal(MAX_ACTIVE_RUNS, 2);
+  assert.equal(MAX_ACTIVE_RUNS, 7);
 });
 
 test('run metric queries carry the run selector, legacy query stays namespaced', () => {

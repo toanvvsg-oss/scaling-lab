@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  runs, archives, createRun, cleanupRun, validateRunId, MAX_ACTIVE_RUNS, activeRuns, parseHpa,
+  runs, archives, createRun, cleanupRun, describeRun, validateRunId, MAX_ACTIVE_RUNS, activeRuns, parseHpa,
 } from './runs.mjs';
 
 import { makeFakeCluster } from './test-fake.mjs';
@@ -24,8 +24,10 @@ test('creation returns the allocated id and correlates registry entries', async 
   assert.equal(a.status, 'ready');
   const labels = fake.namespaces.get(a.ns).labels;
   assert.equal(labels['scaling.lab/run'], a.id);
+  for (let i = 2; i < MAX_ACTIVE_RUNS; i++) await createRun('connections', quiet(), fake.deps);
   await assert.rejects(createRun('prometheus', quiet(), fake.deps), /Run limit reached/);
-  assert.equal(MAX_ACTIVE_RUNS, 2);
+  assert.equal(fake.namespaces.size, 7);
+  assert.equal(MAX_ACTIVE_RUNS, 7);
 });
 
 test('cleanup during creation is rejected, then succeeds', async () => {
@@ -93,6 +95,44 @@ test('traffic stops before the snapshot so final counts are stable', async () =>
   assert.equal(file.load.total, 42);
 });
 
+test('cleanup exposes progress while traffic drains and namespace deletion waits', async () => {
+  runs.clear(); archives.clear();
+  const dir = mkdtempSync(join(tmpdir(), 'lab-progress-'));
+  const fake = makeFakeCluster();
+  const run = await createRun('connections', quiet(), fake.deps);
+  let releaseTraffic;
+  run.load = {
+    active: true,
+    state: () => ({ active: run.load.active }),
+    stop: () => new Promise((resolve) => { releaseTraffic = () => { run.load.active = false; resolve(); }; }),
+  };
+  let releaseDelete;
+  const origExec = fake.deps.exec;
+  fake.deps.exec = async (args) => {
+    if (args.includes('namespace') && args.includes('delete')) {
+      await new Promise((resolve) => { releaseDelete = resolve; });
+    }
+    return origExec(args);
+  };
+  const pending = cleanupRun(run.id, dir, fake.deps);
+  assert.equal(describeRun(run).cleanup.stage, 'stop-traffic');
+  assert.equal(describeRun(run).cleanup.completed, 0);
+  assert.equal(run.status, 'deleting');
+  await assert.rejects(cleanupRun(run.id, dir, fake.deps), /already in progress/);
+  releaseTraffic();
+  for (let i = 0; i < 100 && !releaseDelete; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(releaseDelete);
+  assert.equal(describeRun(run).cleanup.stage, 'delete-namespace');
+  assert.equal(describeRun(run).cleanup.completed, 3);
+  assert.ok(archives.has(run.id));
+  assert.ok(fake.forwards[0].closed);
+  releaseDelete();
+  await pending;
+  assert.equal(run.status, 'deleted');
+  assert.equal(describeRun(run).cleanup.completed, 4);
+  assert.equal(describeRun(run).cleanup.stage, 'complete');
+});
+
 test('cleanup-failed namespaces keep their slot until deletion succeeds', async () => {
   runs.clear(); archives.clear();
   const fake = makeFakeCluster();
@@ -112,11 +152,12 @@ test('cleanup-failed namespaces keep their slot until deletion succeeds', async 
   assert.equal(runs.get(a.id).status, 'cleanup-failed');
   assert.equal(runs.get(a.id).cleanupAttempts, 1);
   assert.ok(fake.namespaces.has(a.ns), 'failed-cleanup namespace retained');
-  // A third run must be rejected: A (cleanup-failed) + B (ready) fill the cap.
+  // Failed cleanup keeps its slot even after the remaining slots are filled.
+  for (let i = 2; i < MAX_ACTIVE_RUNS; i++) await createRun('connections', quiet(), fake.deps);
   const countedActive = activeRuns().length;
-  assert.equal(countedActive, 2);
+  assert.equal(countedActive, MAX_ACTIVE_RUNS);
   await assert.rejects(createRun('prometheus', () => {}, fake.deps), /Run limit reached/);
-  assert.equal(fake.namespaces.size, 2, 'no namespace leaked for the rejected run');
+  assert.equal(fake.namespaces.size, MAX_ACTIVE_RUNS, 'no namespace leaked for the rejected run');
   // Retry succeeds after the failure clears; attempts are recorded.
   failNs.clear();
   await cleanupRun(a.id, tmpdir(), fake.deps);

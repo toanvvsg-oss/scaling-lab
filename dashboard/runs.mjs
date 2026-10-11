@@ -37,7 +37,7 @@ export const realDeps = {
   genId: createRunId,
 };
 
-export const MAX_ACTIVE_RUNS = 2;
+export const MAX_ACTIVE_RUNS = 7;
 // Every lesson can run isolated. Only the autoscaling lessons add a scaler;
 // the other five get app + edge only.
 export const RUN_LESSONS = new Set(['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus']);
@@ -363,6 +363,7 @@ export function describeRun(run) {
   return {
     id: run.id, lesson: run.lesson, namespace: run.ns, status: run.status,
     createdAt: run.createdAt, error: run.error || null, steps: run.steps,
+    cleanup: run.cleanup || null,
     load: run.load ? run.load.state() : { active: false },
     readopted: Boolean(run.readopted),
     scenario: run.scenario || null,
@@ -475,10 +476,15 @@ export async function cleanupRun(runId, resultsDir, deps = realDeps) {
   run.status = 'deleting';
   run.error = null;
   run.cleanupAttempts = (run.cleanupAttempts || 0) + 1;
+  const progress = (stage, detail, completed) => {
+    run.cleanup = { stage, detail, completed, total: 4, updatedAt: new Date().toISOString() };
+  };
   try {
     // Stop traffic first and await in-flight requests, so final counts are
     // stable before the snapshot is taken.
+    progress('stop-traffic', 'Stopping traffic and waiting for in-flight requests…', 0);
     if (run.load?.active) await run.load.stop('stopped by run cleanup');
+    progress('archive-evidence', 'Saving and verifying the evidence snapshot…', 1);
     const archive = structuredClone(buildArchive(run));
     try {
       await mkdir(resultsDir, { recursive: true });
@@ -489,8 +495,10 @@ export async function cleanupRun(runId, resultsDir, deps = realDeps) {
       throw new Error(`Evidence snapshot could not be persisted: ${error.message}`);
     }
     archives.set(runId, archive);
+    progress('close-route', 'Closing the run traffic route…', 2);
     try { if (run.forward) run.forward.close(); } catch { /* ignore */ }
     run.forward = null;
+    progress('delete-namespace', `Waiting for Kubernetes to delete ${run.ns}…`, 3);
     // Idempotent retry: delete --ignore-not-found waits for removal, so a
     // successful delete means the namespace is gone and the slot is freed.
     // Only a failed delete retains the cleanup-failed record and its slot.
@@ -502,6 +510,7 @@ export async function cleanupRun(runId, resultsDir, deps = realDeps) {
       throw Object.assign(new Error(run.error), { status: 502 });
     }
     run.status = 'deleted';
+    progress('complete', 'Run closed. Evidence stays downloadable.', 4);
     return run;
   } catch (error) {
     if (run.status === 'deleting') {

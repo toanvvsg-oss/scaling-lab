@@ -456,7 +456,8 @@ function summarizeAction(s) {
         }
       }
       if (req.method === 'DELETE' && !sub) {
-        if (run.status === 'deleted') return send(res, 409, { error: `Run ${run.id} is already deleted.` });
+        if (run.status === 'deleted') return send(res, 200, { run: run.id, status: run.status });
+        if (run.status === 'deleting') return send(res, 202, { started: true, run: run.id, namespace: run.ns, status: run.status, cleanup: run.cleanup });
         // Preflight the same guards cleanupRun enforces, so a rejected
         // cleanup returns 409 immediately instead of a misleading 202.
         if (run.status === 'creating') return send(res, 409, { error: `Run ${run.id} is still being created. Wait before cleanup.` });

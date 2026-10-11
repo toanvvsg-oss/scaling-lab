@@ -98,6 +98,13 @@ test('boot gate, creation correlation, and limit', async (t) => {
   assert.notEqual(r.body.id, idA);
   const ready = await readyIds(ctx.api, 2);
   assert.ok(ready.includes(idA));
+  for (let i = 2; i < R.MAX_ACTIVE_RUNS; i++) {
+    r = await ctx.api('POST', '/api/runs', { lesson: 'connections' });
+    assert.equal(r.status, 202);
+  }
+  const state = await ctx.api('GET', '/api/state');
+  assert.equal(state.body.maxActiveRuns, 7);
+  assert.equal(state.body.runs.length, 7);
   r = await ctx.api('POST', '/api/runs', { lesson: 'prometheus' });
   assert.equal(r.status, 409);
   assert.match(r.body.error, /Run limit reached/);
@@ -160,6 +167,38 @@ test('cleanup failure keeps state for retry, then deletes', async (t) => {
   }
   r = await ctx.api('GET', '/api/evidence', undefined);
   assert.equal(r.status, 200);
+});
+
+test('repeated DELETE reports the current cleanup without starting it again', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer();
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  const { body } = await ctx.api('POST', '/api/runs', { lesson: 'connections' });
+  await readyIds(ctx.api, 1);
+  const origExec = ctx.fake.deps.exec;
+  let releaseDelete;
+  let deletions = 0;
+  ctx.fake.deps.exec = async (args) => {
+    if (args.includes('delete') && args.includes('namespace')) {
+      deletions++;
+      await new Promise((resolve) => { releaseDelete = resolve; });
+    }
+    return origExec(args);
+  };
+  assert.equal((await ctx.api('DELETE', `/api/runs/${body.id}`)).status, 202);
+  for (let i = 0; i < 100 && !releaseDelete; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(releaseDelete);
+  const repeated = await ctx.api('DELETE', `/api/runs/${body.id}`);
+  assert.equal(repeated.status, 202);
+  assert.equal(repeated.body.status, 'deleting');
+  assert.equal(repeated.body.cleanup.stage, 'delete-namespace');
+  assert.equal(deletions, 1);
+  releaseDelete();
+  for (let i = 0; i < 100 && R.runs.get(body.id).status !== 'deleted'; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(R.runs.get(body.id).status, 'deleted');
+  assert.equal((await ctx.api('DELETE', `/api/runs/${body.id}`)).status, 200);
+  assert.equal(deletions, 1);
 });
 
 test('predictions are scoped per run and lesson with observation gating', async (t) => {
@@ -231,7 +270,7 @@ test('guided-action conflicts: action/load/scenario/cleanup serialize', async (t
   const runsApi2 = {
     runs: store2.runs, archives: store2.archives,
     activeRuns() { return [...store2.runs.values()].filter((r) => !['deleted', 'failed'].includes(r.status)); },
-    MAX_ACTIVE_RUNS: 2,
+    MAX_ACTIVE_RUNS: R.MAX_ACTIVE_RUNS,
     RUN_LESSONS: new Set(['connections', 'rollout']),
     validateRunId: R.validateRunId,
     describeRun: R.describeRun,

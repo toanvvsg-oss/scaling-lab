@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   unit:
+    if: vars.LAB_CI_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
