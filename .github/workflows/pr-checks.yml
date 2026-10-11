@@ -1,13 +1,15 @@
 name: pr-checks
 on:
-  pull_request:
   push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   unit:
+    if: github.event_name == 'workflow_dispatch' || vars.LAB_CI_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,10 +21,13 @@ jobs:
       - run: npm test
       - name: Check changed lines for whitespace errors
         env:
-          DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-          DIFF_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          DIFF_BASE: ${{ github.event.before }}
+          DIFF_HEAD: ${{ github.sha }}
         run: |
           base="$DIFF_BASE"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            base=$(git rev-parse "$DIFF_HEAD^" 2>/dev/null || true)
+          fi
           if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
             base=$(git hash-object -t tree /dev/null)
           fi

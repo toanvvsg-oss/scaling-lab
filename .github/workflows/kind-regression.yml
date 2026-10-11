@@ -1,9 +1,8 @@
 name: kind-regression
 on:
-  pull_request:
-    paths: ['app/**', 'dashboard/**', 'k8s/**', 'scripts/**', 'Makefile', '.github/workflows/**']
   push:
-    paths: ['app/**', 'dashboard/**', 'k8s/**', 'scripts/**', 'Makefile', '.github/workflows/**']
+    branches: [main]
+    paths: ['app/**', 'dashboard/**', 'k8s/**', 'scripts/**', 'Makefile', 'package*.json', '.github/workflows/**']
   workflow_dispatch:
     inputs:
       mode:
@@ -21,6 +20,7 @@ concurrency:
 
 jobs:
   fresh-kind:
+    if: github.event_name == 'workflow_dispatch' || vars.LAB_CI_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:

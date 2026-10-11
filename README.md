@@ -36,7 +36,13 @@ node scripts/kind-cleanup-check.mjs  # real failure + SIGTERM cleanup proof
 These commands allocate only a new `scaling-lab-test-*` cluster, use a private
 kubeconfig and free ports, save evidence in `results/`, and delete their cluster
 on success/failure/interruption. They preserve existing learner clusters.
-The full gate also runs automatically in GitHub Actions for relevant changes.
+Automatic GitHub Actions tests are **off by default**. To enable them, set
+repository variable `LAB_CI_ENABLED` to `true` under **Settings → Secrets and
+variables → Actions → Variables**. Then tests run only on pushes/merges to
+`main` (the kind matrix is limited to relevant code/config changes).
+Both workflows can also be run manually with **Actions → Run workflow**,
+regardless of the variable. Remove the variable or set it to `false` to turn
+automatic tests off again. Local Make test commands work independently of CI.
 For a laptop already hosting other clusters, `KIND_TEST_WORKERS=0 make test-kind`
 uses one node; CI uses the normal three-node topology. See
 [kind acceptance](docs/kind-acceptance.md) for prerequisites and evidence.

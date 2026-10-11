@@ -1,6 +1,6 @@
 # Kind regression and acceptance
 
-Unit checks run on every PR/push. The fresh-kind workflow also runs the full live matrix for changes to app/dashboard/manifests/scripts/Makefile and can be started manually from GitHub Actions. It uploads evidence and failure logs.
+Automatic CI is off by default. Set repository Actions variable `LAB_CI_ENABLED=true` to run tests on pushes/merges to `main`; the fresh-kind matrix runs for relevant app/dashboard/manifests/scripts/Makefile/package/workflow changes. Feature pushes and PRs do not trigger tests. Both workflows support manual **Run workflow** regardless of the variable. The kind workflow uploads evidence and failure logs. Local checks remain available at any time.
 
 ## Automatic fresh-cluster commands
 
