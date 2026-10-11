@@ -33,6 +33,23 @@ dialog button{padding:9px 12px;border-radius:6px;border:1px solid #cfdbcd;backgr
 #run-footprint{color:#4e8a4b}
 #load-duration{padding:8px 10px;border:1px solid #cfdbcd;border-radius:6px;background:#fff;font-size:12px}
 .observe-toggle{margin-left:8px;border-color:#4a6758}
+.observe-toggle{color:#285c3a;background:#fff}
+.observe-title{flex-wrap:wrap}
+.workspace,.observe,#observe-panels,.observe-block{min-width:0}
+.actions{flex-wrap:wrap}
+.grafana-view a{font-size:13px;color:#285c3a}
+.grafana-view iframe{width:100%;height:430px;border:1px solid #dce3d9;border-radius:6px;background:#fff}
+.grafana-view iframe[hidden]{display:none}
+.observe button:focus-visible{outline:2px solid #4a8452;outline-offset:3px}
+.layout.observe-expanded .workspace{padding-left:24px;padding-right:24px}
+.layout.observe-expanded .timeline-chart{height:230px}
+.layout.observe-expanded .event{font-size:12px;overflow-wrap:anywhere}
+#observe-panels{grid-column:1/-1}
+@media(max-width:700px){
+  .layout.observe-expanded #timeline-chart{overflow-x:auto}
+  .layout.observe-expanded .timeline-chart{min-width:540px}
+  .grafana-view iframe{height:360px}
+}
 .observe-title{gap:8px}
 .status-note{color:#6f8375;line-height:1.5}
 .status-error{font:11px 'DM Mono',monospace;background:#fff;border:1px solid #e8c9c2;border-radius:5px;padding:8px;margin-bottom:6px;color:#7a4440;overflow-wrap:anywhere}
@@ -41,8 +58,8 @@ dialog button{padding:9px 12px;border-radius:6px;border:1px solid #cfdbcd;backgr
    available width. Normal layout restores on Collapse. */
 .layout.observe-expanded{grid-template-columns:200px minmax(320px,1fr) minmax(420px,50%)}
 .layout.observe-expanded .observe{background:#f4f7f1}
-.layout.observe-expanded .timeline-chart{height:150px}
-.layout.observe-expanded .rate-chart{height:110px}
+.layout.observe-expanded .timeline-chart{height:230px}
+.layout.observe-expanded .rate-chart{height:230px}
 .layout.observe-expanded #trace{max-height:44vh;overflow:auto}
 .layout.observe-expanded #timeline{max-height:30vh;overflow:auto}
 @media (max-width:1100px){

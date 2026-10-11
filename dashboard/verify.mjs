@@ -20,7 +20,7 @@ try {
   report.error = error.message;
   console.error(`Scenario error: ${error.message}`);
 }
-const directory = resolve('results');
+const directory = resolve(process.env.SCALING_LAB_RESULTS_DIR || 'results');
 await mkdir(directory, { recursive: true });
 const filename = `${id}-${Date.now()}.json`;
 await writeFile(resolve(directory, filename), JSON.stringify(report, null, 2));

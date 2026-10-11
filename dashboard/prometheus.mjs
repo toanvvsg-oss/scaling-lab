@@ -90,7 +90,7 @@ export function counterSelForRun(runId) {
 // legacy requests_total stays the KEDA/autoscale denominator.
 export function responsesSelForRun(runId, statusClass) {
   if (!/^[a-z0-9]{8}$/.test(runId)) throw new Error(`Invalid run id: ${runId}`);
-  if (!['2xx', '4xx', '5xx'].includes(statusClass)) throw new Error(`Invalid status class: ${statusClass}`);
+  if (!['2xx', '3xx', '4xx', '5xx'].includes(statusClass)) throw new Error(`Invalid status class: ${statusClass}`);
   return `scaling_lab_http_responses_total{job="scaling-app",labrun="${runId}",status_class="${statusClass}"}`;
 }
 

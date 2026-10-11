@@ -13,7 +13,7 @@ import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId
 import { runAction } from './actions.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
-const resultsDir = join(root, '..', 'results');
+const resultsDir = process.env.SCALING_LAB_RESULTS_DIR ? resolve(process.env.SCALING_LAB_RESULTS_DIR) : join(root, '..', 'results');
 const files = { '/': ['index.html', 'text/html'], '/worksheet': ['worksheet.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/diagram.css': ['diagram.css', 'text/css'], '/app.js': ['app.js', 'text/javascript'], '/diagram.js': ['diagram.js', 'text/javascript'], '/timeline-ui.js': ['timeline-ui.js', 'text/javascript'], '/timeline.mjs': ['timeline.mjs', 'text/javascript'], '/worksheet.js': ['worksheet.js', 'text/javascript'] };
 
 export const EXPLANATIONS = {

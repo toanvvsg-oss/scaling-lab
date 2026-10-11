@@ -233,6 +233,7 @@ function setObserveExpanded(expanded){
   layout.classList.toggle('observe-expanded', Boolean(expanded));
   btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
   btn.textContent = expanded ? 'Collapse' : 'Expand';
+  paintGrafana();
 }
 function isObserveExpanded(){
   return Boolean(document.querySelector('.layout')?.classList.contains('observe-expanded'));
@@ -294,6 +295,7 @@ async function refreshInner(){
     if (!alive()) return;
     renderStepper(runDetail);
     renderStatus(runDetail ? runDetail.statusStats : state.statusStats);
+    setGrafanaScope(lesson, selectedRun, epoch);
     $('pods').innerHTML=pods?.length?pods.map(x=>`<div class="pod ${x.terminating?'terminating':x.ready?'':'not-ready'}" title="${escape(x.name)}">${escape(x.name)} · ${x.terminating?'terminating':x.ready?'ready':'not ready'}</div>`).join(''):'No application pods';
     $('endpoints').innerHTML=endpoints?.length?endpoints.map(x=>`<div class="endpoint ${x.terminating?'terminating':x.ready?'':'not-ready'}" title="${escape(x.pod)}">${escape(x.pod)} · ${x.terminating?'terminating':x.ready?'ready':'not ready'}</div>`).join(''):'No endpoints';
     const scenarioBusy = active ? active.scenarioRunning : state.running;
@@ -483,7 +485,7 @@ $('load-stop').onclick=()=>loadAction('stop');
 if ($('observe-toggle')) {
   $('observe-toggle').onclick=()=>setObserveExpanded(!isObserveExpanded());
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && isObserveExpanded()) setObserveExpanded(false);
+    if (e.key === 'Escape' && isObserveExpanded() && !document.querySelector('dialog[open]')) setObserveExpanded(false);
   });
 }
 async function predictClick(b){
@@ -505,6 +507,62 @@ $('predict-reveal').onclick=async()=>{
   const box=$('timeline-explain'); if(box) box.textContent=b.explanation;
   refresh();
 };
+// Grafana owns rich metrics charts; this page owns experiment controls and
+// evidence replay. An embedded panel shares the selected run/time cursor.
+let grafanaScope = null, grafanaData = null, grafanaBusy = false;
+function paintGrafana() {
+  const link = $('grafana-open'), frame = $('grafana-embed'), note = $('grafana-state');
+  if (!link || !frame || !note) return;
+  link.hidden = !grafanaData?.available;
+  if (grafanaData?.available) link.href = grafanaData.runUrl || grafanaData.dashboardUrl;
+  if (!grafanaData?.available) {
+    frame.hidden = true;
+    note.textContent = 'Monitoring is starting or unavailable. Run make up, then restart the dashboard to connect.';
+    return;
+  }
+  const pausedAt = window.labCursor ?? (frozenView ? Date.parse(frozenAt) : null);
+  const frozen = Number.isFinite(pausedAt);
+  note.textContent = frozen ? 'Grafana at the observation cursor; absolute time range.' : 'Grafana live app metrics · 5s refresh. Expand to view the panel.';
+  frame.hidden = !isObserveExpanded() || !grafanaScope?.run || !grafanaData.embedUrl;
+  if (frame.hidden) return;
+  const url = new URL(grafanaData.embedUrl);
+  url.searchParams.set('from', frozen ? String(pausedAt - 900000) : 'now-15m');
+  url.searchParams.set('to', frozen ? String(pausedAt) : 'now');
+  url.searchParams.set('refresh', frozen ? '' : '5s');
+  if (frame.getAttribute('src') !== url.href) frame.src = url.href;
+}
+async function fetchGrafana() {
+  if (grafanaBusy || !grafanaScope) return;
+  grafanaBusy = true;
+  const scope = grafanaScope;
+  try {
+    const response = await fetch('/api/grafana' + (scope.run ? '?run=' + encodeURIComponent(scope.run) : ''));
+    const data = await response.json();
+    if (grafanaScope !== scope || scope.epoch !== selEpoch) return;
+    grafanaData = response.ok ? data : { available: false };
+    paintGrafana();
+  } catch {
+    if (grafanaScope === scope) { grafanaData = { available: false }; paintGrafana(); }
+  } finally {
+    grafanaBusy = false;
+    if (grafanaScope && grafanaScope !== scope) fetchGrafana();
+  }
+}
+function setGrafanaScope(lesson, run, epoch) {
+  if (grafanaScope?.lesson === lesson && grafanaScope?.run === run && grafanaScope?.epoch === epoch) return;
+  grafanaScope = { lesson, run, epoch };
+  grafanaData = null;
+  paintGrafana();
+  fetchGrafana();
+}
+window.addEventListener('lab:select', () => {
+  grafanaScope = null; grafanaData = null;
+  const frame = $('grafana-embed');
+  if (frame) { frame.hidden = true; frame.removeAttribute('src'); }
+  paintGrafana();
+});
+for (const name of ['lab:freeze', 'lab:resume', 'lab:cursor']) window.addEventListener(name, paintGrafana);
+setInterval(fetchGrafana, 5000);
 let bootSaved = null;
 try { bootSaved = loadSelection(); } catch { /* start fresh */ }
 select(bootSaved ? bootSaved.index : 0);

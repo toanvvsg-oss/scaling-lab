@@ -18,6 +18,10 @@ const connections = new WeakMap();
 // visible only in client-observed dashboard stats, since /metrics cannot see
 // proxy-emitted 502/504.
 const responsesByStatus = new Map();
+// Known learner routes expose zero before their first response so a scrape
+// can establish a counter baseline before a short error burst.
+const learnerRoutes = [['fast', 200], ['slow', 200], ['cpu', 200], ['stream', 200], ['other', 200], ['demo-404', 404], ['demo-500', 500]];
+for (const [route, status] of learnerRoutes) responsesByStatus.set(`GET|${route}|${status}|${statusClassOf(status)}`, 0);
 
 function routeName(pathname) {
   if (pathname === '/fast') return 'fast';
@@ -45,7 +49,7 @@ function statusClassOf(status) {
 // Simple response-duration histogram by bounded route label only, for p95
 // panels. Buckets in seconds; _sum/_count enable histogram_quantile.
 const DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
-const durationsByRoute = new Map();
+const durationsByRoute = new Map(learnerRoutes.map(([route]) => [route, { buckets: DURATION_BUCKETS.map(() => 0), sum: 0, count: 0 }]));
 function recordDuration(route, seconds) {
   let entry = durationsByRoute.get(route);
   if (!entry) {

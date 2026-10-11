@@ -9,6 +9,8 @@ This repository is a hands-on kind lab for Node.js connection reuse, graceful sh
 
 ## Cluster safety
 
+- Automated cold-start tests may create a uniquely named `scaling-lab-test-*` cluster. The harness uses a private kubeconfig whose `kind-scaling-lab` context points only to that test cluster, and free localhost ports. It must reject existing names, delete only the cluster this invocation attempted to create, preserve both success/failure evidence, and clean up on SIGINT/SIGTERM. Never run `make down` or delete the learner's cluster as part of testing.
+
 - Use only Kubernetes context `kind-scaling-lab`. Pass `--context kind-scaling-lab` explicitly to `kubectl`; do not rely on the current context.
 - Lab work happens in two places: the shared `scaling-lab` namespace (Prometheus, Grafana, edge legacy path, CLI verifiers) and isolated run namespaces `scaling-run-<id>` (one per dashboard experiment, labelled run/lesson/owner). Never touch namespaces outside these two shapes.
 - Other kind clusters may exist on the machine. Never delete or change them. `make down` deletes the dedicated `scaling-lab` cluster, so use it only when teardown is intended.

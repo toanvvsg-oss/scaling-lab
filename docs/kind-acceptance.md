@@ -1,9 +1,20 @@
-# Kind acceptance (manual / opt-in)
+# Kind regression and acceptance
 
-CI runs unit tests only (`npm test` + `git diff --check` on every PR via
-`.github/workflows/pr-checks.yml`). Live kind acceptance needs a local
-machine with Docker, kind, kubectl, helm, and Node 22+, so it stays manual.
-Run everything against context `kind-scaling-lab` only.
+Unit checks run on every PR/push. The fresh-kind workflow also runs the full live matrix for changes to app/dashboard/manifests/scripts/Makefile and can be started manually from GitHub Actions. It uploads evidence and failure logs.
+
+## Automatic fresh-cluster commands
+
+```sh
+make test-kind-smoke
+make test-kind
+node scripts/kind-cleanup-check.mjs
+```
+
+The harness generates its own unique scaling-lab-test-* name, private kubeconfig and free ports. It exercises production Make startup, Grafana provisioning/PromQL, real HTTP status metrics, run creation/archive/cleanup and A/B isolation. Full mode additionally installs KEDA and metrics-server and runs all seven actual verifiers, with both graceful and abrupt shutdown. Failed/inconclusive results exit nonzero. Finally it kills its process-owned dashboard/forwards, deletes only its own cluster, removes private temp files and checks that preexisting cluster names remain. Signal/failure cleanup has a separate real-cluster test. Evidence stays in results/scaling-lab-test-*/summary.json. SIGKILL/host power loss cannot run a process cleanup handler; GitHub-hosted runners are discarded after the job.
+
+Requirements: Docker, kind, kubectl, Helm, make and Node22+. Default three nodes match production; KIND_TEST_WORKERS=0 uses one node on a laptop with existing clusters. Allow10–25minutes for full mode and image downloads; the harness has a30-minute deadline. No existing learner cluster/run is reused or deleted. Kubernetes commands pin kind-scaling-lab inside the PRIVATE config that points only at the generated test cluster. Normal commands keep using the real dedicated kind-scaling-lab context.
+
+The scripts below are additional manual acceptance on an existing learning cluster.
 
 ## Fast path (~5 min)
 
@@ -49,6 +60,7 @@ Reusable scripted acceptance (needs Google Chrome plus
 node scripts/ui-accept.mjs
 node scripts/ui-race.mjs
 node scripts/ui-history.mjs
+node scripts/ui-observation.mjs
 ```
 
 Every check asserts and the script exits nonzero on any FAIL. Screenshots and

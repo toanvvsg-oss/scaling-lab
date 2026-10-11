@@ -17,6 +17,30 @@ make up
 make dashboard
 ```
 
+Startup includes Prometheus, kube-state-metrics and a provisioned Grafana
+dashboard. In **Live observation**, click **Expand** for a wider timeline and
+request trace, or **Open dashboard for this run** for HTTP codes/error ratio,
+latency, active requests, connections and pod/HPA metrics. The embedded Grafana
+panel follows the selected run and switches to an absolute time range on
+pause/scrub. Collapse or Escape restores the layout without changing the run.
+
+### Regression checks
+
+```sh
+make test               # unit/API/grader checks; no cluster needed
+make test-kind-smoke    # fresh cluster: startup, Grafana, HTTP metrics, isolation
+make test-kind          # fresh cluster: all seven lessons, both shutdown modes
+node scripts/kind-cleanup-check.mjs  # real failure + SIGTERM cleanup proof
+```
+
+These commands allocate only a new `scaling-lab-test-*` cluster, use a private
+kubeconfig and free ports, save evidence in `results/`, and delete their cluster
+on success/failure/interruption. They preserve existing learner clusters.
+The full gate also runs automatically in GitHub Actions for relevant changes.
+For a laptop already hosting other clusters, `KIND_TEST_WORKERS=0 make test-kind`
+uses one node; CI uses the normal three-node topology. See
+[kind acceptance](docs/kind-acceptance.md) for prerequisites and evidence.
+
 Open <http://127.0.0.1:4173>. `make up` creates a three-node kind cluster, builds the Node.js image, and deploys two app pods plus an NGINX edge proxy. `make check` confirms readiness. The dashboard uses context `kind-scaling-lab`, shared infrastructure in `scaling-lab`, and a separate `scaling-run-<id>` namespace for each experiment.
 
 On a Colima VM already running several clusters, kind startup may fail if containerd reports `failed to create fsnotify watcher: too many open files`. Raise the VM's inotify instance limit, then retry `make up`:
@@ -44,7 +68,7 @@ Prometheus experiments run isolated: creating a run provisions its own `scaling-
 
 Use **New run** in the top bar to provision a fresh isolated run for the current lesson. Opening another lesson or creating runs never mutates other runs; each run keeps its own namespace, traffic route, graph, and evidence. Cleaning up a run (with its own confirmation naming the namespace and effects) snapshots evidence first, which stays downloadable afterwards. **Delete kind cluster** (`make down`, only the `scaling-lab` cluster) stays separate and is never part of lesson work. CLI setup targets switch the *shared* legacy namespace only: `make hpa-up` installs the CPU scaler and `make prometheus-up` installs the Prometheus/KEDA scaler there for `make verify`; dashboard runs are independent of both.
 
-Grafana is an optional advanced exercise; all guided lessons work without it. After the built-in timeline, try `make grafana-up` (pins `grafana/grafana:11.3.0` plus `kube-state-metrics:v2.12.0`, local only) and `make grafana-ui` (port-forward `service/grafana` to `127.0.0.1:3003`, login `admin` / `scaling-lab`). The provisioned **Scaling Lab - request rate vs replicas** dashboard shows request rate, scrape targets, HPA desired/current replicas, Ready pods, and how to compare with the guided UI.
+Grafana is installed by default; guided controls and evidence also work when monitoring is unavailable. After the built-in timeline, try `make grafana-up` (pins `grafana/grafana:11.3.0` plus `kube-state-metrics:v2.12.0`, local only) and `make grafana-ui` (port-forward `service/grafana` to `127.0.0.1:3003`, login `admin` / `scaling-lab`). The provisioned **Scaling Lab - request rate vs replicas** dashboard shows request rate, scrape targets, HPA desired/current replicas, Ready pods, and how to compare with the guided UI.
 
 ```mermaid
 flowchart LR

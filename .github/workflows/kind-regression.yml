@@ -1,0 +1,71 @@
+name: kind-regression
+on:
+  pull_request:
+    paths: ['app/**', 'dashboard/**', 'k8s/**', 'scripts/**', 'Makefile', '.github/workflows/**']
+  push:
+    paths: ['app/**', 'dashboard/**', 'k8s/**', 'scripts/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Fresh kind test matrix
+        type: choice
+        options: [full, smoke]
+        default: full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kind-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fresh-kind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.15.4
+      - name: Install kind matching the lab topology
+        run: |
+          mkdir -p "$RUNNER_TEMP/kind-bin"
+          curl --fail --location --retry 3 https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64 -o "$RUNNER_TEMP/kind-bin/kind"
+          chmod +x "$RUNNER_TEMP/kind-bin/kind"
+          echo "$RUNNER_TEMP/kind-bin" >> "$GITHUB_PATH"
+      - run: npm test
+      - name: Browser observation regression
+        env:
+          CHROME_CHANNEL: chromium
+        run: |
+          npm install --no-save --package-lock=false playwright-core@1.63.0
+          npx playwright-core install --with-deps chromium
+          node scripts/ui-observation.mjs
+      - name: Cold startup and real lab matrix
+        env:
+          TEST_MODE: ${{ inputs.mode || 'full' }}
+        run: |
+          if [[ "$TEST_MODE" == "smoke" ]]; then
+            make test-kind-smoke
+          else
+            make test-kind
+          fi
+      - name: Prove cleanup on failure and SIGTERM
+        run: node scripts/kind-cleanup-check.mjs
+      - name: Save verification evidence and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kind-evidence-${{ github.run_id }}
+          path: |
+            results/scaling-lab-test-*/
+            results/ui-observation-*
+          if-no-files-found: warn
+          retention-days: 7
