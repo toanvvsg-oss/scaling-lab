@@ -12,6 +12,20 @@ A guided local lab for HTTP connection reuse, Node.js graceful shutdown, Kuberne
 
 ## Start
 
+For all seven dashboard lessons with CPU metrics, Prometheus/KEDA, and embedded Grafana, use the full setup:
+
+```sh
+make prometheus-up  # includes make up: creates the cluster and deploys app/edge
+make hpa-up         # installs metrics-server; selects CPU scaling for the shared CLI app
+make grafana-up     # installs Grafana and kube-state-metrics
+make ui-build       # installs dashboard deps and builds the console (dist/ is gitignored)
+make dashboard     # keep this terminal running
+```
+
+The full setup leaves both autoscaling dependencies installed. The shared `scaling-lab` app ends with the CPU HPA because `hpa-up` runs last; dashboard runs create their own CPU HPA or KEDA scaler in their own namespace, so all seven dashboard lessons remain available. For CLI Prometheus verification, run `make prometheus-up` before `make verify SCENARIO=prometheus` to select the shared Prometheus scaler again.
+
+For the five non-autoscaling lessons without Prometheus/Grafana monitoring, the minimal setup is:
+
 ```sh
 make up
 make ui-build   # one-time: installs dashboard deps and builds the console (dist/ is gitignored)
@@ -26,14 +40,19 @@ On a Colima VM already running several clusters, kind startup may fail if contai
 colima ssh -- sudo sysctl -w fs.inotify.max_user_instances=1024
 ```
 
-For the autoscaling lesson, run `make hpa-up` first. This installs the pinned metrics-server release and sets `--kubelet-insecure-tls` for the local kind cluster, then creates the CPU HPA. Give metrics collection a minute before running the experiment.
+The full setup already installs the dependencies described below. If you used the minimal setup, add them as needed; the setup targets also select which scaler the shared CLI app uses.
+
+For the autoscaling lesson, run `make hpa-up` after `make up`. This installs the pinned metrics-server release and sets `--kubelet-insecure-tls` for the local kind cluster, then creates the CPU HPA. Give metrics collection a minute before running the experiment.
 
 For the Prometheus lesson, run `make prometheus-up`. It deploys a local Prometheus, installs KEDA 2.17.3, and creates a ScaledObject that scales the app toward **5 requests/second per pod**. This target is intentionally low for a laptop experiment; measure your own service before choosing a production target. These Make setup targets replace the scaler of the shared legacy Deployment used by CLI verification; dashboard runs each have their own Deployment and scaler. Run `make hpa-up` to restore CPU scaling for the CLI. Prometheus data is stored only in its pod and disappears if that pod is replaced.
 
 ```sh
 make prometheus-up
+make ui-build       # required if the console has not been built yet
 make dashboard
 ```
+
+To recreate the lab from scratch, save any evidence you need, stop the dashboard, run `make down`, then repeat the full setup above. `make down` deletes only the `scaling-lab` kind cluster, including its live run namespaces. Evidence already saved under `results/` remains on disk and archived evidence is rediscovered when the dashboard starts. Other kind clusters are unaffected.
 
 In another terminal, `make prometheus-ui` optionally opens a port-forward for Prometheus at <http://127.0.0.1:19090>.
 
@@ -49,7 +68,7 @@ Every ready run has an **Open app** link at `/app/<run-id>/fast`, plus browser l
 
 For shutdown and streaming, the monitoring pane defaults to **Requests in flight**. Use **Response counters** for short experiments or **Responses per second** for sustained traffic. Grafana’s app counters measure completed responses; a request can receive HTTP 200 headers and then fail with a connection reset while its body drains. The separate **Dashboard client outcomes** card shows such interruptions and transport failures from recorded dashboard requests. Browser-tab traffic appears in Grafana rather than the dashboard client trace.
 
-Grafana is installed by default and embedded in the console: the Live observation card shows run-scoped request activity, completed response counters, or response rate by HTTP code (light theme, no login — anonymous Viewer, served through a dashboard-managed localhost forward; `GET /api/grafana?run=<id>`). `make grafana-up` (pins `grafana/grafana:11.3.0` plus `kube-state-metrics:v2.12.0`, local only, restarts Grafana so dashboard edits apply) provisions the **Scaling Lab · HTTP and pod lifecycle** dashboard; `make grafana-ui` (port-forward `service/grafana` to `127.0.0.1:3003`, login `admin` / `scaling-lab`) opens the full dashboard with request rate, HTTP status/error ratio, latency, active requests, sockets, scrape freshness and pod/HPA state, scoped to the selected run. Guided controls and evidence also work when monitoring is unavailable.
+The full setup installs Grafana and embeds it in the console; `make up` alone does not install monitoring. The Live observation card shows run-scoped request activity, completed response counters, or response rate by HTTP code (light theme, no login — anonymous Viewer, served through a dashboard-managed localhost forward; `GET /api/grafana?run=<id>`). `make grafana-up` (pins `grafana/grafana:11.3.0` plus `kube-state-metrics:v2.12.0`, local only, restarts Grafana so dashboard edits apply) provisions the **Scaling Lab · HTTP and pod lifecycle** dashboard; `make grafana-ui` (port-forward `service/grafana` to `127.0.0.1:3003`, login `admin` / `scaling-lab`) opens the full dashboard with request rate, HTTP status/error ratio, latency, active requests, sockets, scrape freshness and pod/HPA state, scoped to the selected run. Guided controls and evidence also work when monitoring is unavailable.
 
 ```mermaid
 flowchart LR
