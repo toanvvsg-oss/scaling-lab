@@ -22,6 +22,7 @@ export default function App() {
   const [runCluster, setRunCluster] = useState(null);
   const [timeline, setTimeline] = useState(null);
   const [grafana, setGrafana] = useState(null);
+  const [monitorView, setMonitorView] = useState('');
   const [mode, setMode] = useState('graceful');
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState('');
@@ -55,6 +56,8 @@ export default function App() {
     return () => clearInterval(t);
   }, [refreshState]);
 
+  useEffect(() => setMonitorView(''), [selectedRun]);
+
   useEffect(() => {
     if (!selectedRun) {
       setRunDetail(null);
@@ -71,7 +74,7 @@ export default function App() {
           getJSON(`/api/runs/${selectedRun}`).catch(() => null),
           getJSON(`/api/runs/${selectedRun}/cluster`).catch(() => null),
           getJSON(`/api/runs/${selectedRun}/timeline`).catch(() => null),
-          getJSON(`/api/grafana?run=${selectedRun}`).catch(() => null),
+          getJSON(`/api/grafana?run=${selectedRun}${monitorView ? `&view=${monitorView}` : ''}`).catch(() => null),
           getJSON(`/api/evidence?run=${selectedRun}`).catch(() => null),
         ]);
         if (stop) return;
@@ -88,7 +91,7 @@ export default function App() {
       stop = true;
       clearInterval(t);
     };
-  }, [selectedRun]);
+  }, [selectedRun, monitorView]);
 
   const createRun = async () => {
     setBusy('Creating run…');
@@ -191,6 +194,7 @@ export default function App() {
   const pods = runCluster?.connected ? runCluster.pods : cluster?.pods || [];
   const endpoints = runCluster?.connected ? runCluster.endpoints : cluster?.endpoints || [];
   const stats = runDetail?.statusStats || null;
+  const appliedMode = active?.mode || runDetail?.events?.findLast((event) => event.type === 'app-signal' && event.data?.mode)?.data.mode;
   const events = runDetail?.events || [];
   const points = (timeline?.points || []).slice(-180);
   const failures = (timeline?.milestones || []).filter((m) => m.kind === 'failure');
@@ -262,9 +266,16 @@ export default function App() {
             <h3 className="text-sm font-semibold">Access guide</h3>
             <div className="space-y-1 text-xs">
               <p><strong>Console:</strong> <code>http://127.0.0.1:4173</code> · <a className="underline" href="/worksheet">Worksheet</a></p>
-              <p><strong>Shared edge</strong> (scaling-lab): <code>http://127.0.0.1:8080</code> — <code>/health/ready</code>, <code>/fast</code>, <code>/slow?ms=8000</code>, <code>/stream</code>, <code>/metrics</code></p>
-              <p><strong>Run edge:</strong> use Guided actions (no port-hunting). Manual equivalent:</p>
-              <pre className="overflow-auto rounded bg-muted p-2 font-mono text-[10px]">kubectl --context kind-scaling-lab -n scaling-run-&lt;id&gt; port-forward service/edge 8081:8080{'\n'}# then: http://127.0.0.1:8081/slow?ms=8000</pre>
+              {active?.appUrl ? <div className="space-y-1 rounded-md border bg-secondary/50 p-2">
+                <p><strong>Selected run app</strong></p>
+                <p className="break-all font-mono text-[10px]">{active.namespace}</p>
+                <a className="inline-block text-primary underline" href={active.appUrl} target="_blank" rel="noreferrer">Open this run’s app ↗</a>
+                <p className="text-[11px] text-muted-foreground">This address routes only to the selected run’s edge and app.</p>
+              </div> : <p className="text-muted-foreground">Create or select a run for its own browser address.</p>}
+              <details className="pt-1">
+                <summary className="cursor-pointer text-muted-foreground">Shared CLI endpoint</summary>
+                <p className="mt-1"><code>http://127.0.0.1:8080</code> always routes to <code>scaling-lab</code>. Selecting a lesson never changes this route.</p>
+              </details>
               <p><strong>Prometheus:</strong> <code>make prometheus-ui</code> → <code>http://127.0.0.1:19090</code></p>
               <p><strong>Grafana:</strong> <code>make grafana-ui</code> → <code>http://127.0.0.1:3003</code> (<code>admin</code>/<code>scaling-lab</code>)</p>
             </div>
@@ -293,11 +304,12 @@ export default function App() {
             </div>
             <p className="text-sm text-muted-foreground">{lesson.task}</p>
             {lesson.id === 'shutdown' && (
-              <label className="flex items-center gap-2 text-sm">Shutdown mode
+              <label className="flex flex-wrap items-center gap-2 text-sm">Next request mode
                 <select value={mode} onChange={(e) => setMode(e.target.value)} className="rounded-md border p-1 text-sm">
                   <option value="graceful">Graceful</option>
                   <option value="abrupt">Abrupt (failure demonstration)</option>
                 </select>
+                {appliedMode && <span className="text-xs text-muted-foreground">Last applied: {appliedMode}</span>}
               </label>
             )}
             <div className="flex flex-wrap gap-1">
@@ -336,6 +348,23 @@ export default function App() {
               <p className="font-mono text-[11px] text-muted-foreground">
                 {active ? `run ${active.id} · ${active.status} · ${active.namespace} · ${pods.filter((p) => p.ready && !p.terminating).length} Ready pods` : 'No runs for this lesson — create one to start.'}
               </p>
+              {active?.appUrl && (
+                <div className="space-y-2 rounded-md border bg-muted/40 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h4 className="text-xs font-semibold">Browser access</h4>
+                    <a href={active.appUrl} target="_blank" rel="noreferrer" className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90">Open app ↗</a>
+                  </div>
+                  <a href={active.appUrl} target="_blank" rel="noreferrer" className="block break-all font-mono text-[11px] text-muted-foreground underline">{window.location.origin}{active.appUrl}</a>
+                  <p className="break-all text-[11px] text-muted-foreground">Routes to <code className="text-foreground">{active.namespace}</code> · edge → app</p>
+                  <div className="flex flex-wrap gap-3 text-xs">
+                    <a className="underline" href={`/app/${active.id}/slow?ms=8000`} target="_blank" rel="noreferrer">8s request ↗</a>
+                    <a className="underline" href={`/app/${active.id}/stream`} target="_blank" rel="noreferrer">Stream ↗</a>
+                    <a className="underline" href={`/app/${active.id}/metrics`} target="_blank" rel="noreferrer">Metrics ↗</a>
+                    <a className="underline" href={`/app/${active.id}/health/ready`} target="_blank" rel="noreferrer">Readiness ↗</a>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">These links send requests to this run. No terminal setup needed.</p>
+                </div>
+              )}
               <p className="text-xs text-green-700">
                 Footprint: {(state?.runs || []).filter((r) => r.status !== 'deleted' && r.status !== 'failed').length}/{maxActiveRuns} active runs · 100m CPU / 64Mi per app pod.
               </p>
@@ -417,7 +446,14 @@ export default function App() {
           <Card className="border-0 bg-transparent shadow-none"><CardContent className="space-y-2 px-0">
             <h3 className="text-sm font-semibold">Live observation {active?.load?.active ? '· LIVE' : '· IDLE'}</h3>
             {grafana?.available ? (
-              <a className="text-xs underline" href={grafana.runUrl || grafana.dashboardUrl} target="_blank" rel="noreferrer">Open dashboard for this run ↗</a>
+              <div className="space-y-2">
+                <a className="text-xs underline" href={grafana.runUrl || grafana.dashboardUrl} target="_blank" rel="noreferrer">Open dashboard for this run ↗</a>
+                {grafana.views && <label className="flex items-center justify-between gap-2 text-xs text-muted-foreground">Show
+                  <select aria-label="Monitoring view" value={monitorView || grafana.view} onChange={(e) => setMonitorView(e.target.value)} className="max-w-full rounded-md border bg-card p-1.5 text-xs text-foreground">
+                    {grafana.views.map((view) => <option key={view.id} value={view.id}>{view.label}</option>)}
+                  </select>
+                </label>}
+              </div>
             ) : (
               <div className="space-y-1">
                 <p className="text-xs text-muted-foreground">Monitoring integration is unavailable on this server (no <code>/api/grafana</code>). Use the manual path:</p>
@@ -426,8 +462,30 @@ export default function App() {
               </div>
             )}
             {grafana?.embedUrl && selectedRun && (
-              <iframe title="Grafana HTTP response metrics for selected run" src={`${grafana.embedUrl}${grafana.embedUrl.includes('?') ? '&' : '?'}from=now-15m&to=now&refresh=5s`} className="h-64 w-full rounded border" loading="lazy" />
+              <iframe title={`Grafana ${grafana.viewLabel || 'HTTP response metrics'} for selected run`} src={`${grafana.embedUrl}${grafana.embedUrl.includes('?') ? '&' : '?'}from=now-15m&to=now&refresh=5s`} className="h-64 w-full rounded border" loading="lazy" />
             )}
+            {grafana?.available && selectedRun && <p className="text-[11px] leading-relaxed text-muted-foreground">
+              {grafana.view === 'activity' ? 'Shows active requests, including long requests before they finish. Metrics update about every 5 seconds.' : grafana.view === 'responses' ? 'Shows completed responses on current pods. Counters reset when pods restart; a short response can finish between scrapes.' : 'Shows completed responses per second. An idle run has a zero rate; long requests appear after they finish.'}
+              {' '}Interrupted responses and exact shutdown timing appear in the experiment trace.
+            </p>}
+            <div className="space-y-2 rounded-md border bg-card p-3">
+              <div className="flex items-center justify-between gap-2">
+                <h4 className="text-xs font-semibold">Dashboard client outcomes</h4>
+                <span className="font-mono text-[10px] text-muted-foreground">{stats?.total || 0} recorded</span>
+              </div>
+              {stats?.total ? <>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <p className="rounded bg-secondary px-2 py-1.5">Completed 2xx <strong className="float-right">{stats.ok2xx}</strong></p>
+                  <p className="rounded bg-muted px-2 py-1.5">HTTP 4xx / 5xx <strong className="float-right">{stats.http4xx} / {stats.http5xx}</strong></p>
+                  <p className={`rounded px-2 py-1.5 ${stats.interrupted ? 'bg-red-50 text-red-700' : 'bg-muted'}`}>Interrupted body <strong className="float-right">{stats.interrupted}</strong></p>
+                  <p className={`rounded px-2 py-1.5 ${stats.transport ? 'bg-red-50 text-red-700' : 'bg-muted'}`}>No HTTP response <strong className="float-right">{stats.transport}</strong></p>
+                </div>
+                {(stats.recentErrors || []).slice(0, 3).map((outcome, i) => <p key={i} className="text-[11px] leading-relaxed text-red-700">
+                  {outcome.status != null ? `HTTP ${outcome.status} headers` : 'No HTTP headers'} · {outcome.complete === false ? 'response interrupted' : 'HTTP error'}{outcome.error ? ` · ${outcome.error}` : ''}
+                </p>)}
+                {stats.interrupted > 0 && <p className="text-[11px] leading-relaxed text-muted-foreground">HTTP 200 headers can arrive before the response body is interrupted. An interrupted 200 is a failed request, not a completed success or an HTTP 500.</p>}
+              </> : <p className="text-[11px] text-muted-foreground">Run a guided action to record client outcomes. Browser requests appear in Grafana.</p>}
+            </div>
           </CardContent></Card>
 
           <Card><CardContent className="space-y-1">
@@ -444,23 +502,16 @@ export default function App() {
             )) : <p className="text-xs text-muted-foreground">—</p>}
           </CardContent></Card>
 
-          <Card><CardContent className="space-y-1">
-            <p className="font-mono text-[10px] text-muted-foreground">HTTP STATUS (CLIENT-OBSERVED)</p>
-            {!stats?.total ? <p className="text-xs text-muted-foreground">No responses counted yet.</p> : (
-              <p className="text-xs">2xx {stats.ok2xx} · 4xx {stats.http4xx} · 5xx {stats.http5xx} · transport {stats.transport} · total {stats.total}</p>
-            )}
-            {(stats?.recentErrors || []).slice(0, 5).map((e, i) => (
-              <p key={i} className="font-mono text-[10px] text-red-800">{e.status != null ? `HTTP ${e.status}` : `transport ${e.transport}`} · {shortPod(e.pod)}</p>
-            ))}
-          </CardContent></Card>
-
           <Card><CardContent className="space-y-2">
             <p className="font-mono text-[10px] text-muted-foreground">{TIMELINE_HEADINGS[lesson.id]}</p>
             <TimelineChart points={points} lesson={lesson.id} failures={failures} />
             <div className="max-h-48 space-y-1 overflow-auto">
               {events.slice(-30).reverse().map((ev, i) => (
                 <p key={i} className="font-mono text-[10px] text-muted-foreground">
-                  {new Date(ev.at).toLocaleTimeString()} <strong>{ev.type}</strong> {ev.data?.pod ? shortPod(ev.data.pod) : ev.data?.text || ''}
+                  {new Date(ev.at).toLocaleTimeString()} <strong>{ev.type}</strong>{' '}
+                  {['slow-end', 'stream-end', 'request'].includes(ev.type)
+                    ? `${ev.data?.complete === false || ev.data?.ok === false ? 'Failed / interrupted' : 'Completed'}${ev.data?.status != null ? ` · HTTP ${ev.data.status}` : ''}${ev.data?.error ? ` · ${ev.data.error}` : ''} · ${shortPod(ev.data?.pod)}`
+                    : ev.data?.pod ? shortPod(ev.data.pod) : ev.data?.text || ''}
                 </p>
               ))}
             </div>

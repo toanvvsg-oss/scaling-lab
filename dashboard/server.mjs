@@ -10,6 +10,7 @@ import { queryPrometheus, queryRunSamples, LEGACY_RATE_QUERY, rateQueryForRun, u
 import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns } from './runs.mjs';
 import { runAction } from './actions.mjs';
 import { grafanaStatus, closeGrafanaForward, dashboardUrl, panelEmbedUrl } from './grafana.mjs';
+import { learnerPath, proxyRunApp } from './app-route.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const resultsDir = process.env.SCALING_LAB_RESULTS_DIR ? resolve(process.env.SCALING_LAB_RESULTS_DIR) : join(root, '..', 'results');
@@ -68,8 +69,12 @@ export function createApp(overrides = {}) {
     store.events.push(event);
     if (store.events.length > 2500) store.events.shift();
     store.rev = (store.rev || 0) + 1;
+    if (['slow-end', 'stream-end'].includes(type) && data?.complete === false) {
+      pushMilestone(store.timeline, { at: event.at, kind: 'failure', text: `Response interrupted${data.status ? ` after HTTP ${data.status} headers` : ''}: ${data.error || 'incomplete body'}`, detail: `Pod ${data.pod || 'unknown'} did not finish the response body. HTTP status and response completion are separate observations.`, observer: 'dashboard request client' });
+      return event;
+    }
     if (type === 'request') {
-      if (data?.ok === false) pushMilestone(store.timeline, { at: event.at, kind: 'failure', text: `Request failure ${data.error || data.status || ''}`, detail: `Pod ${data.pod || 'unknown'} returned an error. Failures do not drive scaling directly; they signal overload or draining pods.`, observer: 'dashboard load client' });
+      if (data?.ok === false) pushMilestone(store.timeline, { at: event.at, kind: 'failure', text: `Request failure ${data.error || data.status || ''}`, detail: `The client observed a failed request from pod ${data.pod || 'unknown'}. Failures do not drive scaling directly; they can signal overload or draining pods.`, observer: 'dashboard load client' });
       return event;
     }
     // Sampled successful requests and preStop markers feed the trace lanes;
@@ -301,6 +306,22 @@ function summarizeAction(s) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const path = url.pathname;
+    const appMatch = path.match(/^\/app\/([^/]+)(\/.*)?$/);
+    if (appMatch) {
+      if (!['GET', 'HEAD'].includes(req.method)) return send(res, 405, { error: 'App access supports GET and HEAD only.' });
+      try {
+        R.validateRunId(appMatch[1]);
+        const run = R.runs.get(appMatch[1]);
+        if (!run) return send(res, 404, { error: 'Unknown run.' });
+        if (run.status !== 'ready' || !Number.isInteger(run.forwardPort) || run.forwardPort < 1 || run.forwardPort > 65535) {
+          return send(res, ['deleted', 'failed'].includes(run.status) ? 410 : 409, { error: `Run ${run.id} is ${run.status}. App access needs a ready run.` });
+        }
+        const target = learnerPath(appMatch[2], url.searchParams);
+        return proxyRunApp(req, res, run, target);
+      } catch (error) {
+        return send(res, error.status || 400, { error: error.message });
+      }
+    }
     if (req.method === 'GET' && path === '/api/state') {
       const legacy = state.predictions.legacy || null;
       return send(res, 200, { ...state, load: loadState(), profiles: profilesPayload(), runs: [...R.runs.values()].map(R.describeRun), archivedRuns: [...R.archives.keys()], maxActiveRuns: R.MAX_ACTIVE_RUNS, booted, legacyPrediction: legacy ? { guess: legacy.guess, lesson: legacy.lesson, revealed: legacy.revealed } : null });
@@ -312,6 +333,13 @@ function summarizeAction(s) {
     // runs never spawn a forward.
     if (req.method === 'GET' && path === '/api/grafana') {
       const runParam = url.searchParams.get('run');
+      const views = [
+        { id: 'activity', label: 'Requests in flight', panel: 11 },
+        { id: 'responses', label: 'Response counters', panel: 15 },
+        { id: 'rate', label: 'Responses per second', panel: 7 },
+      ];
+      const requestedView = url.searchParams.get('view');
+      if (requestedView && !views.some((view) => view.id === requestedView)) return send(res, 400, { error: 'Unknown monitoring view.' });
       if (runParam) {
         try {
           R.validateRunId(runParam);
@@ -324,11 +352,13 @@ function summarizeAction(s) {
       if (!status.available) return send(res, 200, { available: false, baseUrl: null, dashboardUrl: null });
       let runUrl = dashboardUrl(status.baseUrl);
       let embedUrl = null;
+      const lesson = R.runs.get(runParam)?.lesson || R.archives.get(runParam)?.lesson;
+      const view = views.find((v) => v.id === (requestedView || (['shutdown', 'streaming'].includes(lesson) ? 'activity' : 'rate')));
       if (runParam) {
         runUrl = dashboardUrl(status.baseUrl, runParam);
-        embedUrl = panelEmbedUrl(status.baseUrl, runParam);
+        embedUrl = panelEmbedUrl(status.baseUrl, runParam, view.panel);
       }
-      return send(res, 200, { available: true, baseUrl: status.baseUrl, dashboardUrl: dashboardUrl(status.baseUrl), runUrl, embedUrl });
+      return send(res, 200, { available: true, baseUrl: status.baseUrl, dashboardUrl: dashboardUrl(status.baseUrl), runUrl, embedUrl, view: view.id, viewLabel: view.label, views: views.map(({ id, label }) => ({ id, label })) });
     }
     if (req.method === 'GET' && path === '/api/load') return send(res, 200, loadState());
     if (req.method === 'GET' && path === '/api/timeline') return send(res, 200, state.timeline);

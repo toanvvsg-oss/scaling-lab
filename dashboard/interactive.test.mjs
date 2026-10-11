@@ -52,6 +52,29 @@ test('second load session is rejected clearly', async () => {
   assert.ok(s.total >= 0);
 });
 
+test('manual load records an interrupted body without dropping its received status', async (t) => {
+  const { default: http } = await import('node:http');
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'x-request-id': 'load-reset', 'x-pod': 'draining-pod' });
+    res.write('partial');
+    setTimeout(() => res.destroy(), 20);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => server.close(r)));
+  const events = [];
+  const load = new LoadSession((type, data) => events.push({ type, data }), { endpoint: `http://127.0.0.1:${server.address().port}` });
+  await load.start('steady');
+  t.after(() => load.stop('test cleanup'));
+  for (let i = 0; i < 100 && !events.some((e) => e.type === 'request'); i++) await new Promise((r) => setTimeout(r, 10));
+  await load.stop('test');
+  const failure = events.find((e) => e.type === 'request');
+  assert.ok(failure);
+  assert.equal(failure.data.status, 200);
+  assert.equal(failure.data.error, 'ECONNRESET');
+  assert.equal(failure.data.requestId, 'load-reset');
+  assert.equal(failure.data.ok, false);
+});
+
 test('timeline history is bounded and distinguishes stale from zero', () => {
   const h = createHistory();
   pushPoint(h, { offeredRps: 10, observedRps: 0, stale: false, desired: 2, actual: 2, ready: 2 });

@@ -1,4 +1,5 @@
 import { spawn, execFile } from 'node:child_process';
+import { clientOutcomes } from './client-outcomes.mjs';
 import { promisify } from 'node:util';
 import { randomBytes } from 'node:crypto';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
@@ -364,9 +365,12 @@ export function describeRun(run) {
     id: run.id, lesson: run.lesson, namespace: run.ns, status: run.status,
     createdAt: run.createdAt, error: run.error || null, steps: run.steps,
     cleanup: run.cleanup || null,
+    appUrl: run.status === 'ready' && run.forwardPort ? `/app/${run.id}/fast` : null,
+    statusStats: clientOutcomes(run.events),
     load: run.load ? run.load.state() : { active: false },
     readopted: Boolean(run.readopted),
     scenario: run.scenario || null,
+    mode: run.mode || null,
     scenarioRunning: Boolean(run.scenarioRunning),
     actionRunning: Boolean(run.actionRunning),
     hasPendingLong: Boolean(run.pendingLong),

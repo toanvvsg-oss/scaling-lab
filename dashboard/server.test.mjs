@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import http from 'node:http';
 import { createApp, EXPLANATIONS, prodDeps } from './server.mjs';
 import * as R from './runs.mjs';
 import { makeFakeCluster } from './test-fake.mjs';
@@ -31,7 +32,7 @@ function fakeSession() {
   };
 }
 
-async function bootTestServer() {
+async function bootTestServer(overrides = {}) {
   const fake = makeFakeCluster();
   const dir = mkdtempSync(join(tmpdir(), 'lab-srv-'));
   const runsApi = {
@@ -58,6 +59,7 @@ async function bootTestServer() {
     resetApi: { validateResetTarget: (t) => t, runReset: async () => ({ ok: true, readyPods: 2 }) },
     resultsDir: dir,
     enableSampler: false,
+    ...overrides,
   });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   const port = app.server.address().port;
@@ -199,6 +201,77 @@ test('repeated DELETE reports the current cleanup without starting it again', as
   assert.equal(R.runs.get(body.id).status, 'deleted');
   assert.equal((await ctx.api('DELETE', `/api/runs/${body.id}`)).status, 200);
   assert.equal(deletions, 1);
+});
+
+test('browser app access is scoped, streams immediately, and rejects arbitrary targets', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer();
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  const { body } = await ctx.api('POST', '/api/runs', { lesson: 'connections' });
+  await readyIds(ctx.api, 1);
+  const requests = [];
+  const upstream = http.createServer((req, res) => {
+    requests.push({ path: req.url, headers: req.headers });
+    res.writeHead(200, { 'content-type': 'text/plain', 'x-pod': 'test-app-pod', 'set-cookie': 'private=test' });
+    if (req.url === '/stream') {
+      res.write('first tick\n');
+      setTimeout(() => res.end('last tick\n'), 250);
+    } else res.end(req.url);
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => upstream.close(r)));
+  R.runs.get(body.id).forwardPort = upstream.address().port;
+  const base = `http://127.0.0.1:${ctx.server.address().port}/app/${body.id}`;
+  assert.equal((await ctx.api('GET', `/api/runs/${body.id}`)).body.appUrl, `/app/${body.id}/fast`);
+  const response = await fetch(base + '/fast', { headers: { cookie: 'session=secret', authorization: 'Bearer secret' } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('x-pod'), 'test-app-pod');
+  assert.equal(response.headers.get('x-scaling-lab-run'), body.id);
+  assert.equal(response.headers.get('x-scaling-lab-namespace'), `scaling-run-${body.id}`);
+  assert.equal(response.headers.get('set-cookie'), null);
+  assert.equal(await response.text(), '/fast');
+  assert.equal(requests[0].headers.cookie, undefined);
+  assert.equal(requests[0].headers.authorization, undefined);
+  const stream = await fetch(base + '/stream');
+  const reader = stream.body.getReader();
+  assert.equal(new TextDecoder().decode((await reader.read()).value), 'first tick\n');
+  assert.equal(new TextDecoder().decode((await reader.read()).value), 'last tick\n');
+  assert.equal((await reader.read()).done, true);
+  const slow = await fetch(base + '/slow?ms=8000');
+  assert.equal(await slow.text(), '/slow?ms=8000');
+  const before = requests.length;
+  for (const [path, status] of [
+    ['/metrics?url=http://example.com', 400], ['/slow?ms=99999', 400],
+    ['/slow?ms=1&ms=2', 400], ['/slow?ms=-1', 400], ['/lifecycle', 404], ['/https://example.com', 404],
+  ]) assert.equal((await fetch(base + path)).status, status, path);
+  assert.equal((await fetch(base + '/fast', { method: 'POST' })).status, 405);
+  assert.equal((await fetch(`http://127.0.0.1:${ctx.server.address().port}/app/deadbeef/fast`)).status, 404);
+  assert.equal(requests.length, before, 'rejected requests never reach an upstream');
+  R.runs.get(body.id).status = 'deleted';
+  assert.equal((await fetch(base + '/fast')).status, 410);
+});
+
+test('Grafana defaults to in-flight requests for shutdown and validates monitoring views', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  let lookups = 0;
+  const ctx = await bootTestServer({ grafanaApi: { status: async () => { lookups++; return { available: true, baseUrl: 'http://127.0.0.1:3003' }; }, close() {} } });
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  const { body } = await ctx.api('POST', '/api/runs', { lesson: 'shutdown' });
+  await readyIds(ctx.api, 1);
+  const initial = await ctx.api('GET', `/api/grafana?run=${body.id}`);
+  assert.equal(initial.body.view, 'activity');
+  assert.equal(new URL(initial.body.embedUrl).searchParams.get('panelId'), '11');
+  assert.equal(new URL(initial.body.embedUrl).searchParams.get('var-run'), body.id);
+  const counters = await ctx.api('GET', `/api/grafana?run=${body.id}&view=responses`);
+  assert.equal(new URL(counters.body.embedUrl).searchParams.get('panelId'), '15');
+  const rate = await ctx.api('GET', `/api/grafana?run=${body.id}&view=rate`);
+  assert.equal(new URL(rate.body.embedUrl).searchParams.get('panelId'), '7');
+  const before = lookups;
+  assert.equal((await ctx.api('GET', `/api/grafana?run=${body.id}&view=arbitrary`)).status, 400);
+  assert.equal((await ctx.api('GET', '/api/grafana?run=deadbeef')).status, 404);
+  assert.equal(lookups, before, 'invalid inputs do not start a route');
 });
 
 test('predictions are scoped per run and lesson with observation gating', async (t) => {

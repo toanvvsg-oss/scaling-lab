@@ -70,7 +70,7 @@ function RunRow({ run, selected, onOpen, onRefresh, onDownload }) {
 
   return (
     <div className={`border-t border-border/60 px-4 py-3 transition-colors ${selected ? 'bg-secondary/70' : 'hover:bg-muted/40'}`} data-run-id={run.id} aria-busy={closing || waiting}>
-      <div className="grid items-center gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_240px]">
+      <div className="grid items-center gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_290px]">
         <div className="min-w-0">
           <p className="text-sm font-medium text-foreground">{title}</p>
           <p className="mt-0.5 flex items-center gap-2 font-mono text-[11px] text-muted-foreground/70" title={run.namespace}>
@@ -92,6 +92,7 @@ function RunRow({ run, selected, onOpen, onRefresh, onDownload }) {
         </div>
         <div className="flex items-center gap-1 sm:justify-end">
           {!closed && <Button variant="ghost" size="sm" className="h-7 px-2 text-muted-foreground" onClick={() => onOpen(run)}>Open <ArrowUpRight aria-hidden="true" /></Button>}
+          {run.appUrl && <a href={run.appUrl} target="_blank" rel="noreferrer" className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-primary hover:bg-secondary" aria-label={`Open app for run ${run.id}`}>App <ArrowUpRight aria-hidden="true" className="h-3.5 w-3.5" /></a>}
           <Button variant="ghost" size="sm" className="h-7 px-2 text-muted-foreground" onClick={() => onDownload(run.id)}><Download aria-hidden="true" /> Evidence</Button>
           {!closed && <Button variant="outline" size="sm" className="h-7 border-border px-2 text-muted-foreground shadow-none hover:border-red-200 hover:bg-red-50 hover:text-red-700" disabled={closing || waiting} onClick={() => setConfirm(true)}>
             {closing ? 'Closing…' : <><X aria-hidden="true" />{run.status === 'cleanup-failed' ? 'Retry close' : 'Close'}</>}
@@ -130,7 +131,7 @@ export function RunsPanel({ runs, archived, maxActiveRuns, selectedRun, onOpen, 
       </div>
       {liveRuns.length ? (
         <div>
-          <div className="hidden grid-cols-[minmax(0,1fr)_minmax(0,1fr)_240px] gap-3 border-t border-border/60 bg-muted/40 px-4 py-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70 sm:grid">
+          <div className="hidden grid-cols-[minmax(0,1fr)_minmax(0,1fr)_290px] gap-3 border-t border-border/60 bg-muted/40 px-4 py-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70 sm:grid">
             <span>Lesson / Run</span><span>Status</span><span className="text-right">Actions</span>
           </div>
           {liveRuns.map((run) => <RunRow key={run.id} run={run} selected={run.id === selectedRun} onOpen={onOpen} onRefresh={onRefresh} onDownload={onDownload} />)}

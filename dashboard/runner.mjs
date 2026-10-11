@@ -43,18 +43,20 @@ function startRequest(path, agent, baseUrl = base) {
   const done = new Promise(resolve => { onDone = resolve; });
   const started = Date.now();
   let headerSent = false;
+  let responseInfo = {};
   const req = http.get(`${baseUrl}${path}`, { agent, timeout: 30000 }, res => {
     headerSent = true;
-    onHeaders({ pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], status: res.statusCode });
+    responseInfo = { pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], status: res.statusCode };
+    onHeaders(responseInfo);
     const chunks = [];
     res.on('data', x => chunks.push(x));
     res.on('end', () => onDone({ ok: res.statusCode === 200, complete: true, status: res.statusCode, pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], ms: Date.now() - started, body: Buffer.concat(chunks).toString() }));
-    res.on('error', error => onDone({ ok: false, complete: false, error: error.code || error.message, pod: res.headers['x-pod'], ms: Date.now() - started }));
+    res.on('error', error => onDone({ ...responseInfo, ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started }));
   });
   req.on('timeout', () => req.destroy(new Error('request timeout')));
   req.on('error', error => {
     if (!headerSent) onHeaders({ error: error.code || error.message });
-    onDone({ ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started });
+    onDone({ ...responseInfo, ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started });
   });
   return { headers, done };
 }
@@ -307,7 +309,7 @@ export async function runScenario(id, options, emit) {
     emit('pod-delete', { pod: streamHeaders.pod });
     await kubectl(ns, 'delete', 'pod', streamHeaders.pod, '--wait=false');
     const stream = { ...await streamRequest.done, pod: streamHeaders.pod };
-    emit('stream-end', { pod: stream.pod, complete: stream.complete, error: stream.error });
+    emit('stream-end', { pod: stream.pod, requestId: stream.requestId || streamHeaders.requestId, status: stream.status, complete: stream.complete, error: stream.error });
     stopLogWatch();
     return gradeStream({ stream, deletedPod: streamHeaders.pod });
   }

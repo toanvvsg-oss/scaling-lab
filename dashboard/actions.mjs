@@ -113,7 +113,7 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
           throw new Error(`Long request did not reach a pod after rollout recovery (last: ${lastError}). Check the app Deployment and edge route, then retry start.`);
         }
         const stopWatch = deps.watchLogs(headers.pod, emit, ns);
-        const pending = { kind: action, pod: headers.pod, requestId: headers.requestId, startedAt: new Date().toISOString(), task: lastTask, agent, stopWatch, completed: false };
+        const pending = { kind: action, pod: headers.pod, requestId: headers.requestId, status: headers.status, startedAt: new Date().toISOString(), task: lastTask, agent, stopWatch, completed: false };
         run.pendingLong = pending;
         emit(action === 'start-long' ? 'slow-start' : 'stream-start', { ...headers });
         // Natural completion clears the slot, releases the watcher/agent, and
@@ -126,8 +126,8 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
           try { pending.agent.destroy(); } catch { /* ignore */ }
           emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end',
             pending.kind === 'start-long'
-              ? { pod: done.pod || pending.pod, requestId: pending.requestId, complete: done.complete, ms: done.ms, error: done.error }
-              : { pod: done.pod || pending.pod, requestId: pending.requestId, complete: done.complete, ms: done.ms, error: done.error, ticks: countTicks(done.body) });
+              ? { pod: done.pod || pending.pod, requestId: pending.requestId, status: done.status ?? pending.status, complete: done.complete, ms: done.ms, error: done.error }
+              : { pod: done.pod || pending.pod, requestId: pending.requestId, status: done.status ?? pending.status, complete: done.complete, ms: done.ms, error: done.error, ticks: countTicks(done.body) });
         });
         return { action, pod: headers.pod, requestId: headers.requestId };
       }
@@ -145,10 +145,10 @@ export async function runAction(run, action, input = {}, emit = () => {}, deps =
         pending.completed = true;
         try { pending.stopWatch(); } catch { /* ignore */ }
         try { pending.agent.destroy(); } catch { /* ignore */ }
-        const result = { ...done, pod: pending.pod, requestId: pending.requestId };
+        const result = { ...done, pod: pending.pod, requestId: pending.requestId, status: done.status ?? pending.status };
         if (pending.kind !== 'start-long') result.ticks = countTicks(done.body);
-        emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end', { pod: result.pod, requestId: result.requestId, complete: result.complete, ms: result.ms, error: result.error, ticks: result.ticks });
-        return { action, pod: pending.pod, requestId: pending.requestId, complete: result.complete, ms: result.ms, error: result.error, ticks: result.ticks };
+        emit(pending.kind === 'start-long' ? 'slow-end' : 'stream-end', { pod: result.pod, requestId: result.requestId, status: result.status, complete: result.complete, ms: result.ms, error: result.error, ticks: result.ticks });
+        return { action, pod: pending.pod, requestId: pending.requestId, status: result.status, complete: result.complete, ms: result.ms, error: result.error, ticks: result.ticks };
       }
       case 'bg-start': {
         if (!run.load) throw new Error(`Run ${run.id} is not ready for traffic yet.`);

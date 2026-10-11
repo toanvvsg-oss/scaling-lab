@@ -72,7 +72,9 @@ export function validateProfile(profile, cpu = false) {
 function get(endpoint, path, agent, timeoutMs = 8000) {
   return new Promise((resolve) => {
     const started = Date.now();
+    let responseInfo = {};
     const req = http.get(`${endpoint}${path}`, { agent, timeout: timeoutMs }, (res) => {
+      responseInfo = { status: res.statusCode, pod: res.headers['x-pod'], requestId: res.headers['x-request-id'] };
       const chunks = [];
       res.on('data', (x) => chunks.push(x));
       res.on('end', () => resolve({
@@ -80,10 +82,10 @@ function get(endpoint, path, agent, timeoutMs = 8000) {
         pod: res.headers['x-pod'], requestId: res.headers['x-request-id'],
         edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'],
       }));
-      res.on('error', (error) => resolve({ ok: false, error: error.code || error.message, ms: Date.now() - started }));
+      res.on('error', (error) => resolve({ ...responseInfo, ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started }));
     });
     req.on('timeout', () => req.destroy(new Error('request timeout')));
-    req.on('error', (error) => resolve({ ok: false, error: error.code || error.message, ms: Date.now() - started }));
+    req.on('error', (error) => resolve({ ...responseInfo, ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started }));
   });
 }
 
