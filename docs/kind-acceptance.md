@@ -64,7 +64,7 @@ untouched). Ending during a scenario, traffic, or a guided stream must
 cancel safely and archive an honest cancelled/incomplete outcome — never a
 pass, never a stuck 409. History stays readable and downloadable after
 teardown and restart. Watch the browser console for JS errors. Capture
-screenshots for `docs/dashboard.png` and the review.
+screenshots for `docs/dashboard-single-lesson.png` and the review.
 
 Reusable scripted acceptance (needs Google Chrome plus
 `npm install --no-save playwright-core` once):

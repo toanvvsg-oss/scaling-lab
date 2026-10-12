@@ -80,7 +80,7 @@ Run live acceptance, not only unit tests:
 2. `rtk proxy make verify SCENARIO=prometheus`. Expect `Result: pass` and five passing checks. Save the `results/prometheus-*.json` path and summarize peak RPS, initial/peak/final pods, and request failures. This can take several minutes due to HPA stabilization.
 3. Exercise reset and lesson switching on the UI: cancel once, confirm once, reload the page during a load session, and verify no orphan traffic or competing HPA. Check the cluster with the explicit-context commands above.
 4. `rtk proxy make hpa-up`, then `rtk proxy make verify SCENARIO=autoscale`. Confirm the CPU HPA is active and KEDA's ScaledObject is absent. Test the wrong-scaler error in both directions.
-5. Run `rtk npm test`, `rtk proxy make check`, and `rtk git diff --check`. Capture a dashboard screenshot if the UI changes and update `docs/dashboard.png` and `README.md`.
+5. Run `rtk npm test`, `rtk proxy make check`, and `rtk git diff --check`. Capture a dashboard screenshot if the UI changes and update `docs/dashboard-single-lesson.png` and `README.md`.
 
 The existing `make reset` and `make down` are available for recovery. `make down` deletes **only** the `scaling-lab` kind cluster; use it only when intentional. Do not claim acceptance from a diagram or mocked data alone.
 
