@@ -2,7 +2,9 @@
 
 A guided local lab that grows from one request to cloud backends: connection reuse, single-pod capacity, resource sizing, CPU and Prometheus autoscaling, scaling signals, Pending pods, downstream bottlenecks, graceful shutdown, streaming, rollouts, disruptions, the GKE load-balancer lifecycle, and a capstone. The web console (React + Tailwind) runs one lesson at a time — preview, explicit start, practice inside an isolated environment, end with saved evidence, and read-only history — paired with a live pod/endpoint view, an embedded Grafana pane, request timeline, conceptual question, and evidence-backed verification result.
 
-![Scaling Lab console](docs/dashboard.png)
+![Scaling Lab console with the 16-lesson learning path and Start lesson preview](docs/dashboard.png)
+
+Lesson preview: browse the learning path, then select **Start lesson** to prepare its environment.
 
 ## Requirements
 
