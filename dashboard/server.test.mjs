@@ -10,7 +10,7 @@ import { makeFakeCluster } from './test-fake.mjs';
 
 test('production runsApi wires every method the routes call', () => {
   const api = prodDeps.runsApi;
-  for (const k of ['beginRun', 'finishRun', 'createRun', 'cleanupRun', 'runClusterState', 'buildArchive', 'adoptOrphanRuns', 'describeRun', 'validateRunId', 'activeRuns']) {
+  for (const k of ['beginRun', 'finishRun', 'createRun', 'cleanupRun', 'runClusterState', 'buildArchive', 'adoptOrphanRuns', 'describeRun', 'validateRunId', 'activeRuns', 'checkLessonPrereqs']) {
     assert.equal(typeof api[k], 'function', `prodDeps.runsApi.${k}`);
   }
   assert.equal(api.beginRun, R.beginRun);
@@ -35,6 +35,7 @@ function fakeSession() {
 async function bootTestServer(overrides = {}) {
   const fake = makeFakeCluster();
   const dir = mkdtempSync(join(tmpdir(), 'lab-srv-'));
+  const { runsApi: runsApiOverrides, ...rest } = overrides;
   const runsApi = {
     runs: R.runs, archives: R.archives,
     activeRuns: R.activeRuns, MAX_ACTIVE_RUNS: R.MAX_ACTIVE_RUNS,
@@ -46,6 +47,8 @@ async function bootTestServer(overrides = {}) {
     runClusterState: (id) => R.runClusterState(id, fake.deps),
     buildArchive: R.buildArchive,
     adoptOrphanRuns: () => R.adoptOrphanRuns(fake.deps),
+    checkLessonPrereqs: async () => ({ ok: true, checks: [{ name: 'cluster', ok: true }], missing: [] }),
+    ...runsApiOverrides,
   };
   const app = createApp({
     clusterState: async () => ({ connected: true, pods: [], endpoints: [] }),
@@ -59,7 +62,7 @@ async function bootTestServer(overrides = {}) {
     resetApi: { validateResetTarget: (t) => t, runReset: async () => ({ ok: true, readyPods: 2 }) },
     resultsDir: dir,
     enableSampler: false,
-    ...overrides,
+    ...rest,
   });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   const port = app.server.address().port;
@@ -84,34 +87,50 @@ async function readyIds(api, n, timeoutMs = 10000) {
   throw new Error('runs did not become ready in time');
 }
 
-test('boot gate, creation correlation, and limit', async (t) => {
+test('boot gate, single allocation, and lesson start conflicts', async (t) => {
   R.runs.clear(); R.archives.clear();
   const ctx = await bootTestServer();
   t.after(() => new Promise((r) => ctx.server.close(r)));
-  let r = await ctx.api('POST', '/api/runs', { lesson: 'prometheus' });
+  const waitLesson = async (pred, timeoutMs = 15000) => {
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until) {
+      const s = await ctx.api('GET', '/api/lesson');
+      if (pred(s.body)) return s.body;
+      await new Promise((x) => setTimeout(x, 100));
+    }
+    throw new Error('lesson flow did not settle in time');
+  };
+  let r = await ctx.api('POST', '/api/lesson/start', { lesson: 'connections' });
   assert.equal(r.status, 503);
   await ctx.boot();
-  r = await ctx.api('POST', '/api/runs', { lesson: 'prometheus' });
-  assert.equal(r.status, 202);
-  assert.match(r.body.id, /^[a-z0-9]{8}$/);
-  const idA = r.body.id;
-  r = await ctx.api('POST', '/api/runs', { lesson: 'autoscale' });
-  assert.equal(r.status, 202);
-  assert.notEqual(r.body.id, idA);
-  const ready = await readyIds(ctx.api, 2);
-  assert.ok(ready.includes(idA));
-  for (let i = 2; i < R.MAX_ACTIVE_RUNS; i++) {
-    r = await ctx.api('POST', '/api/runs', { lesson: 'connections' });
-    assert.equal(r.status, 202);
-  }
-  const state = await ctx.api('GET', '/api/state');
-  assert.equal(state.body.maxActiveRuns, 7);
-  assert.equal(state.body.runs.length, 7);
-  r = await ctx.api('POST', '/api/runs', { lesson: 'prometheus' });
-  assert.equal(r.status, 409);
-  assert.match(r.body.error, /Run limit reached/);
-  r = await ctx.api('POST', '/api/runs', { lesson: 'nope' });
+  r = await ctx.api('POST', '/api/lesson/start', { lesson: 'nope' });
   assert.equal(r.status, 400);
+  r = await ctx.api('POST', '/api/lesson/start', { lesson: 'connections' });
+  assert.equal(r.status, 202);
+  const flow = await waitLesson((b) => b.active?.status === 'ready');
+  assert.equal(flow.active.lesson, 'connections');
+  assert.match(flow.active.runId, /^[a-z0-9]{8}$/);
+  assert.ok(flow.active.stages.some((s) => s.stage === 'check-prerequisites'), 'prerequisite stage reported');
+  assert.ok(flow.active.stages.some((s) => s.stage === 'ready'), 'ready stage reported');
+  // Second start and direct creation both conflict while active.
+  r = await ctx.api('POST', '/api/lesson/start', { lesson: 'rollout' });
+  assert.equal(r.status, 409);
+  r = await ctx.api('POST', '/api/runs', { lesson: 'rollout' });
+  assert.equal(r.status, 409);
+  // Practice routes address the active run; foreign mutating calls are refused.
+  r = await ctx.api('POST', `/api/runs/${flow.active.runId}/load`, { action: 'start', profile: 'steady' });
+  assert.equal(r.status, 200);
+  // End stops traffic, archives honestly, and frees the slot.
+  r = await ctx.api('POST', '/api/lesson/end');
+  assert.equal(r.status, 202);
+  const done = await waitLesson((b) => b.active === null && b.history.length === 1, 30000);
+  assert.equal(done.history[0].lesson, 'connections');
+  assert.equal(done.history[0].ended, 'incomplete', 'ended without a scenario: incomplete, never a pass');
+  r = await ctx.api('POST', '/api/lesson/start', { lesson: 'rollout' });
+  assert.equal(r.status, 202, 'slot freed after end');
+  await waitLesson((b) => b.active?.status === 'ready');
+  await ctx.api('POST', '/api/lesson/end');
+  await waitLesson((b) => b.active === null, 30000);
 });
 
 test('conflicting load-vs-scenario actions are rejected', async (t) => {
@@ -420,4 +439,161 @@ test('guided-action conflicts: action/load/scenario/cleanup serialize', async (t
   assert.equal(r.status, 409);
   r = await api('DELETE', `/api/runs/${id}`);
   assert.equal(r.status, 409);
+});
+
+test('lesson start reports missing prerequisites with guidance, provisions nothing', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer({
+    runsApi: { checkLessonPrereqs: async () => ({ ok: false, checks: [{ name: 'metrics', ok: false }], missing: [{ name: 'metrics', guidance: 'Run: make hpa-up' }] }) },
+  });
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  const r = await ctx.api('POST', '/api/lesson/start', { lesson: 'autoscale' });
+  assert.equal(r.status, 409);
+  assert.match(r.body.missing[0].guidance, /make hpa-up/);
+  assert.equal(R.runs.size, 0, 'no namespace provisioned when prerequisites are missing');
+  const flow = await ctx.api('GET', '/api/lesson');
+  assert.equal(flow.body.active, null);
+});
+
+test('end during a scenario cancels it and archives an honest cancelled outcome', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  let observedCancel = false;
+  const ctx = await bootTestServer({
+    runScenario: async (id, opts) => {
+      for (let i = 0; i < 600; i++) {
+        if (opts.cancel && opts.cancel()) { observedCancel = true; break; }
+        await new Promise((x) => setTimeout(x, 100));
+      }
+      const err = new Error('cancelled by End lesson');
+      err.code = 'CANCELLED';
+      throw err;
+    },
+  });
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  await ctx.api('POST', '/api/lesson/start', { lesson: 'connections' });
+  const waitLesson = async (pred, timeoutMs = 20000) => {
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until) {
+      const s = await ctx.api('GET', '/api/lesson');
+      if (pred(s.body)) return s.body;
+      await new Promise((x) => setTimeout(x, 100));
+    }
+    throw new Error('lesson flow did not settle in time');
+  };
+  const flow = await waitLesson((b) => b.active?.status === 'ready');
+  const run = await ctx.api('POST', `/api/runs/${flow.active.runId}/run`, { id: 'connections' });
+  assert.equal(run.status, 202);
+  await new Promise((x) => setTimeout(x, 500));
+  const end = await ctx.api('POST', '/api/lesson/end');
+  assert.equal(end.status, 202);
+  const done = await waitLesson((b) => b.active === null && b.history.length === 1, 30000);
+  assert.ok(observedCancel, 'scenario observed the cancellation token');
+  assert.equal(done.history[0].ended, 'cancelled');
+  const ev = await ctx.api('GET', `/api/evidence?run=${flow.active.runId}`);
+  assert.equal(ev.body.result?.status, 'cancelled', 'cancelled outcome recorded, never a pass');
+});
+
+test('failed cleanup retains the allocation and retry succeeds', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer();
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  await ctx.api('POST', '/api/lesson/start', { lesson: 'connections' });
+  const waitLesson = async (pred, timeoutMs = 20000) => {
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until) {
+      const s = await ctx.api('GET', '/api/lesson');
+      if (pred(s.body)) return s.body;
+      await new Promise((x) => setTimeout(x, 100));
+    }
+    throw new Error('lesson flow did not settle in time');
+  };
+  const flow = await waitLesson((b) => b.active?.status === 'ready');
+  // Sabotage namespace deletion once: cleanup fails and the slot is retained.
+  const realDelete = ctx.fake.deps.exec;
+  let failOnce = true;
+  ctx.fake.deps.exec = async (args) => {
+    if (failOnce && args.join(' ').includes('delete namespace')) { failOnce = false; throw new Error('injected delete failure'); }
+    return realDelete(args);
+  };
+  await ctx.api('POST', '/api/lesson/end');
+  const stuck = await waitLesson((b) => b.active?.status === 'cleanup-failed', 30000);
+  assert.match(stuck.active.error, /injected delete failure/);
+  // A second start is refused while cleanup-failed holds the allocation.
+  const retry = await ctx.api('POST', '/api/lesson/start', { lesson: 'rollout' });
+  assert.equal(retry.status, 409);
+  // Retry End: this time deletion succeeds and the slot frees.
+  await ctx.api('POST', '/api/lesson/end');
+  await waitLesson((b) => b.active === null && b.history.length === 1, 30000);
+  void flow;
+});
+
+test('inherited environments resolve explicitly without silent deletes', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const mk = (lesson) => ({ id: lesson === 'a' ? 'aaaabbbb' : 'ccccdddd', ns: `scaling-run-${lesson === 'a' ? 'aaaabbbb' : 'ccccdddd'}`, lesson: 'connections', status: 'ready', createdAt: new Date().toISOString() });
+  const ctx = await bootTestServer({
+    runsApi: {
+    adoptOrphanRuns: async () => {
+      const a = mk('a'); const b = mk('b');
+      for (const r of [a, b]) {
+        Object.assign(r, { steps: [], events: [], timeline: { points: [], milestones: [] }, result: null, load: null, forward: null, forwardPort: null, prev: null });
+        R.runs.set(r.id, r);
+      }
+      return [R.runs.get('aaaabbbb'), R.runs.get('ccccdddd')];
+    },
+    },
+  });
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  let flow = await ctx.api('GET', '/api/lesson');
+  assert.equal(flow.body.migration.runs.length, 2);
+  assert.equal(flow.body.active, null);
+  // Start is refused until migration resolves.
+  let r = await ctx.api('POST', '/api/lesson/start', { lesson: 'rollout' });
+  assert.equal(r.status, 409);
+  // Resume is refused while two remain; end one explicitly (evidence kept).
+  r = await ctx.api('POST', '/api/lesson/migrate', { action: 'resume', id: 'aaaabbbb' });
+  assert.equal(r.status, 409);
+  r = await ctx.api('POST', '/api/lesson/migrate', { action: 'end', id: 'aaaabbbb' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.migration.runs.length, 1);
+  r = await ctx.api('POST', '/api/lesson/migrate', { action: 'resume', id: 'ccccdddd' });
+  assert.equal(r.status, 200);
+  flow = await ctx.api('GET', '/api/lesson');
+  assert.equal(flow.body.migration, null);
+  assert.equal(flow.body.active.runId, 'ccccdddd');
+  assert.equal(flow.body.active.status, 'ready');
+});
+
+test('concurrent starts grant exactly one allocation (TOCTOU guard)', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  // Slow prereqs widen the race window: both requests must still serialize.
+  const ctx = await bootTestServer({
+    runsApi: { checkLessonPrereqs: async () => { await new Promise((r) => setTimeout(r, 200)); return { ok: true, checks: [], missing: [] }; } },
+  });
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  const [a, b] = await Promise.all([
+    ctx.api('POST', '/api/lesson/start', { lesson: 'connections' }),
+    ctx.api('POST', '/api/lesson/start', { lesson: 'rollout' }),
+  ]);
+  const statuses = [a.status, b.status].sort().join(',');
+  assert.equal(statuses, '202,409', `exactly one winner, got ${a.status}/${b.status}`);
+  const waitLesson = async (pred, timeoutMs = 20000) => {
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until) {
+      const s = await ctx.api('GET', '/api/lesson');
+      if (pred(s.body)) return s.body;
+      await new Promise((x) => setTimeout(x, 100));
+    }
+    throw new Error('lesson flow did not settle in time');
+  };
+  const flow = await waitLesson((x) => x.active?.status === 'ready');
+  assert.ok(flow.active.runId);
+  const live = [...R.runs.values()].filter((r) => !['deleted', 'failed'].includes(r.status));
+  assert.equal(live.length, 1, 'the loser provisioned nothing');
+  await ctx.api('POST', '/api/lesson/end');
+  await waitLesson((x) => x.active === null, 30000);
 });

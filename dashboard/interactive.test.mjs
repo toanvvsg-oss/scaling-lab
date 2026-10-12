@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PROFILES, CPU_PROFILES, LOAD_LIMITS, validateProfile, LoadSession } from './load.mjs';
+import { PROFILES, CPU_PROFILES, CAPACITY_PROFILES, LOAD_LIMITS, validateProfile, LoadSession } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone, cursorAt, filterByTime, marksUpTo, deriveExplanation } from './timeline.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -38,6 +38,12 @@ test('load profiles stay within laptop-safe bounds', () => {
   for (const [name, p] of Object.entries(CPU_PROFILES)) {
     assert.ok(p.path.startsWith('/cpu'), `${name} burns CPU`);
     assert.ok(p.maxRps <= 12, `${name} stays laptop-safe`);
+  }
+  for (const [name, p] of Object.entries(CAPACITY_PROFILES)) {
+    assert.ok(p.phases.length >= 1, name);
+    assert.ok(Math.abs(p.phases.reduce((a, x) => a + x.frac, 0) - 1) < 1e-9, `${name} phases cover the duration`);
+    assert.ok(p.maxRps <= LOAD_LIMITS.maxRps, `${name} within the global RPS cap`);
+    assert.ok(p.maxRps <= 30, `${name} stays laptop-safe for a single pod`);
   }
   assert.throws(() => validateProfile('nope'), /Unknown profile/);
 });
@@ -190,10 +196,11 @@ test('run metric queries carry the run selector, legacy query stays namespaced',
 });
 
 test('every lesson can run isolated', () => {
-  for (const id of ['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus']) {
+  for (const id of ['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus',
+    'capacity', 'resources', 'hpareact', 'signals', 'downstream', 'pending', 'disruptions', 'gateway', 'capstone']) {
     assert.ok(RUN_LESSONS.has(id), id);
   }
-  assert.equal(RUN_LESSONS.size, 7);
+  assert.equal(RUN_LESSONS.size, 16);
 });
 test('run evidence archive keeps values and timestamps', () => {
   const fake = {
@@ -280,4 +287,51 @@ test('timeline points store bounded pod/endpoint snapshots', async () => {
   pushPoint(h, { offeredRps: 0, podsSnapshot: pods, endpointsSnapshot: [{ pod: 'app-x-old1', ready: true }] });
   assert.deepEqual(h.points[0].podsSnapshot, pods);
   assert.equal(h.points[0].endpointsSnapshot.length, 1);
+});
+
+test('lesson-to-profile selection covers UI Start fallbacks', async () => {
+  const { profilesForLesson } = await import('./load.mjs');
+  const sets = { request: PROFILES, cpu: CPU_PROFILES, capacity: CAPACITY_PROFILES };
+  assert.ok(Object.hasOwn(profilesForLesson('autoscale', sets), 'steady'), 'cpu set has steady (UI fallback)');
+  assert.ok(Object.hasOwn(profilesForLesson('hpareact', sets), 'steady'), 'hpareact shares the cpu set');
+  assert.ok(Object.hasOwn(profilesForLesson('capacity', sets), 'cheap'), 'capacity set has cheap');
+  assert.ok(Object.hasOwn(profilesForLesson('capacity', sets), 'expensive'), 'capacity set has expensive');
+  assert.equal(profilesForLesson('connections', sets), PROFILES);
+  assert.equal(profilesForLesson('mystery', sets), PROFILES, 'unknown lessons fall back to request profiles');
+  assert.equal(profilesForLesson('capacity', { request: PROFILES }), PROFILES, 'missing capacity set falls back safely');
+  assert.throws(() => validateProfile('cpu-steady', true), /Unknown profile/, 'stale cpu-steady key is rejected');
+  assert.throws(() => validateProfile('steady', false, CAPACITY_PROFILES), /Unknown profile/, 'request keys are rejected inside the capacity set');
+});
+
+test('load sessions start and stop inside their own profile set (local HTTP)', async (t) => {
+  const { default: http } = await import('node:http');
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => server.close(r)));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  const cases = [
+    [{ profiles: PROFILES }, 'steady', '/fast'],
+    [{ cpu: true, profiles: CPU_PROFILES }, 'steady', '/cpu?ms=120'],
+    [{ profiles: CAPACITY_PROFILES }, 'cheap', '/fast'],
+    [{ profiles: CAPACITY_PROFILES }, 'expensive', '/cpu?ms=250'],
+  ];
+  for (const [opts, profile, path] of cases) {
+    const events = [];
+    const session = new LoadSession((ty, d) => events.push([ty, d]), { endpoint, ...opts });
+    await session.start(profile, { durationMs: 30000 });
+    assert.equal(session.state().profile, profile);
+    assert.equal(session.state().path, path, `${profile} drives ${path}`);
+    await new Promise((r) => setTimeout(r, 1500));
+    await session.stop('test');
+    assert.equal(session.active, false);
+    assert.ok(session.total > 0, `${profile} offered real requests`);
+  }
+  assert.ok(seen.some((u) => u.startsWith('/cpu?ms=250')), 'expensive path really requested');
+  const cross = new LoadSession(() => {}, { endpoint, profiles: CAPACITY_PROFILES });
+  await assert.rejects(cross.start('steady'), /Unknown profile/, 'capacity session rejects request-set keys');
 });

@@ -52,6 +52,18 @@ export const CPU_PROFILES = {
   },
 };
 
+// Capacity-lesson manual profiles: single-pod offered load, cheap vs
+// expensive work. Steady only: the one-click sweep owns the rate ladder.
+export const CAPACITY_PROFILES = {
+  cheap: {
+    label: 'Cheap steady load', path: '/fast', minRps: 5, maxRps: 30, step: 5,
+    phases: [{ label: 'hold', rps: 15, frac: 1 }],
+  },
+  expensive: {
+    label: 'Expensive CPU steady load', path: '/cpu?ms=250', minRps: 2, maxRps: 12, step: 2,
+    phases: [{ label: 'hold', rps: 6, frac: 1 }],
+  },
+};
 export const LOAD_LIMITS = {
   maxRps: 40,
   maxDurationMs: 5 * 60 * 1000,
@@ -63,9 +75,18 @@ export function profileSet(cpu) {
   return cpu ? CPU_PROFILES : PROFILES;
 }
 
-export function validateProfile(profile, cpu = false) {
-  const set = profileSet(cpu);
-  if (!Object.hasOwn(set, profile)) throw new Error(`Unknown profile: ${profile}`);
+// Lesson → profile set, tested against the real session below. Unknown
+// lessons fall back to plain request profiles; capacity has its own set.
+export function profilesForLesson(lesson, sets) {
+  const bag = sets || { request: PROFILES, cpu: CPU_PROFILES, capacity: CAPACITY_PROFILES };
+  if (lesson === 'autoscale' || lesson === 'hpareact' || lesson === 'resources') return bag.cpu || bag.request;
+  if (lesson === 'capacity') return bag.capacity || bag.request;
+  return bag.request;
+}
+
+export function validateProfile(profile, cpu = false, set = null) {
+  const bag = set || profileSet(cpu);
+  if (!Object.hasOwn(bag, profile)) throw new Error(`Unknown profile: ${profile}`);
   return profile;
 }
 
@@ -94,6 +115,10 @@ export class LoadSession {
     this.emit = emit;
     this.endpoint = opts.endpoint || LOAD_LIMITS.endpoint;
     this.cpu = Boolean(opts.cpu);
+    // A real profile set travels with the session: validation and pacing
+    // always use the same set the server accepted (capacity cheap/expensive
+    // are only valid inside the capacity set).
+    this.set = opts.profiles || profileSet(this.cpu);
     this.path = opts.path || null;
     this.active = false;
     this.profile = null;
@@ -113,7 +138,7 @@ export class LoadSession {
   }
 
   def() {
-    return profileSet(this.cpu)[this.profile];
+    return this.set[this.profile];
   }
 
   phaseAt(elapsedMs) {
@@ -158,7 +183,7 @@ export class LoadSession {
 
   async start(profile, opts = {}) {
     if (this.active) throw new Error('A load session is already running. Stop it before starting another.');
-    validateProfile(profile, this.cpu);
+    validateProfile(profile, this.cpu, this.set);
     this.active = true;
     this.profile = profile;
     this.manualDelta = 0;

@@ -3,9 +3,12 @@ import { Button } from './components/button.jsx';
 import { Card, CardContent } from './components/card.jsx';
 import { TimelineChart } from './components/timeline.jsx';
 import { Diagram } from './components/diagram.jsx';
-import { RunsPanel } from './components/runs-panel.jsx';
-import { LESSONS, ACTION_DEFS, TIMELINE_HEADINGS, STEPS } from './lessons.js';
+import { LESSONS, CHAPTERS, ACTION_DEFS, TIMELINE_HEADINGS, STEPS } from './lessons.js';
 import { getJSON, postJSON, downloadBlob } from './api.js';
+
+const byId = Object.fromEntries(LESSONS.map((l) => [l.id, l]));
+const catalogIndex = Object.fromEntries(LESSONS.map((l, i) => [l.id, i]));
+const LESSON_IDS = new Set(LESSONS.map((l) => l.id));
 
 function shortPod(v) {
   if (!v) return '?';
@@ -13,53 +16,85 @@ function shortPod(v) {
   return `…${parts[parts.length - 1]}`;
 }
 
+function storedLesson() {
+  try {
+    const v = localStorage.getItem('scaling-lab.lesson');
+    if (v && LESSON_IDS.has(v)) return v;
+  } catch { /* private mode */ }
+  return LESSONS[0].id;
+}
+
 export default function App() {
-  const [lessonIdx, setLessonIdx] = useState(0);
+  const [selectedId, setSelectedId] = useState(storedLesson);
   const [state, setState] = useState(null);
   const [cluster, setCluster] = useState(null);
-  const [selectedRun, setSelectedRun] = useState(null);
+  const [flow, setFlow] = useState({ active: null, migration: null, history: [] });
   const [runDetail, setRunDetail] = useState(null);
   const [runCluster, setRunCluster] = useState(null);
   const [timeline, setTimeline] = useState(null);
   const [grafana, setGrafana] = useState(null);
   const [monitorView, setMonitorView] = useState('');
   const [mode, setMode] = useState('graceful');
+  const [capWork, setCapWork] = useState('cheap');
+  const [capP95, setCapP95] = useState(500);
+  const [capErr, setCapErr] = useState(5);
+  const [hpaPredict, setHpaPredict] = useState(4);
+  const [capMix, setCapMix] = useState('balanced');
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState('');
   const [guess, setGuess] = useState(null);
   const [quizPick, setQuizPick] = useState(null);
   const [evidence, setEvidence] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [switchTarget, setSwitchTarget] = useState(null);
 
-  const lesson = LESSONS[lessonIdx];
-  const lessonRuns = useMemo(() => (state?.runs || []).filter((r) => r.lesson === lesson.id), [state, lesson]);
-  const active = useMemo(() => (state?.runs || []).find((r) => r.id === selectedRun) || null, [state, selectedRun]);
+  const lesson = byId[selectedId] || LESSONS[0];
+  const active = flow.active || null;
+  const isActiveLesson = Boolean(active && active.lesson === lesson.id);
+  const activeRunId = isActiveLesson ? active.runId : null;
+  const activeRun = useMemo(
+    () => (state?.runs || []).find((r) => r.id === activeRunId) || null,
+    [state, activeRunId],
+  );
 
-  const refreshState = useCallback(async () => {
+  const select = useCallback((id) => {
+    if (!LESSON_IDS.has(id)) return;
+    setSelectedId(id);
+    try { localStorage.setItem('scaling-lab.lesson', id); } catch { /* ignore */ }
+    setRunDetail(null);
+    setRunCluster(null);
+    setTimeline(null);
+    setEvidence(null);
+    setGuess(null);
+    setQuizPick(null);
+    setSwitchTarget(null);
+  }, []);
+
+  const refreshAll = useCallback(async () => {
     try {
-      const [s, c] = await Promise.all([getJSON('/api/state'), getJSON('/api/cluster').catch(() => null)]);
+      const [s, c, f] = await Promise.all([
+        getJSON('/api/state'),
+        getJSON('/api/cluster').catch(() => null),
+        getJSON('/api/lesson').catch(() => null),
+      ]);
       setState(s);
       if (c) setCluster(c);
-      const live = (s.runs || []).filter((r) => r.lesson === LESSONS[lessonIdx].id && (r.status === 'ready' || r.status === 'creating'));
-      if (!selectedRun || !(s.runs || []).some((r) => r.id === selectedRun && r.lesson === LESSONS[lessonIdx].id && r.status !== 'deleted')) {
-        if (live.length) setSelectedRun(live[live.length - 1].id);
-        else setSelectedRun(null);
-      }
+      if (f) setFlow({ active: f.active || null, migration: f.migration || null, history: f.history || [] });
     } catch (e) {
       setNotice(String(e.message || e));
     }
-  }, [lessonIdx, selectedRun]);
+  }, []);
 
   useEffect(() => {
-    refreshState();
-    const t = setInterval(refreshState, 2500);
+    refreshAll();
+    const t = setInterval(refreshAll, 4000);
     return () => clearInterval(t);
-  }, [refreshState]);
+  }, [refreshAll]);
 
-  useEffect(() => setMonitorView(''), [selectedRun]);
+  useEffect(() => setMonitorView(''), [activeRunId]);
 
   useEffect(() => {
-    if (!selectedRun) {
+    if (!activeRunId) {
       setRunDetail(null);
       setRunCluster(null);
       setTimeline(null);
@@ -71,11 +106,11 @@ export default function App() {
     const load = async () => {
       try {
         const [d, rc, tl, g, ev] = await Promise.all([
-          getJSON(`/api/runs/${selectedRun}`).catch(() => null),
-          getJSON(`/api/runs/${selectedRun}/cluster`).catch(() => null),
-          getJSON(`/api/runs/${selectedRun}/timeline`).catch(() => null),
-          getJSON(`/api/grafana?run=${selectedRun}${monitorView ? `&view=${monitorView}` : ''}`).catch(() => null),
-          getJSON(`/api/evidence?run=${selectedRun}`).catch(() => null),
+          getJSON(`/api/runs/${activeRunId}`).catch(() => null),
+          getJSON(`/api/runs/${activeRunId}/cluster`).catch(() => null),
+          getJSON(`/api/runs/${activeRunId}/timeline`).catch(() => null),
+          getJSON(`/api/grafana?run=${activeRunId}${monitorView ? `&view=${monitorView}` : ''}`).catch(() => null),
+          getJSON(`/api/evidence?run=${activeRunId}`).catch(() => null),
         ]);
         if (stop) return;
         if (d) setRunDetail(d);
@@ -91,38 +126,85 @@ export default function App() {
       stop = true;
       clearInterval(t);
     };
-  }, [selectedRun, monitorView]);
+  }, [activeRunId, monitorView]);
 
-  const createRun = async () => {
-    setBusy('Creating run…');
+  const startLesson = async (id) => {
+    setBusy('Starting lesson…');
+    setNotice('');
     try {
-      const { id } = await postJSON('/api/runs', { lesson: lesson.id });
-      setSelectedRun(id);
-      for (let i = 0; i < 24; i++) {
-        await new Promise((x) => setTimeout(x, 5000));
-        const s = await getJSON('/api/state');
-        setState(s);
-        const r = (s.runs || []).find((x) => x.id === id);
-        if (r?.status === 'ready') break;
-        if (r && r.status !== 'creating') throw new Error(r.error || 'run failed');
-      }
-      setNotice(`Run ${id} ready.`);
+      const out = await postJSON('/api/lesson/start', { lesson: id });
+      setNotice(`Starting ${id}: preparing environment (${out.run}).`);
     } catch (e) {
-      setNotice(`Run creation failed: ${e.message}`);
+      setNotice(`Start failed: ${e.message}`);
     } finally {
       setBusy('');
-      refreshState();
+      refreshAll();
+    }
+  };
+
+  const endLesson = async () => {
+    setBusy('Ending lesson…');
+    try {
+      await postJSON('/api/lesson/end', {});
+      setNotice('Ending: traffic stops, evidence saves, the environment is removed.');
+    } catch (e) {
+      setNotice(`End failed: ${e.message}`);
+    } finally {
+      setBusy('');
+      refreshAll();
+    }
+  };
+
+  const confirmSwitch = async () => {
+    if (!switchTarget) return;
+    setBusy('Switching lessons…');
+    try {
+      await postJSON('/api/lesson/end', {});
+      for (let i = 0; i < 90; i++) {
+        await new Promise((x) => setTimeout(x, 2000));
+        const f = await getJSON('/api/lesson').catch(() => null);
+        if (f) setFlow({ active: f.active || null, migration: f.migration || null, history: f.history || [] });
+        if (!f?.active) break;
+      }
+      // Open the destination preview. Never auto-start: the learner presses
+      // Start lesson explicitly.
+      select(switchTarget);
+      setNotice('Previous environment ended with evidence saved. Press Start lesson when ready — nothing is provisioned yet.');
+    } catch (e) {
+      setNotice(`Switch failed: ${e.message}`);
+    } finally {
+      setBusy('');
+      setSwitchTarget(null);
+      refreshAll();
     }
   };
 
   const runScenario = async () => {
-    if (!selectedRun) {
-      await createRun();
+    if (!activeRunId) {
+      setNotice('Start the lesson first — previewing never provisions.');
       return;
     }
     setBusy('Collecting evidence…');
     try {
-      await postJSON(`/api/runs/${selectedRun}/run`, { id: lesson.id, mode });
+      const body = { id: lesson.id, mode };
+      if (lesson.id === 'capacity') {
+        body.options = {
+          work: capWork,
+          sloP95Ms: Math.min(10000, Math.max(50, Number(capP95) || 500)),
+          sloErrorPct: Math.min(50, Math.max(0, Number(capErr) || 0)),
+        };
+      }
+      if (lesson.id === 'hpareact') {
+        body.options = { predictDesired: Math.min(8, Math.max(2, Number(hpaPredict) || 4)) };
+      }
+      if (lesson.id === 'capstone') {
+        body.options = {
+          sloP95Ms: Math.min(5000, Math.max(100, Number(capP95) || 800)),
+          sloErrorPct: Math.min(20, Math.max(0, Number(capErr) || 0)),
+          mix: ['balanced', 'cpu-heavy', 'io-heavy'].includes(capMix) ? capMix : 'balanced',
+        };
+      }
+      await postJSON(`/api/runs/${activeRunId}/run`, body);
       setNotice('Scenario running…');
     } catch (e) {
       setNotice(e.message);
@@ -132,21 +214,21 @@ export default function App() {
   };
 
   const runAction = async (action) => {
-    if (!selectedRun) {
-      setNotice('Create a run first.');
+    if (!activeRunId) {
+      setNotice('Start the lesson first.');
       return;
     }
     setBusy(`Running ${action}…`);
     try {
       const payload = { action };
       if (action === 'start-long') payload.mode = mode;
-      const out = await postJSON(`/api/runs/${selectedRun}/actions`, payload);
+      const out = await postJSON(`/api/runs/${activeRunId}/actions`, payload);
       setNotice(`${action}: ${JSON.stringify(out).slice(0, 160)}`);
     } catch (e) {
       setNotice(e.message);
     } finally {
       setBusy('');
-      refreshState();
+      refreshAll();
     }
   };
 
@@ -161,7 +243,7 @@ export default function App() {
 
   const predict = async (g) => {
     try {
-      await postJSON('/api/predict', { guess: g, lesson: lesson.id, run: selectedRun || undefined });
+      await postJSON('/api/predict', { guess: g, lesson: lesson.id, run: activeRunId || undefined });
       setGuess(g);
       setNotice('Predicted. Observe, then reveal.');
     } catch (e) {
@@ -171,7 +253,7 @@ export default function App() {
 
   const reveal = async () => {
     try {
-      const out = await postJSON('/api/reveal', { lesson: lesson.id, run: selectedRun || undefined });
+      const out = await postJSON('/api/reveal', { lesson: lesson.id, run: activeRunId || undefined });
       setNotice(out.explanation);
     } catch (e) {
       setNotice(e.message);
@@ -179,52 +261,55 @@ export default function App() {
   };
 
   const loadAction = async (action, profile) => {
-    if (!selectedRun) {
-      setNotice('Create a run first.');
+    if (!activeRunId) {
+      setNotice('Start the lesson first.');
       return;
     }
     try {
-      await postJSON(`/api/runs/${selectedRun}/load`, { action, profile: profile || 'steady', durationMs: 180000 });
+      const fallback = lesson.id === 'autoscale' || lesson.id === 'hpareact' ? 'steady' : lesson.id === 'capacity' ? (capWork === 'expensive' ? 'expensive' : 'cheap') : 'steady';
+      await postJSON(`/api/runs/${activeRunId}/load`, { action, profile: profile || fallback, durationMs: 180000 });
       setNotice(`Load ${action}.`);
     } catch (e) {
       setNotice(e.message);
     }
   };
 
+  const migrate = async (action, id) => {
+    setBusy(`${action === 'resume' ? 'Resuming' : 'Ending'} ${id}…`);
+    try {
+      const out = await postJSON('/api/lesson/migrate', { action, id });
+      setNotice(action === 'resume' ? `Resumed ${out.resumed} as the single active lesson.` : `Ended ${out.ended}; evidence retained.`);
+    } catch (e) {
+      setNotice(`Migration failed: ${e.message}`);
+    } finally {
+      setBusy('');
+      refreshAll();
+    }
+  };
+
   const pods = runCluster?.connected ? runCluster.pods : cluster?.pods || [];
   const endpoints = runCluster?.connected ? runCluster.endpoints : cluster?.endpoints || [];
   const stats = runDetail?.statusStats || null;
-  const appliedMode = active?.mode || runDetail?.events?.findLast((event) => event.type === 'app-signal' && event.data?.mode)?.data.mode;
+  const appliedMode = activeRun?.mode || runDetail?.events?.findLast((event) => event.type === 'app-signal' && event.data?.mode)?.data.mode;
   const events = runDetail?.events || [];
   const points = (timeline?.points || []).slice(-180);
   const failures = (timeline?.milestones || []).filter((m) => m.kind === 'failure');
   const checks = evidence?.result?.checks || null;
-  const verdict = evidence?.result?.status || active?.resultStatus || null;
-  const archived = state?.archivedRuns || [];
-  const maxActiveRuns = state?.maxActiveRuns ?? 7;
-  const atRunLimit = (state?.runs || []).filter((r) => !['deleted', 'failed'].includes(r.status)).length >= maxActiveRuns;
-  const runUnavailable = Boolean(busy || !active || active.status !== 'ready' || active.actionRunning || active.scenarioRunning);
-  const openRun = (run) => {
-    const idx = LESSONS.findIndex((l) => l.id === run.lesson);
-    if (idx < 0) return;
-    setLessonIdx(idx);
-    setSelectedRun(run.id);
-    setRunDetail(null);
-    setRunCluster(null);
-    setTimeline(null);
-    setEvidence(null);
-    setGuess(null);
-    setQuizPick(null);
-  };
+  const verdict = evidence?.result?.status || activeRun?.resultStatus || null;
+  const history = flow.history || [];
+  const runUnavailable = Boolean(busy || !activeRun || activeRun.status !== 'ready' || activeRun.actionRunning || activeRun.scenarioRunning);
   const defs = ACTION_DEFS[lesson.id] || [];
   const done = {
-    baseline: active?.status === 'ready',
+    baseline: activeRun?.status === 'ready',
     predict: Boolean(runDetail?.predicted),
-    act: Boolean(active?.scenario || (active?.actions || 0) > 0 || (active?.load?.total || 0) > 0),
+    act: Boolean(activeRun?.scenario || (activeRun?.actions || 0) > 0 || (activeRun?.load?.total || 0) > 0),
     observe: Boolean(runDetail?.observed),
     explain: Boolean(runDetail?.revealed),
-    checks: Boolean(active?.resultStatus),
+    checks: Boolean(activeRun?.resultStatus),
   };
+  const nextLesson = lesson.next ? byId[lesson.next] : null;
+  const showPractice = isActiveLesson && active.status === 'ready';
+  const showStatus = isActiveLesson && active.status !== 'ready';
 
   return (
     <div className="min-h-screen">
@@ -236,6 +321,7 @@ export default function App() {
         </div>
         <div className="flex flex-wrap items-center gap-4 text-[11px] text-white/60">
           <span className="inline-flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${cluster?.connected ? 'bg-emerald-400' : 'bg-slate-400'}`} />{cluster?.connected ? 'Cluster connected' : 'Connecting…'}</span>
+          <span className="inline-flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${active ? 'bg-emerald-400' : 'bg-slate-400'}`} />{active ? `Lesson active: ${byId[active.lesson]?.title || active.lesson}` : 'No active lesson'}</span>
           <button className="rounded-md border border-white/15 px-2.5 py-1.5 transition-colors hover:bg-white/10" onClick={() => setSidebarOpen((v) => !v)} aria-expanded={sidebarOpen}>
             {sidebarOpen ? 'Hide lessons' : 'Show lessons'}
           </button>
@@ -244,48 +330,41 @@ export default function App() {
         </div>
       </header>
 
-      <div className="mx-auto max-w-7xl px-4">
-        <RunsPanel runs={state?.runs || []} archived={archived} maxActiveRuns={maxActiveRuns} selectedRun={selectedRun} onOpen={openRun} onRefresh={refreshState} onDownload={downloadEvidence} />
-      </div>
-
-      <div className={`mx-auto grid max-w-7xl gap-4 p-4 ${sidebarOpen ? 'lg:grid-cols-[220px_minmax(0,1fr)_340px]' : 'lg:grid-cols-[minmax(0,1fr)_340px]'}`}>
+      <div className={`mx-auto grid max-w-7xl gap-4 p-4 ${sidebarOpen ? 'lg:grid-cols-[240px_minmax(0,1fr)_340px]' : 'lg:grid-cols-[minmax(0,1fr)_340px]'}`}>
         {sidebarOpen && (
-        <aside className="min-w-0 space-y-2">
-          <p className="font-mono text-[10px] tracking-widest text-muted-foreground">LABS / 07</p>
-          {LESSONS.map((l, i) => (
-            <button
-              key={l.id}
-              onClick={() => { setLessonIdx(i); setSelectedRun(null); setRunDetail(null); setTimeline(null); setGuess(null); setQuizPick(null); }}
-              className={`flex w-full items-center gap-2 rounded-md border p-2 text-left text-sm ${i === lessonIdx ? 'border-primary bg-secondary font-semibold' : 'bg-background hover:bg-muted'}`}
-            >
-              <span className="font-mono text-xs text-muted-foreground">0{i + 1}</span>{l.title}
-            </button>
-          ))}
-          <Card><CardContent><p className="text-xs text-muted-foreground">Each experiment runs in its own <code>scaling-run-&lt;id&gt;</code> namespace on <code>kind-scaling-lab</code>.</p></CardContent></Card>
-          <Card><CardContent className="space-y-2">
-            <h3 className="text-sm font-semibold">Access guide</h3>
-            <div className="space-y-1 text-xs">
-              <p><strong>Console:</strong> <code>http://127.0.0.1:4173</code> · <a className="underline" href="/worksheet">Worksheet</a></p>
-              {active?.appUrl ? <div className="space-y-1 rounded-md border bg-secondary/50 p-2">
-                <p><strong>Selected run app</strong></p>
-                <p className="break-all font-mono text-[10px]">{active.namespace}</p>
-                <a className="inline-block text-primary underline" href={active.appUrl} target="_blank" rel="noreferrer">Open this run’s app ↗</a>
-                <p className="text-[11px] text-muted-foreground">This address routes only to the selected run’s edge and app.</p>
-              </div> : <p className="text-muted-foreground">Create or select a run for its own browser address.</p>}
-              <details className="pt-1">
-                <summary className="cursor-pointer text-muted-foreground">Shared CLI endpoint</summary>
-                <p className="mt-1"><code>http://127.0.0.1:8080</code> always routes to <code>scaling-lab</code>. Selecting a lesson never changes this route.</p>
-              </details>
-              <p><strong>Prometheus:</strong> <code>make prometheus-ui</code> → <code>http://127.0.0.1:19090</code></p>
-              <p><strong>Grafana:</strong> <code>make grafana-ui</code> → <code>http://127.0.0.1:3003</code> (<code>admin</code>/<code>scaling-lab</code>)</p>
+        <aside className="min-w-0 space-y-3">
+          <p className="font-mono text-[10px] tracking-widest text-muted-foreground">LEARNING PATH / {String(LESSONS.length).padStart(2, '0')}</p>
+          {CHAPTERS.map((ch) => (
+            <div key={ch.id} className="space-y-1">
+              <p className="px-1 pt-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{ch.title}</p>
+              {ch.lessons.map((id) => {
+                const l = byId[id];
+                if (!l) return null;
+                const n = String((catalogIndex[id] ?? 0) + 1).padStart(2, '0');
+                const isSel = id === selectedId;
+                const isLive = active?.lesson === id;
+                return (
+                  <button
+                    key={id}
+                    onClick={() => select(id)}
+                    aria-current={isSel ? 'page' : undefined}
+                    className={`flex w-full items-center gap-2 rounded-md border p-2 text-left text-sm ${isSel ? 'border-primary bg-secondary font-semibold' : 'bg-background hover:bg-muted'}`}
+                  >
+                    <span className="font-mono text-xs text-muted-foreground">{n}</span>
+                    <span className="min-w-0 flex-1">{l.title}</span>
+                    {isLive && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" title="Active lesson" />}
+                  </button>
+                );
+              })}
             </div>
-          </CardContent></Card>
+          ))}
+          <Card><CardContent><p className="text-xs text-muted-foreground">One lesson at a time. Selecting a lesson only previews it — <strong>Start lesson</strong> provisions its isolated environment on <code>kind-scaling-lab</code>.</p></CardContent></Card>
         </aside>
         )}
 
         <section className="min-w-0 space-y-4">
           <div>
-            <p className="font-mono text-[10px] tracking-widest text-muted-foreground">LAB 0{lessonIdx + 1} / 07 · {lesson.time}</p>
+            <p className="font-mono text-[10px] tracking-widest text-muted-foreground">LESSON {String((catalogIndex[lesson.id] ?? 0) + 1).padStart(2, '0')} / {String(LESSONS.length).padStart(2, '0')} · {lesson.time}</p>
             <h1 className="text-3xl font-semibold tracking-tight">{lesson.title}</h1>
             <p className="mt-1 text-sm text-muted-foreground">{lesson.intro}</p>
           </div>
@@ -295,14 +374,113 @@ export default function App() {
             <p className="text-sm">{lesson.concept}</p>
           </CardContent></Card>
 
-          <Diagram lessonIndex={lessonIdx} />
+          <Diagram lessonId={lesson.id} />
 
+          {flow.migration && (
+          <Card><CardContent className="space-y-3">
+            <h3 className="text-sm font-semibold">Inherited environments need a choice</h3>
+            <p className="text-sm text-muted-foreground">A previous version left {flow.migration.runs.length} environments behind. Nothing is deleted silently: resume the last one, or end each explicitly (evidence is saved first).</p>
+            {flow.migration.runs.map((r) => (
+              <div key={r.id} className="flex flex-wrap items-center gap-2 rounded-md border p-2 text-sm">
+                <span className="font-mono text-xs">{r.id}</span>
+                <span className="text-muted-foreground">{byId[r.lesson]?.title || r.lesson} · {r.status}</span>
+                <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => migrate('resume', r.id)}>Resume</Button>
+                <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => migrate('end', r.id)}>End + save evidence</Button>
+              </div>
+            ))}
+            {busy && <span className="text-xs text-muted-foreground">{busy}</span>}
+          </CardContent></Card>
+          )}
+
+          {!isActiveLesson && (
+          <Card><CardContent className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Preview — nothing is provisioned yet</h3>
+              <span className="font-mono text-[10px] text-muted-foreground">00 / PREVIEW</span>
+            </div>
+            <p className="text-sm"><strong>Objective:</strong> {lesson.objective}</p>
+            <p className="text-sm text-muted-foreground"><strong>Prerequisite:</strong> {lesson.prereq}</p>
+            <p className="text-sm text-muted-foreground"><strong>Coming in with:</strong> {lesson.prevQ}</p>
+            <p className="text-sm text-muted-foreground">{lesson.task}</p>
+            <div className="flex flex-wrap items-center gap-2">
+              {!active && <Button disabled={Boolean(busy || flow.migration)} onClick={() => startLesson(lesson.id)}>{busy === 'Starting lesson…' ? 'Starting…' : 'Start lesson →'}</Button>}
+              {active && <Button variant="outline" disabled={Boolean(busy)} onClick={() => setSwitchTarget(lesson.id)}>Switch from “{byId[active.lesson]?.title || active.lesson}”…</Button>}
+              {busy && <span className="text-xs text-muted-foreground">{busy}</span>}
+            </div>
+            {active && <p className="text-xs text-muted-foreground">“{byId[active.lesson]?.title || active.lesson}” currently holds the single environment ({active.status}). Switching asks first: traffic stops, results save, its environment is removed — cancel leaves everything untouched.</p>}
+            {notice && <p className="rounded-md bg-muted p-2 text-xs">{notice}</p>}
+          </CardContent></Card>
+          )}
+
+          {switchTarget && active && (
+          <Card><CardContent className="space-y-3">
+            <h3 className="text-sm font-semibold">End “{byId[active.lesson]?.title || active.lesson}” and open “{byId[switchTarget]?.title}”?</h3>
+            <p className="text-sm text-muted-foreground">Ending stops traffic and cancels in-progress work safely, saves results, and deletes only <code>{active.runId ? `scaling-run-${active.runId}` : 'its environment'}</code>. The destination opens as a preview — it will <strong>not</strong> start automatically.</p>
+            <div className="flex flex-wrap gap-2">
+              <Button disabled={Boolean(busy)} onClick={confirmSwitch}>{busy === 'Switching lessons…' ? 'Switching…' : 'End current + open preview'}</Button>
+              <Button variant="outline" disabled={Boolean(busy)} onClick={() => setSwitchTarget(null)}>Cancel (leave everything untouched)</Button>
+            </div>
+          </CardContent></Card>
+          )}
+
+          {showStatus && (
+          <Card><CardContent className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Lesson {active.status === 'failed' ? 'failed to start' : active.status === 'cleanup-failed' ? 'cleanup failed — allocation retained' : active.status === 'ending' ? 'ending…' : 'starting…'}</h3>
+              <span className="font-mono text-[10px] text-muted-foreground">01 / LIFECYCLE</span>
+            </div>
+            <div className="space-y-1">
+              {(active.stages || []).map((s, i) => (
+                <p key={i} className="font-mono text-[11px] text-muted-foreground">{new Date(s.at).toLocaleTimeString()} <strong>{s.stage}</strong> {s.detail}</p>
+              ))}
+            </div>
+            {active.error && <p className="rounded-md bg-red-50 p-2 text-xs text-red-700" role="alert">{active.error}</p>}
+            <div className="flex flex-wrap gap-2">
+              {(active.status === 'cleanup-failed') && <Button disabled={Boolean(busy)} onClick={endLesson}>Retry end</Button>}
+              {(active.status === 'failed') && <Button disabled={Boolean(busy)} onClick={() => startLesson(active.lesson)}>Retry start</Button>}
+              {(active.status === 'starting' || active.status === 'ending') && <Button variant="outline" disabled={Boolean(busy)} onClick={endLesson}>End now</Button>}
+              {busy && <span className="text-xs text-muted-foreground">{busy}</span>}
+            </div>
+            {notice && <p className="rounded-md bg-muted p-2 text-xs">{notice}</p>}
+          </CardContent></Card>
+          )}
+
+          {showPractice && (
           <Card><CardContent className="space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold">Run the experiment</h3>
-              <span className="font-mono text-[10px] text-muted-foreground">01 / OBSERVE</span>
+              <span className="font-mono text-[10px] text-muted-foreground">02 / OBSERVE</span>
             </div>
             <p className="text-sm text-muted-foreground">{lesson.task}</p>
+            {lesson.id === 'capacity' && (
+              <div className="flex flex-wrap items-center gap-3 rounded-md border bg-muted/40 p-2 text-sm">
+                <label className="flex items-center gap-2">Work
+                  <select value={capWork} onChange={(e) => setCapWork(e.target.value)} className="rounded-md border p-1 text-sm">
+                    <option value="cheap">Cheap (/fast)</option>
+                    <option value="expensive">Expensive (/cpu 250ms)</option>
+                  </select>
+                </label>
+              </div>
+            )}
+            {(lesson.id === 'capacity' || lesson.id === 'capstone') && (
+              <div className="flex flex-wrap items-center gap-3 rounded-md border bg-muted/40 p-2 text-sm">
+                <label className="flex items-center gap-2">Objective p95 ≤
+                  <input value={capP95} onChange={(e) => setCapP95(e.target.value)} inputMode="numeric" className="w-20 rounded-md border p-1 text-sm" aria-label="Objective p95 milliseconds" /> ms
+                </label>
+                <label className="flex items-center gap-2">errors ≤
+                  <input value={capErr} onChange={(e) => setCapErr(e.target.value)} inputMode="decimal" className="w-16 rounded-md border p-1 text-sm" aria-label="Objective error percent" /> %
+                </label>
+                {lesson.id === 'capstone' && (
+                <label className="flex items-center gap-2">Traffic mix
+                  <select value={capMix} onChange={(e) => setCapMix(e.target.value)} className="rounded-md border p-1 text-sm">
+                    <option value="balanced">Balanced (/fast)</option>
+                    <option value="cpu-heavy">CPU-heavy</option>
+                    <option value="io-heavy">I/O-heavy</option>
+                  </select>
+                </label>
+                )}
+              </div>
+            )}
             {lesson.id === 'shutdown' && (
               <label className="flex flex-wrap items-center gap-2 text-sm">Next request mode
                 <select value={mode} onChange={(e) => setMode(e.target.value)} className="rounded-md border p-1 text-sm">
@@ -312,14 +490,22 @@ export default function App() {
                 {appliedMode && <span className="text-xs text-muted-foreground">Last applied: {appliedMode}</span>}
               </label>
             )}
+            {lesson.id === 'hpareact' && (
+              <div className="flex flex-wrap items-center gap-3 rounded-md border bg-muted/40 p-2 text-sm">
+                <label className="flex items-center gap-2">Predicted desired replicas
+                  <input value={hpaPredict} onChange={(e) => setHpaPredict(e.target.value)} inputMode="numeric" className="w-16 rounded-md border p-1 text-sm" aria-label="Predicted desired replicas" />
+                </label>
+                <span className="text-xs text-muted-foreground">Formula: ceil(replicas × observed ÷ target), ±1 counts as agreement.</span>
+              </div>
+            )}
             <div className="flex flex-wrap gap-1">
               {STEPS.map((s) => (
                 <span key={s} className={`rounded-full border px-2 py-1 font-mono text-[10px] ${done[s] ? 'border-green-600 bg-green-50 text-green-800' : 'text-muted-foreground'}`}>{s}</span>
               ))}
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Button disabled={active ? runUnavailable || active.hasPendingLong || active.load?.active : Boolean(busy || atRunLimit)} onClick={runScenario}>{selectedRun ? 'Run + verify →' : 'New run →'}</Button>
-              <Button variant="outline" disabled={Boolean(busy || atRunLimit)} onClick={createRun}>New run</Button>
+              <Button disabled={runUnavailable && !busy} onClick={runScenario}>Run + verify →</Button>
+              <Button variant="outline" disabled={Boolean(busy)} onClick={endLesson}>End lesson</Button>
               {busy && <span className="text-xs text-muted-foreground">{busy}</span>}
             </div>
             {defs.length > 0 && (
@@ -328,73 +514,49 @@ export default function App() {
                 <p className="text-xs text-muted-foreground">Small steps you can run and inspect before the one-click verifier.</p>
                 <div className="flex flex-wrap gap-2">
                   {defs.map(([v, label]) => (
-                    <Button key={v} variant="outline" size="sm" disabled={runUnavailable || (v === 'terminate-serving' ? !active?.hasPendingLong : active?.hasPendingLong)} onClick={() => runAction(v)}>{busy === `Running ${v}…` ? `${label}…` : label}</Button>
+                    <Button key={v} variant="outline" size="sm" disabled={runUnavailable || (v === 'terminate-serving' ? !activeRun?.hasPendingLong : activeRun?.hasPendingLong)} onClick={() => runAction(v)}>{busy === `Running ${v}…` ? `${label}…` : label}</Button>
                   ))}
                 </div>
               </div>
             )}
             <div className="space-y-2 border-t pt-2">
-              <h4 className="text-sm font-semibold">Isolated runs</h4>
-              <div className="flex flex-wrap items-center gap-2">
-                <select value={selectedRun || ''} onChange={(e) => setSelectedRun(e.target.value || null)} className="max-w-full rounded-md border p-1 text-sm">
-                  <option value="">no runs</option>
-                  {lessonRuns.map((r) => (
-                    <option key={r.id} value={r.id}>{r.id} · {r.status} · {r.namespace}</option>
-                  ))}
-                </select>
-                <Button variant="outline" size="sm" onClick={() => downloadEvidence(selectedRun)}>Download evidence</Button>
-                <a className="text-xs underline" href="#all-runs">Manage / close runs ↑</a>
-              </div>
               <p className="font-mono text-[11px] text-muted-foreground">
-                {active ? `run ${active.id} · ${active.status} · ${active.namespace} · ${pods.filter((p) => p.ready && !p.terminating).length} Ready pods` : 'No runs for this lesson — create one to start.'}
+                {activeRun ? `environment scaling-run-${activeRun.id} · ${activeRun.status} · ${pods.filter((p) => p.ready && !p.terminating).length} Ready pods` : 'Environment ready.'}
               </p>
-              {active?.appUrl && (
+              {activeRun?.appUrl && (
                 <div className="space-y-2 rounded-md border bg-muted/40 p-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h4 className="text-xs font-semibold">Browser access</h4>
-                    <a href={active.appUrl} target="_blank" rel="noreferrer" className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90">Open app ↗</a>
+                    <a href={activeRun.appUrl} target="_blank" rel="noreferrer" className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90">Open app ↗</a>
                   </div>
-                  <a href={active.appUrl} target="_blank" rel="noreferrer" className="block break-all font-mono text-[11px] text-muted-foreground underline">{window.location.origin}{active.appUrl}</a>
-                  <p className="break-all text-[11px] text-muted-foreground">Routes to <code className="text-foreground">{active.namespace}</code> · edge → app</p>
+                  <a href={activeRun.appUrl} target="_blank" rel="noreferrer" className="block break-all font-mono text-[11px] text-muted-foreground underline">{window.location.origin}{activeRun.appUrl}</a>
+                  <p className="break-all text-[11px] text-muted-foreground">Routes to <code className="text-foreground">{activeRun.namespace}</code> · edge → app</p>
                   <div className="flex flex-wrap gap-3 text-xs">
-                    <a className="underline" href={`/app/${active.id}/slow?ms=8000`} target="_blank" rel="noreferrer">8s request ↗</a>
-                    <a className="underline" href={`/app/${active.id}/stream`} target="_blank" rel="noreferrer">Stream ↗</a>
-                    <a className="underline" href={`/app/${active.id}/metrics`} target="_blank" rel="noreferrer">Metrics ↗</a>
-                    <a className="underline" href={`/app/${active.id}/health/ready`} target="_blank" rel="noreferrer">Readiness ↗</a>
+                    <a className="underline" href={`/app/${activeRun.id}/slow?ms=8000`} target="_blank" rel="noreferrer">8s request ↗</a>
+                    <a className="underline" href={`/app/${activeRun.id}/stream`} target="_blank" rel="noreferrer">Stream ↗</a>
+                    <a className="underline" href={`/app/${activeRun.id}/metrics`} target="_blank" rel="noreferrer">Metrics ↗</a>
+                    <a className="underline" href={`/app/${activeRun.id}/health/ready`} target="_blank" rel="noreferrer">Readiness ↗</a>
                   </div>
-                  <p className="text-[11px] text-muted-foreground">These links send requests to this run. No terminal setup needed.</p>
+                  <p className="text-[11px] text-muted-foreground">These links send requests to this lesson. No terminal setup needed.</p>
                 </div>
               )}
               <p className="text-xs text-green-700">
-                Footprint: {(state?.runs || []).filter((r) => r.status !== 'deleted' && r.status !== 'failed').length}/{maxActiveRuns} active runs · 100m CPU / 64Mi per app pod.
+                One lesson at a time · {(activeRun?.resources?.appReplicas ?? 2)} app pods (100m CPU / 64Mi each) + 1 edge pod in this environment.
               </p>
-              <div className="text-xs">
-                <span className="font-mono text-muted-foreground">Archived evidence ({archived.length}): </span>
-                {archived.slice(-5).reverse().map((id) => (
-                  <button key={id} onClick={() => downloadEvidence(id)} className="mr-1 rounded border px-1 font-mono text-[11px] hover:bg-muted">{id}</button>
-                ))}
-                {archived.length > 5 && (
-                  <details className="mt-1">
-                    <summary className="cursor-pointer underline">Show all {archived.length}</summary>
-                    <div className="mt-1 flex flex-wrap gap-1">
-                      {archived.slice(0, -5).reverse().map((id) => (
-                        <button key={id} onClick={() => downloadEvidence(id)} className="rounded border px-1 font-mono text-[11px] hover:bg-muted">{id}</button>
-                      ))}
-                    </div>
-                  </details>
-                )}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => downloadEvidence(activeRunId)}>Download evidence</Button>
               </div>
             </div>
-            {(lesson.id === 'prometheus' || lesson.id === 'autoscale') && (
+            {(lesson.id === 'prometheus' || lesson.id === 'autoscale' || lesson.id === 'capacity' || lesson.id === 'hpareact' || lesson.id === 'resources' || lesson.id === 'signals' || lesson.id === 'downstream' || lesson.id === 'gateway') && (
               <div className="space-y-2 border-t pt-2">
                 <h4 className="text-sm font-semibold">Manual traffic</h4>
                 <div className="flex flex-wrap gap-2">
-                  <Button variant="outline" size="sm" disabled={runUnavailable || active?.hasPendingLong || active?.load?.active} onClick={() => loadAction('start', lesson.id === 'autoscale' ? 'cpu-steady' : 'steady')}>Start</Button>
-                  <Button variant="outline" size="sm" disabled={runUnavailable || !active?.load?.active} onClick={() => loadAction('increase')}>Increase</Button>
-                  <Button variant="outline" size="sm" disabled={runUnavailable || !active?.load?.active} onClick={() => loadAction('decrease')}>Decrease</Button>
-                  <Button variant="outline" size="sm" disabled={runUnavailable || !active?.load?.active} onClick={() => loadAction('stop')}>Stop</Button>
+                  <Button variant="outline" size="sm" disabled={runUnavailable || activeRun?.hasPendingLong || activeRun?.load?.active} onClick={() => loadAction('start')}>Start</Button>
+                  <Button variant="outline" size="sm" disabled={runUnavailable || !activeRun?.load?.active} onClick={() => loadAction('increase')}>Increase</Button>
+                  <Button variant="outline" size="sm" disabled={runUnavailable || !activeRun?.load?.active} onClick={() => loadAction('decrease')}>Decrease</Button>
+                  <Button variant="outline" size="sm" disabled={runUnavailable || !activeRun?.load?.active} onClick={() => loadAction('stop')}>Stop</Button>
                 </div>
-                <p className="text-xs text-muted-foreground">{active?.load?.active ? `${active.load.profile} · target ${active.load.targetRps} req/s · total ${active.load.total}` : 'Manual load idle.'}</p>
+                <p className="text-xs text-muted-foreground">{activeRun?.load?.active ? `${activeRun.load.profile} · target ${activeRun.load.targetRps} req/s · total ${activeRun.load.total}` : 'Manual load idle.'}</p>
               </div>
             )}
             <div className="space-y-2 border-t pt-2">
@@ -408,11 +570,13 @@ export default function App() {
             </div>
             {notice && <p className="rounded-md bg-muted p-2 text-xs">{notice}</p>}
           </CardContent></Card>
+          )}
 
+          {showPractice && (
           <Card><CardContent className="space-y-2">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold">Verification</h3>
-              <span className="font-mono text-[10px] text-muted-foreground">02 / CHECK</span>
+              <span className="font-mono text-[10px] text-muted-foreground">03 / CHECK</span>
             </div>
             {!verdict ? <p className="text-sm text-muted-foreground">Run the experiment to see evidence and checks.</p> : (
               <div>
@@ -426,11 +590,13 @@ export default function App() {
               </div>
             )}
           </CardContent></Card>
+          )}
 
+          {showPractice && (
           <Card><CardContent className="space-y-2">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold">Check your understanding</h3>
-              <span className="font-mono text-[10px] text-muted-foreground">03 / EXPLAIN</span>
+              <span className="font-mono text-[10px] text-muted-foreground">04 / EXPLAIN</span>
             </div>
             <p className="text-sm">{lesson.quiz}</p>
             <div className="flex flex-wrap gap-2">
@@ -440,14 +606,51 @@ export default function App() {
             </div>
             {quizPick != null && <p className="text-xs text-muted-foreground">{quizPick === lesson.correct ? 'Correct. ' : 'Try again. '}{lesson.why}</p>}
           </CardContent></Card>
+          )}
+
+          <Card><CardContent className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Learning path</h3>
+              <span className="font-mono text-[10px] text-muted-foreground">05 / PATH</span>
+            </div>
+            <p className="text-sm"><strong>Take away:</strong> {lesson.takeaway}</p>
+            {nextLesson
+              ? <p className="text-sm text-muted-foreground"><strong>Next:</strong> {nextLesson.title} — <button className="underline" onClick={() => select(nextLesson.id)}>open its preview →</button></p>
+              : <p className="text-sm text-muted-foreground"><strong>Next:</strong> you completed the path — revisit any lesson or export evidence above.</p>}
+            {lesson.reading && (
+              <div className="space-y-1 border-t pt-2">
+                <p className="text-sm"><a className="underline" href={lesson.reading.url} target="_blank" rel="noreferrer">{lesson.reading.title} ↗</a></p>
+                <p className="text-sm"><strong>Reflect:</strong> {lesson.reflect}</p>
+              </div>
+            )}
+          </CardContent></Card>
+
+          <Card id="history"><CardContent className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">History (read-only)</h3>
+              <span className="font-mono text-[10px] text-muted-foreground">{history.length} saved</span>
+            </div>
+            {history.length ? (
+              <div className="max-h-48 space-y-1 overflow-auto">
+                {history.map((h) => (
+                  <div key={h.run} className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="font-mono">{h.run}</span>
+                    <span className="text-muted-foreground">{byId[h.lesson]?.title || h.lesson}</span>
+                    <span className={`font-semibold ${h.status === 'pass' ? 'text-green-700' : h.status === 'fail' ? 'text-red-700' : 'text-muted-foreground'}`}>{h.status}{h.ended && h.ended !== 'completed' ? ` · ${h.ended}` : ''}</span>
+                    <button className="underline" onClick={() => downloadEvidence(h.run)}>Evidence</button>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-xs text-muted-foreground">Ended lessons keep readable results and downloadable evidence here, even after restart. Viewing history never provisions anything.</p>}
+          </CardContent></Card>
         </section>
 
         <aside className="min-w-0 space-y-3">
           <Card className="border-0 bg-transparent shadow-none"><CardContent className="space-y-2 px-0">
-            <h3 className="text-sm font-semibold">Live observation {active?.load?.active ? '· LIVE' : '· IDLE'}</h3>
+            <h3 className="text-sm font-semibold">Live observation {activeRun?.load?.active ? '· LIVE' : '· IDLE'}</h3>
             {grafana?.available ? (
               <div className="space-y-2">
-                <a className="text-xs underline" href={grafana.runUrl || grafana.dashboardUrl} target="_blank" rel="noreferrer">Open dashboard for this run ↗</a>
+                <a className="text-xs underline" href={grafana.runUrl || grafana.dashboardUrl} target="_blank" rel="noreferrer">Open dashboard for this lesson ↗</a>
                 {grafana.views && <label className="flex items-center justify-between gap-2 text-xs text-muted-foreground">Show
                   <select aria-label="Monitoring view" value={monitorView || grafana.view} onChange={(e) => setMonitorView(e.target.value)} className="max-w-full rounded-md border bg-card p-1.5 text-xs text-foreground">
                     {grafana.views.map((view) => <option key={view.id} value={view.id}>{view.label}</option>)}
@@ -461,11 +664,11 @@ export default function App() {
                 <p className="text-xs text-muted-foreground">Login <code>admin</code> / <code>scaling-lab</code>, open “Scaling Lab · HTTP and pod lifecycle”.</p>
               </div>
             )}
-            {grafana?.embedUrl && selectedRun && (
-              <iframe title={`Grafana ${grafana.viewLabel || 'HTTP response metrics'} for selected run`} src={`${grafana.embedUrl}${grafana.embedUrl.includes('?') ? '&' : '?'}from=now-15m&to=now&refresh=5s`} className="h-64 w-full rounded border" loading="lazy" />
+            {grafana?.embedUrl && activeRunId && (
+              <iframe title={`Grafana ${grafana.viewLabel || 'HTTP response metrics'} for selected lesson`} src={`${grafana.embedUrl}${grafana.embedUrl.includes('?') ? '&' : '?'}from=now-15m&to=now&refresh=5s`} className="h-64 w-full rounded border" loading="lazy" />
             )}
-            {grafana?.available && selectedRun && <p className="text-[11px] leading-relaxed text-muted-foreground">
-              {grafana.view === 'activity' ? 'Shows active requests, including long requests before they finish. Metrics update about every 5 seconds.' : grafana.view === 'responses' ? 'Shows completed responses on current pods. Counters reset when pods restart; a short response can finish between scrapes.' : 'Shows completed responses per second. An idle run has a zero rate; long requests appear after they finish.'}
+            {grafana?.available && activeRunId && <p className="text-[11px] leading-relaxed text-muted-foreground">
+              {grafana.view === 'activity' ? 'Shows active requests, including long requests before they finish. Metrics update about every 5 seconds.' : grafana.view === 'responses' ? 'Shows completed responses on current pods. Counters reset when pods restart; a short response can finish between scrapes.' : 'Shows completed responses per second. An idle lesson has a zero rate; long requests appear after they finish.'}
               {' '}Interrupted responses and exact shutdown timing appear in the experiment trace.
             </p>}
             <div className="space-y-2 rounded-md border bg-card p-3">

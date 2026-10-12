@@ -273,3 +273,23 @@ test('cleanup of an already-absent namespace succeeds and frees the slot', async
   assert.equal(activeRuns().length, 0, 'absent namespace frees its slot');
   assert.ok(archives.has(run.id), 'evidence still snapshotted');
 });
+
+test('per-lesson run shapes pin replicas and scalers', async () => {
+  const { makeFakeCluster } = await import('./test-fake.mjs');
+  const { runs, archives, createRun, runConfig, RUN_LESSONS } = await import('./runs.mjs');
+  assert.equal(RUN_LESSONS.size, 16);
+  assert.deepEqual(runConfig('capacity'), { replicas: 1, scaler: null });
+  assert.deepEqual(runConfig('disruptions'), { replicas: 3, scaler: null });
+  assert.deepEqual(runConfig('autoscale'), { replicas: 2, scaler: 'cpu-hpa' });
+  assert.deepEqual(runConfig('prometheus'), { replicas: 2, scaler: 'keda' });
+  runs.clear(); archives.clear();
+  const fake = makeFakeCluster();
+  const cap = await createRun('capacity', () => {}, fake.deps);
+  assert.equal(cap.status, 'ready');
+  const appliedKinds = fake.applied.filter(([ns]) => ns === cap.ns).map(([, kind]) => kind);
+  assert.ok(!appliedKinds.includes('HorizontalPodAutoscaler'), 'capacity provisions no scaler');
+  assert.ok(!appliedKinds.includes('ScaledObject'), 'capacity provisions no scaler');
+  assert.equal(fake.namespaces.get(cap.ns).deployments.app, 1);
+  const dis = await createRun('disruptions', () => {}, fake.deps);
+  assert.equal(fake.namespaces.get(dis.ns).deployments.app, 3);
+});

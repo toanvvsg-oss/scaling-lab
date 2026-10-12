@@ -2,12 +2,12 @@ import http from 'node:http';
 import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { clusterState, runScenario } from './runner.mjs';
-import { LoadSession, PROFILES, CPU_PROFILES, profileSet } from './load.mjs';
+import { clusterState, runScenario, validateCapacityOptions, validateHpaReactOptions, validateCapstoneOptions } from './runner.mjs';
+import { LoadSession, PROFILES, CPU_PROFILES, CAPACITY_PROFILES, profileSet, profilesForLesson } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, runReset } from './reset.mjs';
 import { queryPrometheus, queryRunSamples, LEGACY_RATE_QUERY, rateQueryForRun, upQueryForRun, counterSelForRun, upSelForRun } from './prometheus.mjs';
-import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns } from './runs.mjs';
+import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns, checkLessonPrereqs } from './runs.mjs';
 import { runAction } from './actions.mjs';
 import { grafanaStatus, closeGrafanaForward, dashboardUrl, panelEmbedUrl } from './grafana.mjs';
 import { learnerPath, proxyRunApp } from './app-route.mjs';
@@ -25,17 +25,26 @@ export const EXPLANATIONS = {
   streaming: 'The 20-tick stream stays active far longer than a fast response. Graceful shutdown lets the active response finish all 20 ticks before the pod exits; server.close waits for active HTTP requests instead of cutting them.',
   autoscale: 'HPA CPU utilization is measured against the 100m request with a 60% target. Metrics-server sampling, HPA reconciliation, and the 60s scale-down stabilization window delay every stage: load first, desired replicas later, Ready pods last.',
   prometheus: 'Prometheus scrapes every 5s, KEDA polls every 5s, and HPA stabilizes scale-down for 60s. Expect: offered RPS rises first, scraped RPS follows, desired replicas follow, Ready pods arrive last; reverse on scale-in.',
+  capacity: 'One pod can only do so much: offered load queues or times out while goodput flattens and tail latency climbs. The sweep finds the highest offered rate meeting your latency/error objective on this exact configuration — a measurement, not a production rating.',
+  resources: 'CPU requests size the HPA utilization denominator and schedule pods; CPU limits throttle at runtime. Raising requests can move HPA decisions with zero traffic change, and memory limits kill (OOMKill) instead of slowing down.',
+  hpareact: 'HPA desired = ceil(currentReplicas × observed / target) per metric, then tolerance (±10% ignores small moves) applies; pods that are unready or lack metrics are left out of the calculation and the controller holds rather than guessing from zero; min/max bounds and scale-down stabilization delay the visible reaction. Desired replicas are a decision; Ready pods are usable capacity, minutes apart.',
+  signals: 'Equal RPS can mean wildly different work: CPU burn vs waiting on slow I/O look identical as request counts. A scaling signal should move when useful capacity is added — CPU is a poor signal for queue or I/O-bound work.',
+  downstream: 'Adding app replicas cannot beat a saturated dependency: throughput caps at the dependency, queues and tail latency grow instead. Bounded retries, concurrency limits, and early shedding protect timely success; unbounded retries amplify the overload.',
+  pending: 'HPA can desire replicas that never run: requests exceeding allocatable capacity, unsatisfiable placement constraints, or fragmentation leave pods Pending. Desired ≠ scheduled ≠ Running ≠ Ready, and only node capacity (not HPA) fixes Pending.',
+  disruptions: 'Evictions honor PodDisruptionBudgets; direct pod deletion, rollouts, and involuntary node loss do not wait for them. Availability through change needs spare Ready capacity plus topology spread — and a guarded, reversible drain procedure for real nodes.',
+  gateway: 'A pod being Ready is only half the path: backends must attach to the load balancer (NEGs/endpoints), pass health checks, and drain gracefully on shutdown. When 502/503 appear during rollouts, compare endpoint-removal order against response completion before concluding: early backend removal is one common cause among several. This local exercise is a backend-drain analogue, not GKE.',
+  capstone: 'Meeting an objective through burst, rollout, and disruption takes warm headroom, bounded max replicas, and honest measurement: replica growth alone never passes. Export the raw evidence, the criteria, and the limitations.',
 };
 
 export const LOAD_DURATIONS = [60, 120, 180, 300];
 const PREDICT_VALUES = new Set(['up', 'down', 'same', 'share', 'fresh']);
 
 export const prodDeps = {
-  clusterState, runScenario,
+  clusterState, runScenario, checkLessonPrereqs,
   loadFactory: (emitFn, opts) => new LoadSession(emitFn, opts),
   runsApi: {
     runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS,
-    validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns,
+    validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns, checkLessonPrereqs,
   },
   promQuery: queryPrometheus,
   queryRunSamples,
@@ -49,7 +58,7 @@ export const prodDeps = {
   // ever spawning kubectl against a live cluster.
   grafanaApi: { status: () => grafanaStatus(), close: () => closeGrafanaForward() },
   resultsDir,
-  profiles: { request: PROFILES, cpu: CPU_PROFILES },
+  profiles: { request: PROFILES, cpu: CPU_PROFILES, capacity: CAPACITY_PROFILES },
   enableSampler: true,
 };
 
@@ -58,11 +67,71 @@ function send(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
+// End-lesson orchestration: cancel cooperatively, stop traffic/queues,
+// terminate guided requests with a bounded wait, persist evidence, then
+// delete ONLY the owned lesson namespace. Failures retain the allocation with
+// a retry instead of navigating as if cleanup succeeded. Partial and
+// cancelled outcomes are recorded honestly, never fabricated.
+async function endLessonRun(run, ctx) {
+  const { active, emit, R, io, stage, clear } = ctx;
+  const fail = (message) => {
+    active.status = 'cleanup-failed';
+    active.error = message;
+    stage('cleanup-failed', message);
+    emit('error', { text: `End lesson failed: ${message}` });
+  };
+  try {
+    run.cancel = run.cancel || { requested: false };
+    run.cancel.requested = true;
+    stage('stop-traffic', 'Stopping load and queue exercises.');
+    if (run.load?.active) await run.load.stop('stopped by End lesson').catch((e) => emit('error', { text: `Load stop: ${e.message}` }));
+    if (run.queue?.active) await run.queue.stop('stopped by End lesson').catch((e) => emit('error', { text: `Queue stop: ${e.message}` }));
+    if (run.pendingLong && !run.pendingLong.completed) {
+      stage('cancel-guided', 'Terminating the guided long request (bounded 30s wait).');
+      try {
+        if (!run.actionRunning) {
+          run.actionRunning = true;
+          try { await io.runAction(run, 'terminate-serving', {}, (t, d) => emit(t, d)); } finally { run.actionRunning = false; }
+        }
+      } catch (e) { emit('error', { text: `Guided termination: ${e.message}` }); }
+      const guntil = Date.now() + 30000;
+      while (run.pendingLong && !run.pendingLong.completed && Date.now() < guntil) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      if (run.pendingLong && !run.pendingLong.completed) {
+        emit('error', { text: 'Guided request still in flight after 30s; teardown finalizes and the outcome is recorded as cancelled.' });
+        run.pendingLong = null;
+      }
+    }
+    stage('await-scenario', 'Waiting for any in-progress scenario to reach a cancellation boundary.');
+    const until = Date.now() + 420000;
+    while (run.scenarioRunning && Date.now() < until) await new Promise((r) => setTimeout(r, 2000));
+    if (run.scenarioRunning) { fail('Scenario did not reach a cancellation boundary within 7 minutes. Retry End; nothing was deleted.'); return; }
+    const aUntil = Date.now() + 60000;
+    while (run.actionRunning && Date.now() < aUntil) await new Promise((r) => setTimeout(r, 1000));
+    if (run.actionRunning) { fail('A learner action is still running. Retry End; nothing was deleted.'); return; }
+    stage('archive', 'Persisting evidence and deleting only the owned lesson namespace.');
+    run.ended = run.result?.status === 'cancelled' ? 'cancelled' : run.result ? 'completed' : 'incomplete';
+    await R.cleanupRun(run.id, io.resultsDir);
+    emit('note', { text: `Lesson ended; evidence retained for run ${run.id}.` });
+    clear();
+  } catch (error) {
+    fail(error.message);
+  }
+}
+
 export function createApp(overrides = {}) {
   const io = { ...prodDeps, ...overrides };
   const R = io.runsApi;
   const state = { running: false, scenario: null, events: [], rev: 0, result: null, error: null, started: null, resetting: false, resetSteps: [], load: null, timeline: createHistory(), predictions: {} };
   let booted = false;
+  // Single active lesson lifecycle (supersedes multi-run UX; namespaces stay
+  // an internal isolation detail). Exactly one allocation is enforced here.
+  const lessonFlow = { active: null, migration: null };
+  const stage = (text, detail) => {
+    if (!lessonFlow.active) return;
+    lessonFlow.active.stages.push({ at: new Date().toISOString(), stage: text, detail: detail || '' });
+  };
 
   function pushEvent(store, type, data) {
     const event = { at: new Date().toISOString(), type, data };
@@ -95,13 +164,14 @@ export function createApp(overrides = {}) {
   const load = io.loadFactory(emit, {});
   const loadState = () => load.state();
   const profilesPayload = () => ({
-    request: Object.fromEntries(Object.entries(io.profiles.request).map(([k, v]) => [k, { minRps: v.minRps, maxRps: v.maxRps, step: v.step, phases: v.phases.map((p) => ({ label: p.label, rps: p.rps })) }])),
+    request: Object.fromEntries(Object.entries(io.profiles.request).map(([k, v]) => [k, { minRps: v.minRps, maxRps: v.maxRps, step: v.step, path: v.path, phases: v.phases.map((p) => ({ label: p.label, rps: p.rps })) }])),
     cpu: Object.fromEntries(Object.entries(io.profiles.cpu).map(([k, v]) => [k, { minRps: v.minRps, maxRps: v.maxRps, step: v.step, path: v.path, phases: v.phases.map((p) => ({ label: p.label, rps: p.rps })) }])),
+    capacity: Object.fromEntries(Object.entries(io.profiles.capacity).map(([k, v]) => [k, { minRps: v.minRps, maxRps: v.maxRps, step: v.step, path: v.path, phases: v.phases.map((p) => ({ label: p.label, rps: p.rps })) }])),
     durations: LOAD_DURATIONS,
   });
 
   function wireRunLoad(run) {
-    run.load = io.loadFactory((t, d) => runEmit(run, t, d), { cpu: run.lesson === 'autoscale' });
+    run.load = io.loadFactory((t, d) => runEmit(run, t, d), { cpu: run.lesson === 'autoscale' || run.lesson === 'hpareact' || run.lesson === 'resources', profiles: lessonProfiles(run.lesson) });
     if (run.forwardPort) run.load.endpoint = `http://127.0.0.1:${run.forwardPort}`;
   }
 
@@ -245,7 +315,17 @@ export function createApp(overrides = {}) {
   }
 
   function lessonProfiles(lesson) {
-    return lesson === 'autoscale' ? io.profiles.cpu : io.profiles.request;
+    return profilesForLesson(lesson, io.profiles);
+  }
+
+  // Scenario options are validated per lesson with strict bounds before any
+  // cluster work starts. Unknown lessons or out-of-range numbers are rejected.
+  function scenarioOptions(lesson, input) {
+    if (lesson === 'capacity') return validateCapacityOptions(input || {});
+    if (lesson === 'hpareact') return validateHpaReactOptions(input || {});
+    if (lesson === 'capstone') return validateCapstoneOptions(input || {});
+    if (input && input.options !== undefined) throw new Error(`Lesson ${lesson} takes no scenario options.`);
+    return {};
   }
 
   async function runLoadAction(run, action, profile, durationMs) {
@@ -281,8 +361,7 @@ function summarizeAction(s) {
   return s.action || '';
 }
 
-  function predictionScope(input) {
-    if (input.run) {
+  function predictionScope(input) {    if (input.run) {
       R.validateRunId(input.run);
       const run = R.runs.get(input.run);
       if (!run) throw Object.assign(new Error(`Unknown run: ${input.run}`), { status: 404 });
@@ -387,6 +466,9 @@ function summarizeAction(s) {
       let input;
       try { input = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
       if (!R.RUN_LESSONS.has(input.lesson)) return send(res, 400, { error: `Unknown run lesson. Expected one of ${[...R.RUN_LESSONS].join(', ')}.` });
+      // Single allocation: the lesson flow owns creation while active.
+      if (lessonFlow.migration) return send(res, 409, { error: 'Resolve the inherited environments first (GET /api/lesson).' });
+      if (lessonFlow.active) return send(res, 409, { error: `Lesson ${lessonFlow.active.lesson} already holds the single environment. End it before creating another.`, active: lessonFlow.active });
       if (R.activeRuns().length >= R.MAX_ACTIVE_RUNS) return send(res, 409, { error: `Run limit reached (${R.MAX_ACTIVE_RUNS} active runs: ${R.activeRuns().map((r) => r.id).join(', ')}). Clean up a run before creating another.` });
       let run;
       try {
@@ -403,12 +485,151 @@ function summarizeAction(s) {
         .catch((error) => emit('error', { text: `Run creation failed: ${error.message}` }));
       return;
     }
+    function lessonHistory() {
+      return [...R.archives.values()].map((a) => ({
+        run: a.run, lesson: a.lesson, archivedAt: a.archivedAt,
+        status: a.result?.status || a.status, ended: a.ended || null,
+      })).sort((a, b) => (a.archivedAt < b.archivedAt ? 1 : -1));
+    }
+
+    if (req.method === 'GET' && path === '/api/lesson') {
+      return send(res, 200, { active: lessonFlow.active, migration: lessonFlow.migration, history: lessonHistory(), booted });
+    }
+    if (req.method === 'POST' && path === '/api/lesson/start') {
+      if (!booted) return send(res, 503, { error: 'Dashboard is still starting (re-adoption in progress). Retry in a few seconds.' });
+      let input;
+      try { input = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
+      if (!R.RUN_LESSONS.has(input.lesson)) return send(res, 400, { error: `Unknown lesson. Expected one of ${[...R.RUN_LESSONS].join(', ')}.` });
+      if (lessonFlow.migration) return send(res, 409, { error: 'Resolve the inherited environments first (GET /api/lesson).', migration: lessonFlow.migration });
+      if (lessonFlow.active && lessonFlow.active.status !== 'failed') {
+        return send(res, 409, { error: `Lesson ${lessonFlow.active.lesson} already holds the single environment (status ${lessonFlow.active.status}). End it before starting another.`, active: lessonFlow.active });
+      }
+      // Synchronous reservation BEFORE any await below: the check and the
+      // claim run atomically, so two concurrent Starts cannot both pass.
+      // Prerequisite verification happens after the claim; failure releases
+      // it (a failed start never blocks retry).
+      lessonFlow.active = { lesson: input.lesson, runId: null, status: 'starting', stages: [], error: null, startedAt: new Date().toISOString() };
+      const prereqs = await R.checkLessonPrereqs(input.lesson).catch((e) => ({ ok: false, checks: [], missing: [{ name: 'check', guidance: e.message }] }));
+      if (!prereqs.ok) {
+        if (lessonFlow.active && lessonFlow.active.runId === null && lessonFlow.active.lesson === input.lesson) lessonFlow.active = null;
+        return send(res, 409, {
+          error: `Prerequisites missing for ${input.lesson}. Start provisions nothing until they are met.`,
+          missing: prereqs.missing, checks: prereqs.checks,
+        });
+      }
+      let run;
+      try {
+        run = R.beginRun(input.lesson, emit);
+      } catch (error) {
+        if (lessonFlow.active && lessonFlow.active.runId === null && lessonFlow.active.lesson === input.lesson) lessonFlow.active = null;
+        return send(res, error.status || 400, { error: error.message });
+      }
+      lessonFlow.active = { lesson: input.lesson, runId: run.id, status: 'starting', stages: [], error: null, startedAt: new Date().toISOString() };
+      stage('check-prerequisites', `Shared dependencies verified (${prereqs.checks.map((c) => c.name).join(', ')}).`);
+      stage('prepare-environment', `Provisioning isolated namespace ${run.ns}.`);
+      send(res, 202, { started: true, lesson: input.lesson, run: run.id, status: 'starting' });
+      R.finishRun(run, emit)
+        .then(() => {
+          wireRunLoad(run);
+          if (lessonFlow.active?.runId === run.id) {
+            lessonFlow.active.status = 'ready';
+            stage('ready', `Environment ready in ${run.ns}.`);
+          }
+          emit('note', { text: `Lesson ${run.lesson} ready in ${run.ns}.` });
+        })
+        .catch((error) => {
+          // Creation holds no resources (rollback removed the namespace), so
+          // the slot frees: a failed start never blocks retry.
+          if (lessonFlow.active?.runId === run.id) {
+            lessonFlow.active.status = 'failed';
+            lessonFlow.active.error = error.message;
+            stage('failed', error.message);
+          }
+          emit('error', { text: `Lesson start failed: ${error.message}` });
+        });
+      return;
+    }
+    if (req.method === 'POST' && path === '/api/lesson/end') {
+      if (!booted) return send(res, 503, { error: 'Dashboard is still starting. Retry in a few seconds.' });
+      if (lessonFlow.migration) return send(res, 409, { error: 'Resolve the inherited environments first (GET /api/lesson).' });
+      const active = lessonFlow.active;
+      if (!active) return send(res, 200, { ended: false, note: 'No active lesson.' });
+      if (active.status === 'starting') {
+        // Creation is short and uninterruptible; the client polls and ends
+        // once ready/failed instead of a second start slipping in.
+        return send(res, 409, { error: 'Lesson is still starting. Wait for Ready/failed, then End.', retryable: true, active });
+      }
+      const run = R.runs.get(active.runId);
+      if (!run) {
+        lessonFlow.active = null;
+        return send(res, 200, { ended: true, note: 'Allocation record cleared (environment already gone).' });
+      }
+      if (active.status === 'cleanup-failed') {
+        // Retry: relaunch the orchestrator; the retained allocation stays
+        // held until cleanup genuinely succeeds.
+        active.status = 'ending';
+        active.endingSince = new Date().toISOString();
+        stage('end-retry', 'Retrying teardown after a retained cleanup failure.');
+        endLessonRun(run, {
+          active, emit, R, io, stage,
+          clear: () => { if (lessonFlow.active === active) lessonFlow.active = null; },
+        });
+      } else if (active.status !== 'ending') {
+        active.status = 'ending';
+        active.endingSince = new Date().toISOString();
+        stage('end-requested', 'Stopping traffic and cancelling in-progress work.');
+        endLessonRun(run, {
+          active, emit, R, io, stage,
+          clear: () => { if (lessonFlow.active === active) lessonFlow.active = null; },
+        });
+      }
+      return send(res, 202, { ending: true, lesson: active.lesson, run: run.id, status: active.status });
+    }
+    if (req.method === 'POST' && path === '/api/lesson/migrate') {
+      if (!lessonFlow.migration) return send(res, 400, { error: 'No inherited environments to resolve.' });
+      let input;
+      try { input = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
+      const target = lessonFlow.migration.runs.find((r) => r.id === input.id);
+      if (!target) return send(res, 404, { error: `Unknown inherited run: ${input.id}` });
+      if (input.action === 'resume') {
+        if (lessonFlow.migration.runs.length > 1) {
+          return send(res, 409, { error: 'End the other inherited environments first; only the last one can be resumed into the single slot.', migration: lessonFlow.migration });
+        }
+        const run = R.runs.get(target.id);
+        if (!run || run.status === 'deleted' || run.status === 'failed') return send(res, 409, { error: 'That environment is already gone; end it instead.' });
+        lessonFlow.migration = null;
+        lessonFlow.active = { lesson: run.lesson, runId: run.id, status: 'ready', stages: [{ at: new Date().toISOString(), stage: 'resumed', detail: `Resumed inherited ${run.ns}; it was the last one, so the single slot is now held normally.` }], error: null, startedAt: new Date().toISOString(), resumed: true };
+        return send(res, 200, { resumed: run.id, active: lessonFlow.active });
+      }
+      if (input.action === 'end') {
+        const run = R.runs.get(target.id);
+        if (run && run.status !== 'deleted' && run.status !== 'failed') {
+          if (run.load?.active) await run.load.stop('stopped by migration cleanup').catch(() => {});
+          if (run.queue?.active) await run.queue.stop('stopped by migration cleanup').catch(() => {});
+          try {
+            await R.cleanupRun(run.id, io.resultsDir);
+          } catch (error) {
+            return send(res, 502, { error: `Cleanup failed and is retained for retry: ${error.message}` });
+          }
+        }
+        lessonFlow.migration.runs = lessonFlow.migration.runs.filter((r) => r.id !== target.id);
+        if (!lessonFlow.migration.runs.length) lessonFlow.migration = null;
+        return send(res, 200, { ended: target.id, migration: lessonFlow.migration });
+      }
+      return send(res, 400, { error: 'Unknown migration action. Expected resume or end.' });
+    }
     const runMatch = path.match(/^\/api\/runs\/([A-Za-z0-9-]+)(\/(timeline|load|run|cluster|actions))?$/);
     if (runMatch) {
       let run;
       try { run = getRun(runMatch[1]); } catch (error) { return send(res, 400, { error: error.message }); }
       if (!run) return send(res, 404, { error: `Unknown run: ${runMatch[1]}` });
       const sub = runMatch[3];
+      // Single allocation: mutating calls address the active environment;
+      // reads of gone runs stay open. Inherited runs resolve via migration.
+      if (lessonFlow.migration && req.method !== 'GET') return send(res, 409, { error: 'Resolve the inherited environments first (GET /api/lesson).' });
+      if (lessonFlow.active && lessonFlow.active.runId !== run.id && !['deleted', 'failed'].includes(run.status) && req.method !== 'GET') {
+        return send(res, 409, { error: `Lesson ${lessonFlow.active.lesson} holds the single environment.`, active: lessonFlow.active });
+      }
       if (req.method === 'GET' && !sub) {
         const key = `run:${run.id}`;
         const pred = state.predictions[key];
@@ -421,11 +642,13 @@ function summarizeAction(s) {
       if (req.method === 'GET' && sub === 'timeline') return send(res, 200, run.timeline);
       if (req.method === 'GET' && sub === 'cluster') return send(res, 200, await R.runClusterState(run.id));
       if (req.method === 'POST' && sub === 'run') {
-        const valid = ['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus'];
+        const valid = [...R.RUN_LESSONS];
         let input;
         try { input = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
         if (!valid.includes(input.id)) return send(res, 400, { error: 'Unknown scenario' });
         if (input.id !== run.lesson) return send(res, 400, { error: `Scenario ${input.id} does not belong to run ${run.id} (lesson ${run.lesson}).` });
+        let options = {};
+        try { options = scenarioOptions(input.id, input.options); } catch (error) { return send(res, 400, { error: error.message }); }
         if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before running scenarios.` });
         if (run.scenarioRunning) return send(res, 409, { error: 'A scenario is already running in this run.' });
         if (run.actionRunning) return send(res, 409, { error: 'A learner action is running in this run. Wait for it before the one-click scenario.' });
@@ -436,15 +659,24 @@ function summarizeAction(s) {
         run.mode = input.mode;
         run.result = null;
         run.error = null;
+        run.cancel = { requested: false };
         run.experimentAt = new Date().toISOString();
         send(res, 202, { started: true });
         const stopObs = observeRun(run);
         io.runScenario(input.id, {
           mode: input.mode, namespace: run.ns, endpoint: `http://127.0.0.1:${run.forwardPort}`,
-          rateQuery: io.rateQueryForRun(run.id), upQuery: io.upQueryForRun(run.id),
+          rateQuery: io.rateQueryForRun(run.id), upQuery: io.upQueryForRun(run.id), options,
+          cancel: () => Boolean(run.cancel?.requested),
         }, (t, d) => runEmit(run, t, d))
           .then((result) => { run.result = result; runEmit(run, 'result', { status: result.status }); })
-          .catch((error) => { run.error = error.message; runEmit(run, 'error', { text: error.message }); })
+          .catch((error) => {
+            if (error?.code === 'CANCELLED') {
+              run.result = { status: 'cancelled', checks: [], evidence: { note: 'Ended by the learner before completion: partial events above are the honest trail, never a pass.' } };
+              runEmit(run, 'result', { status: 'cancelled' });
+            } else {
+              run.error = error.message; runEmit(run, 'error', { text: error.message });
+            }
+          })
           .finally(() => { run.scenarioRunning = false; stopObs(); });
         return;
       }
@@ -654,6 +886,17 @@ function summarizeAction(s) {
         if (run.status === 'ready') wireRunLoad(run);
         emit('note', { text: `Re-adopted run ${run.id} (${run.ns}): ${run.status}${run.error ? ' — ' + run.error : ''}. Previous in-memory events are gone; archive files persist.` });
       }
+      // Single-lesson reconciliation: 0 → nothing; 1 → resume it as the
+      // active lesson; >1 → one-time explicit migration choice (never silent
+      // deletes; normal new sessions never see this).
+      const live = adopted.filter((r) => !['deleted', 'failed'].includes(r.status));
+      if (live.length === 1) {
+        const only = live[0];
+        only.cancel = { requested: false };
+        lessonFlow.active = { lesson: only.lesson, runId: only.id, status: only.status === 'ready' ? 'ready' : 'degraded', stages: [{ at: new Date().toISOString(), stage: 'resumed', detail: `Reconnected to ${only.ns} after restart; no duplicate created.` }], error: only.error || null, startedAt: only.createdAt, resumed: true };
+      } else if (live.length > 1) {
+        lessonFlow.migration = { runs: live.map((r) => ({ id: r.id, lesson: r.lesson, status: r.status, namespace: r.ns })) };
+      }
     } catch (error) {
       emit('error', { text: `Startup recovery failed: ${error.message}` });
     } finally {
@@ -671,7 +914,7 @@ function summarizeAction(s) {
     else return new Promise((resolve) => server.close(resolve));
   }
 
-  return { server, state, boot, isBooted: () => booted, close };
+  return { server, state, boot, isBooted: () => booted, close, lessonFlow };
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

@@ -1,8 +1,6 @@
-// UI regression: out-of-order /api/state responses must not flip selection.
-// Two same-lesson runs (A retained, B fresh). The first state response is
-// delayed 4s and carries only A; newer responses carry A+B with B selected.
-// Asserts B stays selected and A-only data never renders into B's panel.
-// Exits nonzero on failure. Requires one free slot; cleans up only run B.
+// Single-allocation race: two tabs start two different lessons at once.
+// Exactly one Start returns 202; the other 409s and provisions nothing.
+// Exits nonzero on failure. Ends the winner; never touches retained history.
 import { chromium } from 'playwright-core';
 
 const BASE = process.argv[2] || 'http://127.0.0.1:4173';
@@ -13,79 +11,51 @@ const check = (name, cond) => {
 };
 
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
-const page = await browser.newPage();
-const jsErrors = [];
-page.on('pageerror', (e) => jsErrors.push(`pageerror: ${e.message}`));
-page.on('unhandledrejection', (r) => jsErrors.push(`unhandled: ${String(r).slice(0, 200)}`));
+const a = await browser.newPage();
+const b = await browser.newPage();
+for (const p of [a, b]) {
+  p.on('pageerror', (e) => { console.log(`FAIL pageerror: ${e.message}`); failures += 1; });
+}
+await a.goto(BASE, { waitUntil: 'networkidle' });
+await b.goto(BASE, { waitUntil: 'networkidle' });
 
-await page.goto(BASE, { waitUntil: 'networkidle' });
-const st0 = await page.evaluate(() => fetch('/api/state').then((r) => r.json()));
-const live0 = (st0.runs || []).filter((r) => r.status === 'ready' || r.status === 'creating');
-if (live0.length >= (st0.maxActiveRuns || 2)) {
-  console.log('ABORT: no free run slot.');
+const flowA = await a.evaluate(() => fetch('/api/lesson').then((r) => r.json()));
+if (flowA.active) {
+  console.log('ABORT: a lesson is already active; ending it here would touch someone else’s environment.');
   await browser.close();
   process.exit(2);
 }
-const retainedA = live0[0]?.id || null;
-console.log('retained:', retainedA);
 
-// Create run B (connections) via API and wait until ready.
-const created = await page.evaluate(() => fetch('/api/runs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ lesson: 'connections' }) }).then((r) => r.json()));
-if (!created.id) { console.log('ABORT: creation failed', JSON.stringify(created)); await browser.close(); process.exit(2); }
-const runB = created.id;
+// Fire both starts concurrently from independent tabs.
+const [ra, rb] = await Promise.all([
+  a.evaluate(() => fetch('/api/lesson/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ lesson: 'connections' }) }).then((r) => r.status)),
+  b.evaluate(() => fetch('/api/lesson/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ lesson: 'rollout' }) }).then((r) => r.status)),
+]);
+console.log(`start statuses: tabA=${ra} tabB=${rb}`);
+check('exactly one winner', (ra === 202 && rb === 409) || (ra === 409 && rb === 202));
+
+// The loser provisioned nothing: at most one owned namespace may exist.
+const winner = ra === 202 ? a : b;
+let f = null;
 for (let i = 0; i < 40; i++) {
-  await page.waitForTimeout(5000);
-  const s = await page.evaluate(() => fetch('/api/state').then((r) => r.json()));
-  const rec = (s.runs || []).find((x) => x.id === runB);
-  if (rec && rec.status === 'ready') break;
+  await winner.waitForTimeout(5000);
+  f = await winner.evaluate(() => fetch('/api/lesson').then((r) => r.json()));
+  if (f.active?.status === 'ready' || f.active?.status === 'failed') break;
 }
-// Go to connections lesson and select B explicitly.
-await page.click('.lesson-link[data-index="0"]');
-await page.waitForTimeout(1000);
-await page.selectOption('#run-select', runB);
-await page.waitForTimeout(2000);
-check('B selected', (await page.evaluate(() => window.labRun)) === runB);
-
-// Delay the next /api/state response 4s and serve an A-only snapshot,
-// simulating a slow out-of-order poll from before B existed/was selected.
-let delayedOnce = false;
-await page.route('**/api/state', async (route) => {
-  if (!delayedOnce) {
-    delayedOnce = true;
-    await new Promise((r) => setTimeout(r, 4000));
-    const real = await fetch(`${BASE}/api/state`).then((r) => r.json());
-    real.runs = (real.runs || []).filter((r) => r.id !== runB);
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(real) });
-  } else {
-    await route.continue();
+check('winner reaches a terminal start state', ['ready', 'failed'].includes(f?.active?.status));
+const states = await winner.evaluate(() => fetch('/api/state').then((r) => r.json()));
+const live = (states.runs || []).filter((r) => !['deleted', 'failed'].includes(r.status));
+check('single allocation holds across tabs', live.length <= 1);
+if (f?.active) {
+  await winner.evaluate(() => fetch('/api/lesson/end', { method: 'POST' }));
+  let ended = false;
+  for (let i = 0; i < 48; i++) {
+    await winner.waitForTimeout(5000);
+    const g = await winner.evaluate(() => fetch('/api/lesson').then((r) => r.json()));
+    if (g.active === null) { ended = true; break; }
   }
-});
-await page.waitForTimeout(9000); // let the stale response land between fresh polls
-check('selection still B after stale response', (await page.evaluate(() => window.labRun)) === runB);
-check('panel never rendered A-only data', (await page.textContent('#run-panel-state')).includes(runB));
-await page.unroute('**/api/state');
-
-// Section 2: a delayed timeline response for the previous selection must not
-// paint into the newly selected lesson/run.
-let delayedTimelineOnce = false;
-await page.route('**/api/runs/*/timeline', async (route) => {
-  const url = route.request().url();
-  if (!delayedTimelineOnce && url.includes(`/api/runs/${runB}/timeline`)) {
-    delayedTimelineOnce = true;
-    await new Promise((r) => setTimeout(r, 4000));
-  }
-  await route.continue();
-});
-await page.click('.lesson-link[data-index="6"]'); // switch to Prometheus/A
-await page.waitForTimeout(8000); // let the stale B timeline land mid-flight
-const head = await page.textContent('#prometheus-rate');
-check('late B timeline never painted into A view', /requests \/ second|stale —/.test(head));
-await page.unroute('**/api/runs/*/timeline');
-
-// Cleanup owned run B only.
-await page.evaluate(async (id) => { await fetch(`/api/runs/${id}`, { method: 'DELETE' }); }, runB);
-console.log(`js errors: ${jsErrors.length ? jsErrors.join(' | ') : 'none'}`);
-if (jsErrors.length) failures += 1;
+  check('winner ends cleanly', ended);
+}
 await browser.close();
-console.log(failures ? `FAILED (${failures})` : 'RACE REGRESSION PASSED');
+console.log(failures ? `FAILED (${failures})` : 'RACE CHECKS PASSED');
 process.exit(failures ? 1 : 0);

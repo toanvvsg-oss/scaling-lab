@@ -1,0 +1,17 @@
+# VPA in recommendation mode (lesson 09 cloud continuation): observe
+# rightsizing guidance WITHOUT changing live requests, so the HPA keeps its
+# denominator while you learn. Check current GKE VPA/HPA compatibility
+# guidance before combining modes in production.
+# Docs: https://docs.cloud.google.com/kubernetes-engine/docs/concepts/verticalpodautoscaler
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: app-recommender
+  namespace: scaling-lab
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: app
+  updatePolicy:
+    updateMode: "Off"

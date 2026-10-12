@@ -1,0 +1,86 @@
+# GKE load-balancer lifecycle exercise (lesson 15 cloud continuation).
+#
+# CLOUD EXECUTION IS PENDING EXPLICIT CONFIGURATION. Nothing here is applied
+# by the lab: replace every <GKE_*> placeholder, export the required
+# variables, and run the documented commands yourself against YOUR project.
+# Required: GKE_PROJECT, GKE_REGION, GKE_CLUSTER, GKE_CONTEXT.
+# The lab only validates these artifacts locally (node scripts/gke-validate.mjs).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: scaling-lab-gateway
+  namespace: scaling-lab
+  annotations:
+    networking.gke.io/project: <GKE_PROJECT>
+spec:
+  gatewayClassName: gke-l7-regional
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+  addresses:
+    - type: NamedAddress
+      value: scaling-lab-ip-<GKE_REGION>
+---
+# Route learner traffic to the lab Service. The local analogue of this route
+# is the dashboard's per-run edge Service; on GKE the attachment, health
+# check, and drain below decide what clients actually observe.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: scaling-lab-route
+  namespace: scaling-lab
+spec:
+  parentRefs:
+    - name: scaling-lab-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+          value: /
+      backendRefs:
+        - name: app
+          port: 3000
+---
+# Health checking: the backend must observe the SAME readiness the lab uses
+# locally (/health/ready). A check against / would mark draining pods healthy
+# and hide the drain window this lesson measures.
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: scaling-lab-health
+  namespace: scaling-lab
+spec:
+  default:
+    checkIntervalSec: 5
+    timeoutSec: 3
+    healthyThreshold: 2
+    unhealthyThreshold: 2
+    config:
+      type: HTTP
+      httpHealthCheck:
+        port: 3000
+        requestPath: /health/ready
+  targetRef:
+    group: ""
+    kind: Service
+    name: app
+---
+# Backend behavior: fail fast at the edge and bound the drain window so a
+# rollout cannot hold clients past the pod's real shutdown budget (locally:
+# 2s preStop + 24s app deadline inside a 30s grace period).
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: scaling-lab-backend
+  namespace: scaling-lab
+spec:
+  default:
+    timeoutSec: 30
+  targetRef:
+    group: ""
+    kind: Service
+    name: app

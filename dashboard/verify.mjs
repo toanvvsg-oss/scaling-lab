@@ -4,7 +4,7 @@ import { runScenario } from './runner.mjs';
 
 const id = process.argv[2] || 'connections';
 const mode = process.argv[3] || 'graceful';
-const allowed = new Set(['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus']);
+const allowed = new Set(['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus', 'capacity', 'hpareact', 'pending', 'resources', 'signals', 'downstream', 'disruptions', 'gateway', 'capstone']);
 if (!allowed.has(id)) { console.error(`Unknown scenario: ${id}`); process.exit(2); }
 const events = [];
 const report = { scenario: id, mode, started: new Date().toISOString(), events };
@@ -25,4 +25,9 @@ await mkdir(directory, { recursive: true });
 const filename = `${id}-${Date.now()}.json`;
 await writeFile(resolve(directory, filename), JSON.stringify(report, null, 2));
 console.log(`Evidence: results/${filename}`);
-if (report.error || report.result?.status !== 'pass') process.exitCode = 1;
+const failed = Boolean(report.error || report.result?.status !== 'pass');
+// Explicit exit: keepalive agents can retain refused-connection socket
+// handles (a Node userland quirk: agent.destroy() does not reap sockets that
+// errored before connect). Evidence is flushed above, so exiting here loses
+// nothing; the long-lived dashboard server is unaffected.
+process.exit(failed ? 1 : 0);

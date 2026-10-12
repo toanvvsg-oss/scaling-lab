@@ -39,10 +39,36 @@ export const realDeps = {
 };
 
 export const MAX_ACTIVE_RUNS = 7;
-// Every lesson can run isolated. Only the autoscaling lessons add a scaler;
-// the other five get app + edge only.
-export const RUN_LESSONS = new Set(['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus']);
-const SCALER_LESSON = { autoscale: 'cpu-hpa', prometheus: 'keda' };
+// Every lesson can run isolated. Autoscaling lessons add a scaler; capacity
+// runs a single pod with no scaler; the rest get app + edge only.
+export const RUN_LESSONS = new Set(['connections', 'timeouts', 'shutdown', 'rollout', 'streaming', 'autoscale', 'prometheus',
+  'capacity', 'resources', 'hpareact', 'signals', 'downstream', 'pending', 'disruptions', 'gateway', 'capstone']);
+// Per-lesson run shape: replica count and optional scaler. Bounded laptop
+// footprint: at most 3 app pods + 1 edge pod per run (disruptions uses 3 so a
+// PDB can block while one pod stays serving).
+export const RUN_CONFIG = {
+  connections: { replicas: 2, scaler: null },
+  timeouts: { replicas: 2, scaler: null },
+  shutdown: { replicas: 2, scaler: null },
+  rollout: { replicas: 2, scaler: null },
+  streaming: { replicas: 2, scaler: null },
+  autoscale: { replicas: 2, scaler: 'cpu-hpa' },
+  prometheus: { replicas: 2, scaler: 'keda' },
+  capacity: { replicas: 1, scaler: null },
+  resources: { replicas: 2, scaler: 'cpu-hpa' },
+  hpareact: { replicas: 2, scaler: 'cpu-hpa' },
+  signals: { replicas: 2, scaler: null },
+  downstream: { replicas: 2, scaler: null },
+  pending: { replicas: 2, scaler: null },
+  disruptions: { replicas: 3, scaler: null },
+  gateway: { replicas: 2, scaler: null },
+  capstone: { replicas: 2, scaler: 'cpu-hpa' },
+};
+export function runConfig(lesson) {
+  const cfg = RUN_CONFIG[lesson];
+  if (!cfg) throw new Error(`Unknown run lesson: ${lesson}.`);
+  return cfg;
+}
 const RUN_ID_RE = /^[a-z0-9]{8}$/;
 
 export function createRunId() {
@@ -58,6 +84,43 @@ export function validateRunId(id) {
 
 export function namespaceFor(runId) {
   return `scaling-run-${validateRunId(runId)}`;
+}
+
+// Lesson prerequisites against shared infrastructure (single-lesson Start
+// reports these as understandable stages; missing items produce actionable
+// setup guidance, never silent provisioning or cluster mutation).
+const PREREQ_GUIDANCE = {
+  cluster: 'The kind-scaling-lab cluster is unreachable. Recreate the lab (make up), then Start again — Start never recreates a cluster by itself.',
+  metrics: 'The metrics server is missing. Run: make hpa-up — then Start again.',
+  prometheus: 'Prometheus is missing. Run: make prometheus-up — then Start again.',
+  keda: 'KEDA is missing. Run: make prometheus-up — then Start again.',
+};
+const LESSON_PREREQS = {
+  autoscale: ['cluster', 'metrics'],
+  hpareact: ['cluster', 'metrics'],
+  resources: ['cluster', 'metrics'],
+  capstone: ['cluster', 'metrics'],
+  prometheus: ['cluster', 'prometheus', 'keda'],
+  signals: ['cluster', 'prometheus'],
+};
+
+export async function checkLessonPrereqs(lesson, deps = realDeps) {
+  const wants = LESSON_PREREQS[lesson] || ['cluster'];
+  const checks = [];
+  const need = async (name, args) => {
+    try {
+      await deps.exec(['--context', 'kind-scaling-lab', ...args]);
+      checks.push({ name, ok: true });
+    } catch {
+      checks.push({ name, ok: false, guidance: PREREQ_GUIDANCE[name] });
+    }
+  };
+  if (wants.includes('cluster')) await need('cluster', ['get', 'nodes', '--no-headers']);
+  if (wants.includes('metrics')) await need('metrics', ['-n', 'kube-system', 'get', 'deployment', 'metrics-server', '-o', 'name']);
+  if (wants.includes('prometheus')) await need('prometheus', ['-n', 'scaling-lab', 'get', 'deployment', 'prometheus', '-o', 'name']);
+  if (wants.includes('keda')) await need('keda', ['-n', 'keda', 'get', 'deployment', 'keda-operator', '-o', 'name']);
+  const missing = checks.filter((c) => !c.ok);
+  return { ok: missing.length === 0, checks, missing };
 }
 
 export const runs = new Map();
@@ -140,14 +203,62 @@ realDeps.forward = startEdgeForwardReal;
 
 const APP_IMAGE = 'scaling-lab-app:local';
 
-function appManifests(runId, ns) {
+function appEnvFor(lesson, ns) {
+  const base = [
+    { name: 'SHUTDOWN_MODE', value: 'graceful' },
+    { name: 'SHUTDOWN_MS', value: '24000' },
+  ];
+  // Lesson 12 calls an isolated in-namespace dependency with a bounded pool.
+  if (lesson === 'downstream') {
+    base.push({ name: 'UPSTREAM_URL', value: `http://dep.${ns}.svc.cluster.local:3000` });
+    base.push({ name: 'DEP_POOL', value: '2' });
+    base.push({ name: 'DEP_TIMEOUT_MS', value: '1500' });
+    base.push({ name: 'DEP_RETRIES', value: '0' });
+    base.push({ name: 'DEP_BACKOFF_MS', value: '100' });
+  }
+  return base;
+}
+
+function depManifests(ns) {
+  return [
+    {
+      apiVersion: 'apps/v1', kind: 'Deployment',
+      metadata: { name: 'dep', namespace: ns },
+      spec: {
+        replicas: 1,
+        selector: { matchLabels: { app: 'scaling-dep' } },
+        template: {
+          metadata: { labels: { app: 'scaling-dep' } },
+          spec: {
+            terminationGracePeriodSeconds: 15,
+            containers: [{
+              name: 'dep', image: APP_IMAGE, imagePullPolicy: 'Never',
+              ports: [{ containerPort: 3000 }],
+              env: [{ name: 'SHUTDOWN_MODE', value: 'graceful' }, { name: 'SHUTDOWN_MS', value: '10000' }],
+              resources: { requests: { cpu: '100m', memory: '64Mi' }, limits: { cpu: '1', memory: '128Mi' } },
+              readinessProbe: { httpGet: { path: '/health/ready', port: 3000 }, periodSeconds: 1 },
+            }],
+          },
+        },
+      },
+    },
+    {
+      apiVersion: 'v1', kind: 'Service',
+      metadata: { name: 'dep', namespace: ns },
+      spec: { selector: { app: 'scaling-dep' }, ports: [{ name: 'http', port: 3000, targetPort: 3000 }] },
+    },
+  ];
+}
+
+function appManifests(runId, ns, lesson = 'connections') {
+  const { replicas } = runConfig(lesson);
   const podLabels = { app: 'scaling-app', labrun: runId };
   return [
     {
       apiVersion: 'apps/v1', kind: 'Deployment',
       metadata: { name: 'app', namespace: ns, labels: { ...podLabels, 'scaling.lab/run': runId } },
       spec: {
-        replicas: 2,
+        replicas,
         strategy: { rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } },
         selector: { matchLabels: podLabels },
         template: {
@@ -157,7 +268,7 @@ function appManifests(runId, ns) {
             containers: [{
               name: 'app', image: APP_IMAGE, imagePullPolicy: 'Never',
               ports: [{ containerPort: 3000 }],
-              env: [{ name: 'SHUTDOWN_MODE', value: 'graceful' }, { name: 'SHUTDOWN_MS', value: '24000' }],
+              env: appEnvFor(lesson, ns),
               resources: { requests: { cpu: '100m', memory: '64Mi' }, limits: { cpu: '1', memory: '128Mi' } },
               lifecycle: { preStop: { exec: { command: ['node', '/app/prestop.mjs'] } } },
               startupProbe: { httpGet: { path: '/health/live', port: 3000 }, periodSeconds: 1, failureThreshold: 20 },
@@ -327,17 +438,17 @@ export function parseHpa(items) {
   };
 }
 
-async function waitRunReady(runId, deps) {
+async function waitRunReady(runId, deps, expected = 2) {
   const until = Date.now() + 120000;
   let last = null;
   while (Date.now() < until) {
     last = await runClusterState(runId, deps);
-    if (last.connected && last.pods.length === 2
+    if (last.connected && last.pods.length === expected
       && last.pods.every((p) => p.ready && !p.terminating)
-      && last.endpoints.filter((e) => e.ready && !e.terminating).length >= 2) return last;
+      && last.endpoints.filter((e) => e.ready && !e.terminating).length >= expected) return last;
     await deps.sleep(2000);
   }
-  throw new Error(`Run ${runId} did not settle to exactly two Ready app pods (saw ${last?.pods.length ?? '?'} pods). Check kubectl --context kind-scaling-lab -n ${namespaceFor(runId)} get pods.`);
+  throw new Error(`Run ${runId} did not settle to exactly ${expected} Ready app pods (saw ${last?.pods.length ?? '?'} pods). Check kubectl --context kind-scaling-lab -n ${namespaceFor(runId)} get pods.`);
 }
 
 async function verifyRunScrape(runId, deps) {
@@ -377,8 +488,9 @@ export function describeRun(run) {
     actions: run.actions || 0,
     resultStatus: run.result?.status || null,
     resources: {
-      appReplicas: 2, appCpuRequest: '100m', appMemoryRequest: '64Mi',
-      edgeReplicas: 1, note: 'Fixed footprint per run: 2 app pods (100m/64Mi each) + 1 edge pod. Active-run limit keeps laptop usage bounded.',
+      appReplicas: runConfig(run.lesson).replicas, appCpuRequest: '100m', appMemoryRequest: '64Mi',
+      edgeReplicas: 1, scaler: runConfig(run.lesson).scaler || 'none',
+      note: 'Fixed footprint per run: 1–3 app pods (100m/64Mi each) + 1 edge pod. Active-run limit keeps laptop usage bounded.',
     },
   };
 }
@@ -411,22 +523,28 @@ export async function finishRun(run, onEvent, deps = realDeps) {
     step('create-namespace', `Creating namespace ${ns} with run/lesson/owner labels.`);
     await deps.apply(null, namespaceManifest(id, lesson));
     step('apply-manifests', 'Applying fixed app, edge, and scaler manifests scoped to the run namespace.');
-    const objs = [...appManifests(id, ns), ...edgeManifests(ns)];
-    if (SCALER_LESSON[lesson] === 'keda') objs.push(scaledObjectManifest(id, ns));
-    if (SCALER_LESSON[lesson] === 'cpu-hpa') objs.push(cpuHpaManifest(ns));
+    const { scaler } = runConfig(lesson);
+    const objs = [...appManifests(id, ns, lesson), ...edgeManifests(ns)];
+    if (lesson === 'downstream') objs.push(...depManifests(ns));
+    if (scaler === 'keda') objs.push(scaledObjectManifest(id, ns));
+    if (scaler === 'cpu-hpa') objs.push(cpuHpaManifest(ns));
     for (const obj of objs) {
       await deps.apply(ns, obj);
     }
     step('wait-rollout', 'Waiting for app and edge rollouts.');
     await deps.exec(kubectlBase(ns).concat(['rollout', 'status', 'deployment/app', '--timeout=180s'])).then((r) => r.stdout);
     await deps.exec(kubectlBase(ns).concat(['rollout', 'status', 'deployment/edge', '--timeout=180s'])).then((r) => r.stdout);
-    step('wait-ready', 'Waiting for exactly two Ready, non-terminating app pods and Ready endpoints.');
-    await waitRunReady(id, deps);
+    step('wait-ready', `Waiting for exactly ${runConfig(lesson).replicas} Ready, non-terminating app pods and Ready endpoints.`);
+    await waitRunReady(id, deps, runConfig(lesson).replicas);
     if (lesson === 'prometheus') {
-      step('verify-scrape', `Verifying Prometheus scrapes both run targets (${upQueryForRun(id)}).`);
+      step('verify-scrape', `Verifying Prometheus scrapes all run targets (${upQueryForRun(id)}).`);
       var targets = await verifyRunScrape(id, deps);
     }
-    if (lesson === 'autoscale') {
+    if (scaler === 'keda') {
+      step('verify-scaler', 'Verifying the KEDA ScaledObject is present for the run deployment.');
+      await deps.exec(kubectlBase(ns).concat(['get', 'scaledobject', 'app-prometheus', '-o', 'name']));
+    }
+    if (scaler === 'cpu-hpa') {
       step('verify-scaler', 'Verifying the CPU HPA is present for the run deployment.');
       await deps.exec(kubectlBase(ns).concat(['get', 'hpa', 'app', '-o', 'name']));
     }
@@ -434,7 +552,7 @@ export async function finishRun(run, onEvent, deps = realDeps) {
     const fwd = await deps.forward(id);
     run.forward = fwd; run.forwardPort = fwd.port;
     run.status = 'ready';
-    pushMilestone(run.timeline, { kind: 'run', text: `Run ${id} ready in ${ns}${lesson === 'prometheus' ? ` (${targets} Prometheus targets)` : lesson === 'autoscale' ? ' (CPU HPA active)' : ''}.`, detail: 'Traffic for this run is routed to its own edge; other runs are unaffected.', observer: 'run controller' });
+    pushMilestone(run.timeline, { kind: 'run', text: `Run ${id} ready in ${ns} (${runConfig(lesson).replicas} app pod(s)${lesson === 'prometheus' ? `, ${targets} Prometheus targets` : scaler === 'keda' ? ', KEDA scaler active' : scaler === 'cpu-hpa' ? ', CPU HPA active' : ', autoscaling disabled'})}.`, detail: 'Traffic for this run is routed to its own edge; other runs are unaffected.', observer: 'run controller' });
     return run;
   } catch (error) {
     // Creation rollback is idempotent: delete --ignore-not-found waits for
@@ -463,7 +581,9 @@ export function buildArchive(run) {
   return {
     run: run.id, lesson: run.lesson, namespace: run.ns, createdAt: run.createdAt,
     archivedAt: new Date().toISOString(), status: run.status, error: run.error,
+    ended: run.ended || null,
     steps: run.steps, load: run.load ? run.load.state() : null,
+    queue: run.queue ? run.queue.stats() : null,
     result: run.result, timeline: run.timeline, events: run.events,
   };
 }
@@ -485,9 +605,11 @@ export async function cleanupRun(runId, resultsDir, deps = realDeps) {
   };
   try {
     // Stop traffic first and await in-flight requests, so final counts are
-    // stable before the snapshot is taken.
+    // stable before the snapshot is taken. Queue exercises stop too: their
+    // drain settles every in-flight request, keeping the archive immutable.
     progress('stop-traffic', 'Stopping traffic and waiting for in-flight requests…', 0);
     if (run.load?.active) await run.load.stop('stopped by run cleanup');
+    if (run.queue?.active) await run.queue.stop('stopped by run cleanup');
     progress('archive-evidence', 'Saving and verifying the evidence snapshot…', 1);
     const archive = structuredClone(buildArchive(run));
     try {

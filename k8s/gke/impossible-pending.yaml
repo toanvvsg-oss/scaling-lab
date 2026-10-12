@@ -1,0 +1,29 @@
+# Impossible scheduling constraint for the GKE continuation of lesson 13.
+# Apply against an EXPLICIT context only; delete afterwards. On GKE this
+# demonstrates a Pending reason the cluster autoscaler cannot fix (no node
+# will ever match), unlike a resource-driven scale-up. kind never autoscales
+# nodes — the local lesson labels that explicitly.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: impossible-demo
+  namespace: scaling-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: impossible-demo
+  template:
+    metadata:
+      labels:
+        app: impossible-demo
+    spec:
+      nodeSelector:
+        scaling.lab/nonexistent: "true"
+      containers:
+        - name: demo
+          image: nginx:1.27-alpine
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi

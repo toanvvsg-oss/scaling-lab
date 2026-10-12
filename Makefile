@@ -18,7 +18,13 @@ up:
 
 check:
 	$(KUBECTL) -n scaling-lab get deployments,pods,services
-	curl --fail --silent --show-error http://127.0.0.1:8080/health/ready
+	@for i in 1 2 3 4 5 6; do \
+	  if curl --fail --silent --show-error --connect-timeout 3 --max-time 5 http://127.0.0.1:8080/health/ready; then \
+	    echo; break; \
+	  fi; \
+	  if [ $$i -eq 6 ]; then echo 'edge readiness did not succeed within ~60s (6 tries, 5s curl cap + 5s sleep)'; exit 1; fi; \
+	  sleep 5; \
+	done
 
 dashboard:
 	node dashboard/server.mjs
@@ -45,7 +51,7 @@ reset:
 
 hpa-up:
 	$(KUBECTL) -n scaling-lab delete scaledobject app-prometheus --ignore-not-found
-	$(KUBECTL) apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+	$(KUBECTL) apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.9.0/components.yaml
 	$(KUBECTL) -n kube-system patch deployment metrics-server --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
 	$(KUBECTL) -n kube-system rollout status deployment/metrics-server --timeout=180s
 	$(KUBECTL) apply -f k8s/hpa.yaml
@@ -56,7 +62,7 @@ prometheus-up: up
 	$(KUBECTL) apply -f k8s/prometheus.yaml
 	$(KUBECTL) -n scaling-lab rollout status deployment/prometheus --timeout=180s
 	helm repo add kedacore https://kedacore.github.io/charts --force-update
-	helm upgrade --install keda kedacore/keda --version 2.17.3 --namespace keda --create-namespace --kube-context $(CTX) --wait --timeout 5m
+	helm upgrade --install keda kedacore/keda --version 2.21.0 --namespace keda --create-namespace --kube-context $(CTX) --wait --timeout 5m
 	$(KUBECTL) apply -f k8s/prometheus-scaledobject.yaml
 	$(KUBECTL) -n scaling-lab get scaledobject,hpa
 

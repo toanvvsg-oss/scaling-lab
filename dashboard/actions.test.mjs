@@ -148,3 +148,91 @@ test('start-long reports HTTP status when no pod is ever reached', async () => {
   await assert.rejects(runAction(run, 'start-long', {}, () => {}, deps), /HTTP 502/);
   assert.equal(run.pendingLong, null, 'no slot held without a serving pod');
 });
+
+test('pending constrain/restore use injected kubectl only', async () => {
+  const run = runFor('pending');
+  const deps = fakeDeps();
+  const out = await runAction(run, 'constrain', {}, () => {}, deps);
+  assert.equal(out.constrained, true);
+  assert.ok(deps.calls.some((c) => c.includes('nodeSelector') && c.includes('scaling.lab/nonexistent')), 'constraint patch scoped to the run deployment');
+  assert.ok(deps.calls.some((c) => c.includes('scale') && c.includes('--replicas=5')), 'scale to 5 via injected kubectl');
+  const back = await runAction(run, 'restore', {}, () => {}, deps);
+  assert.equal(back.restored, true);
+  assert.ok(deps.calls.some((c) => c.includes('--replicas=2')), 'restore scales back via injected kubectl');
+});
+
+test('resources actions patch valid pairs and report OOM evidence', async () => {
+  const run = runFor('resources');
+  const deps = fakeDeps();
+  const raised = await runAction(run, 'raise-request', {}, () => {}, deps);
+  assert.equal(raised.cpuRequest, '400m');
+  assert.ok(deps.calls.some((c) => c.includes('requests') && c.includes('400m')));
+  const tight = await runAction(run, 'tighten-limit', {}, () => {}, deps);
+  assert.equal(tight.cpuLimit, '150m');
+  const patch = deps.calls.find((c) => c.includes('150m'));
+  assert.ok(patch.includes('100m'), 'tighten sets request 100m together with limit 150m (request never exceeds limit)');
+  const oomDeps = fakeDeps();
+  const origOomKubectl = oomDeps.kubectlIn;
+  oomDeps.kubectlIn = async (...a) => {
+    const s = a.join(' ');
+    if (s.includes('get pods')) {
+      return JSON.stringify({ items: [{ metadata: { name: 'app-x-1' }, status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 1, lastState: { terminated: { reason: 'OOMKilled' } } }] } }] });
+    }
+    return origOomKubectl(...a);
+  };
+  const oom = await runAction(run, 'oom-burst', {}, () => {}, oomDeps);
+  assert.equal(oom.restarts, 1);
+  assert.match(oom.reason || '', /OOMKilled/);
+  const back = await runAction(run, 'restore-res', {}, () => {}, deps);
+  assert.equal(back.restored, true);
+});
+
+test('disruptions actions use injected apply and eviction', async () => {
+  const run = runFor('disruptions');
+  const deps = fakeDeps();
+  deps.apply = async (ns, obj) => { deps.calls.push(`apply ${obj.kind}/${obj.metadata.name} maxUnavailable=${obj.spec.maxUnavailable}`); };
+  deps.evictRaw = async (ns, pod) => { deps.calls.push(`evict ${pod}`); return { code: 0, out: 'eviction created', err: '' }; };
+  deps.kubectlIn = async (...a) => {
+    const s = a.join(' ');
+    deps.calls.push(s);
+    if (s.includes('get pods')) {
+      return JSON.stringify({ items: [{ metadata: { name: 'app-x-1' }, status: { phase: 'Running', containerStatuses: [{ ready: true }] } }] });
+    }
+    return 'ok';
+  };
+  const pdb = await runAction(run, 'pdb-set', {}, () => {}, deps);
+  assert.equal(pdb.pdb, 'app-pdb');
+  const ev = await runAction(run, 'evict-one', {}, () => {}, deps);
+  assert.equal(ev.allowed, true);
+  assert.equal(ev.pod, 'app-x-1');
+  const blocked = await runAction(run, 'evict-one', {}, () => {}, { ...deps, evictRaw: async () => ({ code: 1, out: '', err: 'Error from server (TooManyRequests): budgets' }) });
+  assert.equal(blocked.allowed, false);
+  const del = await runAction(run, 'delete-one', {}, () => {}, deps);
+  assert.equal(del.deleted, true);
+});
+
+test('queue actions drive real request/scale hooks with bounds', async () => {
+  const run = runFor('signals');
+  const deps = fakeDeps();
+  let workers = 1;
+  const origKubectl = deps.kubectlIn;
+  deps.kubectlIn = async (...a) => {
+    const s = a.join(' ');
+    deps.calls.push(s);
+    if (s.includes('get deployment/app')) return JSON.stringify({ spec: { replicas: workers } });
+    if (s.includes('--replicas=')) workers = Number(s.match(/--replicas=(\d)/)[1]);
+    return origKubectl(...a);
+  };
+  const started = await runAction(run, 'q-start', {}, () => {}, deps);
+  assert.equal(started.active, true);
+  const more = await runAction(run, 'q-more', {}, () => {}, deps);
+  assert.equal(more.workers, 2);
+  assert.equal(workers, 2, 'worker capacity really changed');
+  const auto = await runAction(run, 'q-auto', {}, () => {}, deps);
+  assert.equal(auto.auto, true);
+  await assert.rejects(runAction(run, 'q-start', {}, () => {}, deps), /already running/);
+  const stopped = await runAction(run, 'q-stop', {}, () => {}, deps);
+  assert.equal(stopped.active, false);
+  await runAction(run, 'q-start', {}, () => {}, deps);
+  await runAction(run, 'q-stop', {}, () => {}, deps);
+});

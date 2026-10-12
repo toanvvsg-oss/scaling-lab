@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dashboard": "node dashboard/server.mjs",
-    "test": "node --test app/*.test.mjs dashboard/*.test.mjs",
+    "test": "node --test app/*.test.mjs dashboard/*.test.mjs scripts/*.test.mjs",
     "ui-build": "npm --prefix dashboard/ui run build",
     "ui-dev": "npm --prefix dashboard/ui run dev"
   },

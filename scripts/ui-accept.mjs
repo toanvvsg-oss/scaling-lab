@@ -1,12 +1,12 @@
-// Browser acceptance for scaling-lab. Uses the installed Google Chrome via
-// playwright-core (install once: npm install --no-save playwright-core).
-// Every check asserts; any FAIL exits nonzero. Screenshots and downloaded
-// evidence go to results/ (git-ignored).
+// Browser acceptance for the single-lesson React console (playwright-core
+// with Google Chrome). Every check asserts; any FAIL exits nonzero.
+// Screenshots and downloaded evidence go to results/ (git-ignored).
 //
 //   node scripts/ui-accept.mjs [baseUrl]
 //
-// Requires one free active-run slot (max 2). Cleans up only runs it creates;
-// retained runs are never touched.
+// Requires NO active lesson (aborts otherwise, preserving it). Cleans up
+// only the lessons it starts; retained history is never touched. Lesson
+// selection is by stable title text, never by catalog index.
 import { mkdirSync, existsSync } from 'node:fs';
 import { chromium } from 'playwright-core';
 
@@ -25,180 +25,106 @@ const jsErrors = [];
 page.on('pageerror', (e) => jsErrors.push(`pageerror: ${e.message}`));
 page.on('unhandledrejection', (r) => jsErrors.push(`unhandled: ${String(r).slice(0, 200)}`));
 
-async function state() {
-  return page.evaluate(() => fetch('/api/state').then((r) => r.json()));
-}
-async function waitRunReady(timeoutMs = 200000) {
+const flow = () => page.evaluate(() => fetch('/api/lesson').then((r) => r.json()));
+const waitFlow = async (pred, timeoutMs = 200000) => {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
-    const st = await page.textContent('#run-panel-state');
-    if (st.includes('ready')) return page.evaluate(() => document.getElementById('run-select').value);
+    const f = await flow();
+    if (pred(f)) return f;
     await page.waitForTimeout(5000);
   }
-  return '';
-}
+  return null;
+};
 
-// 0. Precheck: free slot, or fail fast with a useful error.
+// 0. Precheck: no active lesson, or fail fast without touching it.
 await page.goto(BASE, { waitUntil: 'networkidle' });
 {
-  const st = await state();
-  const live = (st.runs || []).filter((r) => r.status === 'ready' || r.status === 'creating');
-  console.log(`slots: ${live.length}/${st.maxActiveRuns || 2} ${live.map((r) => r.id)}`);
-  if (live.length >= (st.maxActiveRuns || 2)) {
-    console.log('ABORT: no free run slot; clean up a scratch run first, preserving retained runs.');
+  const f = await flow();
+  console.log(`active: ${f.active ? `${f.active.lesson}/${f.active.status}` : 'none'}, history: ${(f.history || []).length}`);
+  if (f.active) {
+    console.log('ABORT: a lesson is already active; ending it here would touch someone else’s environment.');
     await browser.close();
     process.exit(2);
   }
 }
-check('no refresh errors on load', await page.evaluate(() => window.labLastError == null));
+check('no JS errors on load', jsErrors.length === 0);
 
-// 1. Stepper + lesson-specific prediction labels on lesson 01.
-const steps = await page.$$eval('#stepper .step-pill', (els) => els.map((e) => e.firstChild.textContent.trim()));
-check('stepper shows six phases', steps.join(',') === 'baseline,predict,act,observe,explain,checks');
-const guesses = await page.$$eval('#guess-options button', (els) => els.map((e) => e.textContent));
-check('connection guesses are lesson-specific', guesses.some((g) => /edge connection/i.test(g)));
-
-// 2. Prediction gating: reveal before any observation must be refused.
-await page.click('#guess-options button');
-await page.waitForTimeout(800);
-await page.click('#predict-reveal');
-await page.waitForTimeout(800);
-check('reveal gated before observation', /Observe after predicting|prediction first/i.test(await page.textContent('#predict-state')));
-
-// 3. Guided batch action on an auto-created connections run.
-await page.click('.lesson-link[data-index="0"]');
-await page.waitForTimeout(800);
-await page.click('#run');
-let runId = '';
-for (let i = 0; i < 48; i++) {
-  await page.waitForTimeout(5000);
-  if (await page.evaluate(() => !!document.querySelector('#verdict .verdict-card'))) break;
-  const st = await page.textContent('#run-panel-state');
-  if (st.includes('ready')) { runId = await page.evaluate(() => document.getElementById('run-select').value); break; }
-}
-if (!runId) {
-  for (let i = 0; i < 24; i++) {
-    await page.waitForTimeout(5000);
-    const st = await page.textContent('#run-panel-state');
-    if (st.includes('ready')) { runId = await page.evaluate(() => document.getElementById('run-select').value); break; }
-  }
-}
-check('run auto-created and selected', Boolean(runId));
-await page.click('[data-action="reuse-batch"]');
-await page.waitForTimeout(9000);
-const trace = await page.textContent('#trace');
-check('trace shows request/socket IDs', /req [0-9a-f]{8} · edge \S+ → …[a-z0-9]{5}\/\S+/.test(trace));
-console.log('action state:', await page.textContent('#action-state'));
-
-// 4. Cleanup the connections run to free its slot (cancel first, then confirm).
-await page.click('#run-cleanup-open');
-await page.waitForSelector('#cleanup-dialog[open]', { timeout: 5000 });
-await page.click('#cleanup-cancel');
+// 1. Chapters render by stable identity; preview provisions nothing.
+check('chapter: follow one request', (await page.locator('text=Follow one request').count()) >= 1);
+check('chapter: take the system to GKE', (await page.locator('text=Take the system to GKE').count()) >= 1);
+await page.getByRole('button', { name: '01 Connection reuse' }).click();
 await page.waitForTimeout(1000);
-check('cleanup cancel keeps run', (await page.textContent('#run-panel-state')).includes(runId));
-await page.click('#run-cleanup-open');
-await page.click('#cleanup-confirm');
-let gone = false;
-for (let i = 0; i < 24; i++) {
-  await page.waitForTimeout(5000);
-  const s = await state();
-  if (!(s.runs || []).some((x) => x.id === runId && ['ready', 'creating', 'deleting'].includes(x.status))) { gone = true; break; }
+check('preview provisions nothing', (await page.locator('text=nothing is provisioned yet').count()) >= 1);
+{
+  const f = await flow();
+  check('selecting a lesson creates no environment', f.active === null);
 }
-check('cleanup deletes run', gone);
 
-// 5. Lesson 07: explicitly create a fresh prometheus run (never touch retained A).
-await page.click('.lesson-link[data-index="6"]');
-await page.waitForTimeout(1000);
-const beforeIds = await page.evaluate(() => fetch('/api/state').then(r => r.json()).then(s => (s.runs || []).map(x => x.id)));
-await page.click('#run-new');
-let promId = '';
-for (let i = 0; i < 48; i++) {
-  await page.waitForTimeout(5000);
-  const st = await page.textContent('#run-panel-state');
-  const sel = await page.evaluate(() => document.getElementById('run-select').value);
-  if (st.includes('ready') && sel && !beforeIds.includes(sel)) { promId = sel; break; }
+// 2. Start reaches Ready with reported stages.
+await page.getByRole('button', { name: /Start lesson/ }).click();
+let f = await waitFlow((x) => x.active?.status === 'ready' || x.active?.status === 'failed');
+check('lesson ready', f?.active?.status === 'ready');
+const runId = f?.active?.runId || '';
+check('prerequisite stage reported', (f?.active?.stages || []).some((s) => s.stage === 'check-prerequisites'));
+// Duplicate Start is refused without provisioning.
+{
+  const dup = await page.evaluate(() => fetch('/api/lesson/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ lesson: 'rollout' }) }).then((r) => r.status));
+  check('duplicate start 409s', dup === 409);
 }
-check('fresh prometheus run created and selected', Boolean(promId));
-for (let i = 0; i < 12; i++) {
-  await page.waitForTimeout(2000);
-  const lab = await page.evaluate(() => window.labRun);
-  if (lab === promId) break;
-}
-console.log('labRun synced:', await page.evaluate(() => window.labRun));
-await page.selectOption('#load-profile', 'steady');
-await page.selectOption('#load-duration', '300');
-await page.click('#load-start');
-await page.waitForTimeout(10000);
-const loadText = await page.textContent('#load-state');
-console.log('load-state:', loadText.slice(0, 160));
-check('load active before pause', /measured \d+ offered/.test(loadText));
-// Reload continuity: same lesson/run/profile reconnect, counters continue, nothing restarts.
-const beforeReload = await page.evaluate(() => ({
-  title: document.getElementById('lesson-title').textContent,
-  run: document.getElementById('run-select').value,
-  profile: document.getElementById('load-profile').value,
-}));
-const beforeTotal = await page.evaluate(() => fetch('/api/state').then(r => r.json()).then(s => {
-  const rec = (s.runs || []).find(x => x.id === document.getElementById('run-select').value);
-  return rec && rec.load ? rec.load.total : -1;
-}));
-await page.reload({ waitUntil: 'networkidle' });
+
+// 3. Connections practice: guided actions, then the one-click verifier.
+await page.getByRole('button', { name: /Run \+ verify/ }).waitFor({ timeout: 30000 });
+await page.getByRole('button', { name: 'Send 8 reused requests' }).click();
 await page.waitForTimeout(6000);
-check('lesson restored after reload', (await page.textContent('#lesson-title')) === beforeReload.title);
-check('run restored after reload', (await page.evaluate(() => document.getElementById('run-select').value)) === beforeReload.run);
-const afterTotal = await page.evaluate(() => fetch('/api/state').then(r => r.json()).then(s => {
-  const rec = (s.runs || []).find(x => x.id === document.getElementById('run-select').value);
-  return rec && rec.load ? { total: rec.load.total, active: rec.load.active, profile: rec.load.profile } : null;
-}));
-check('load reconnected, counters continue', afterTotal && afterTotal.active && afterTotal.profile === beforeReload.profile && afterTotal.total >= beforeTotal && beforeTotal > 0);
-for (let i = 0; i < 12; i++) {
-  await page.waitForTimeout(5000);
-  const max = await page.evaluate(() => document.getElementById('timeline-scrub').max);
-  if (Number(max) > 0) break;
-}
-await page.click('#timeline-pause');
-await page.waitForTimeout(1000);
-const snap = await page.textContent('#pods') + await page.textContent('#timeline') + await page.textContent('#trace');
-await page.waitForTimeout(4000);
-check('pause freezes pods/events/trace', (await page.textContent('#pods') + await page.textContent('#timeline') + await page.textContent('#trace')) === snap);
-check('pause pill shows PAUSED', (await page.textContent('#live-pill')) === 'PAUSED');
-await page.click('#timeline-replay');
-await page.waitForTimeout(5000);
-await page.screenshot({ path: `${OUT}accept-ui.png` });
-// wait for replay to end on its own (button back to Pause), then use
-// explicit pause/resume clicks so the test never races the replay timer.
+await page.getByRole('button', { name: /Run \+ verify/ }).click();
+let verdict = '';
 for (let i = 0; i < 30; i++) {
-  await page.waitForTimeout(2000);
-  if ((await page.textContent('#timeline-pause')).trim() === 'Pause') break;
-}
-check('live after replay ends', (await page.textContent('#live-pill')) === 'LIVE');
-await page.click('#timeline-pause'); // freeze
-await page.waitForTimeout(1000);
-await page.click('#timeline-pause'); // resume
-await page.waitForTimeout(3000);
-check('resume restores LIVE under load', (await page.textContent('#live-pill')) === 'LIVE');
-await page.click('#load-stop');
-await page.waitForTimeout(2000);
-check('load stopped clean', (await page.textContent('#load-state')).includes('Manual load idle'));
-
-// 6. Evidence download + final cleanup of the prometheus run.
-const dl = page.waitForEvent('download', { timeout: 20000 }).catch(() => null);
-await page.click('#run-evidence');
-check('run evidence downloads', (await dl) !== null);
-await page.click('#run-cleanup-open');
-await page.waitForSelector('#cleanup-dialog[open]', { timeout: 5000 });
-await page.screenshot({ path: `${OUT}accept-cleanup-dialog.png` });
-await page.click('#cleanup-confirm');
-gone = false;
-for (let i = 0; i < 24; i++) {
   await page.waitForTimeout(5000);
-  const s = await state();
-  if (!(s.runs || []).some((x) => x.id === promId && ['ready', 'creating', 'deleting'].includes(x.status))) { gone = true; break; }
+  const ev = await page.evaluate((id) => fetch(`/api/evidence?run=${id}`).then((r) => r.json()).catch(() => null), runId);
+  if (ev?.result?.status) { verdict = ev.result.status; break; }
 }
-check('prometheus run cleaned up', gone);
-const arch = await state().then((s) => s.archivedRuns || []);
-check('archives listed after cleanups', arch.includes(promId) && arch.includes(runId));
+check('connections verifier passes', verdict === 'pass');
 
+// 4. Switch-cancel preserves the environment; switch-confirm ends it and
+// opens a preview without auto-start.
+await page.getByRole('button', { name: '13 Rolling deployment' }).click();
+await page.waitForTimeout(800);
+await page.getByRole('button', { name: /Switch from/ }).click();
+await page.waitForTimeout(800);
+check('switch dialog states no auto-start', (await page.locator('text=will not start automatically').count()) >= 1);
+await page.getByRole('button', { name: /leave everything untouched/i }).click();
+await page.waitForTimeout(1000);
+check('cancel keeps environment', (await flow()).active?.runId === runId);
+await page.getByRole('button', { name: /Switch from/ }).click();
+await page.waitForTimeout(800);
+await page.getByRole('button', { name: /End current \+ open preview/ }).click();
+f = await waitFlow((x) => x.active === null, 240000);
+check('confirm ends the lesson', f && f.active === null);
+check('no auto-start after switch', (await flow()).active === null);
+check('preview offers Start', (await page.getByRole('button', { name: /Start lesson/ }).count()) >= 1);
+
+// 5. Spot-check two more lessons: start → ready → end each.
+for (const [title, re] of [["03 Measure one pod's capacity", /Start lesson/], ['09 Pending pods and node capacity', /Start lesson/]]) {
+  await page.getByRole('button', { name: title }).click();
+  await page.waitForTimeout(800);
+  await page.getByRole('button', { name: re }).click();
+  f = await waitFlow((x) => x.active?.status === 'ready' || x.active?.status === 'failed');
+  check(`${title} reaches ready`, f?.active?.status === 'ready');
+  await page.getByRole('button', { name: 'End lesson', exact: true }).first().click();
+  f = await waitFlow((x) => x.active === null, 240000);
+  check(`${title} ends cleanly`, f && f.active === null);
+}
+
+// 6. History is read-only and downloadable.
+{
+  const h = await flow();
+  check('history retained three lessons', (h.history || []).length >= 3);
+  const dl = page.waitForEvent('download', { timeout: 20000 }).catch(() => null);
+  await page.locator('#history button', { hasText: 'Evidence' }).first().click();
+  check('history evidence downloads', (await dl) !== null);
+}
+
+await page.screenshot({ path: `${OUT}accept-ui.png` });
 console.log(`js errors (incl. unhandled rejections): ${jsErrors.length ? jsErrors.join(' | ') : 'none'}`);
 if (jsErrors.length) failures += 1;
 await browser.close();

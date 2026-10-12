@@ -10,15 +10,20 @@ export function makeFakeCluster(opts = {}) {
   let releaseApply = null;
   let gated = 0;
   const gateApply = opts.gateApply === true;
-  const podsJson = JSON.stringify({
-    items: [1, 2].map((i) => ({
-      metadata: { name: `app-x-${i}`, deletionTimestamp: null },
+  const podsJsonFor = (count) => JSON.stringify({
+    items: Array.from({ length: count }, (_, k) => ({
+      metadata: { name: `app-x-${k + 1}`, deletionTimestamp: null },
       status: { phase: 'Running', containerStatuses: [{ ready: true }] },
     })),
   });
-  const slicesJson = JSON.stringify({
-    items: [{ endpoints: [1, 2].map((i) => ({ targetRef: { name: `app-x-${i}` }, conditions: { ready: true, terminating: false } })) }],
+  const slicesJsonFor = (count) => JSON.stringify({
+    items: [{ endpoints: Array.from({ length: count }, (_, k) => ({ targetRef: { name: `app-x-${k + 1}` }, conditions: { ready: true, terminating: false } })) }],
   });
+  const nsOf = (args) => {
+    const i = args.indexOf('-n');
+    return i >= 0 ? args[i + 1] : null;
+  };
+  const appReplicasIn = (ns) => namespaces.get(ns)?.deployments?.app ?? 2;
   const deps = {
     genId: () => (0xa0000000 + seq++).toString(16),
     sleep: async () => {},
@@ -27,13 +32,14 @@ export function makeFakeCluster(opts = {}) {
       if (gateApply && gated++ === 0 && !releaseApply) await new Promise((r) => { releaseApply = r; });
       applied.push([ns, obj.kind, obj.metadata?.name]);
       if (obj.kind === 'Namespace') namespaces.set(obj.metadata.name, { labels: obj.metadata.labels, deployments: {} });
-      if (obj.kind === 'Deployment' && ns && namespaces.has(ns)) namespaces.get(ns).deployments[obj.metadata.name] = true;
+      if (obj.kind === 'Deployment' && ns && namespaces.has(ns)) namespaces.get(ns).deployments[obj.metadata.name] = obj.spec?.replicas ?? 1;
     },
     exec: async (args) => {
       const a = args.join(' ');
       calls.push(a);
       if (a.includes('rollout status')) return { stdout: 'ok' };
       if (a.includes('get hpa app')) return { stdout: 'hpa/app' };
+      if (a.includes('get scaledobject')) return { stdout: 'scaledobject/app-prometheus' };
       if (a.includes('get deployment/app')) return { stdout: 'ok' };
       if (a.includes('delete namespace')) {
         const ns = args[args.indexOf('namespace') + 1];
@@ -51,8 +57,8 @@ export function makeFakeCluster(opts = {}) {
           return { stdout: `namespace/${m[1]}` };
         }
       }
-      if (a.includes('get pods')) return { stdout: podsJson };
-      if (a.includes('get endpointslices')) return { stdout: slicesJson };
+      if (a.includes('get pods')) return { stdout: podsJsonFor(appReplicasIn(nsOf(args))) };
+      if (a.includes('get endpointslices')) return { stdout: slicesJsonFor(appReplicasIn(nsOf(args))) };
       if (a.includes('get hpa')) return { stdout: '{"items":[]}' };
       throw new Error(`fake does not implement: ${a}`);
     },

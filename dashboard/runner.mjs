@@ -1,7 +1,8 @@
 import http from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { gradeConnections, gradeTimeout, gradeShutdown, gradeRollout, gradeStream } from './grade.mjs';
+import { fileURLToPath } from 'node:url';
+import { gradeConnections, gradeTimeout, gradeShutdown, gradeRollout, gradeStream, gradeCapacity, gradeHpaReact, gradePending, gradeResources, gradeSignals, gradeDownstream, gradeDisruptions, gradeGateway, gradeCapstone, percentile } from './grade.mjs';
 
 const runFile = promisify(execFile);
 const base = 'http://127.0.0.1:8080';
@@ -61,12 +62,13 @@ function startRequest(path, agent, baseUrl = base) {
   return { headers, done };
 }
 
-async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1, baseUrl = base) {
+async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1, baseUrl = base, cancel = null) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: 12 });
   const requests = [];
   let observed = 0;
   const until = Date.now() + durationMs;
   while (Date.now() < until) {
+    throwIfCancelled(cancel);
     const task = startRequest(path, agent, baseUrl).done.then(x => {
       const n = ++observed;
       // Successful samples go to the trace as 'sample' (no milestone);
@@ -83,14 +85,64 @@ async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1, 
   return results;
 }
 
+export const CANCELLED = 'CANCELLED';
+export function throwIfCancelled(cancel) {
+  if (typeof cancel === 'function' && cancel()) {
+    throw Object.assign(new Error('cancelled by End lesson'), { code: CANCELLED });
+  }
+}
+
+// Race a long blocking promise against cancellation. On cancel the caller
+// stops waiting; the orphaned operation runs out on its own (read-only status
+// waits) or is finalized by namespace deletion. Never swallows the outcome
+// when not cancelled.
+export async function unlessCancelled(promise, cancel, pollMs = 1000) {
+  if (typeof cancel !== 'function') return promise;
+  let settled = false;
+  let value;
+  let error = null;
+  promise.then((v) => { settled = true; value = v; }, (e) => { settled = true; error = e; });
+  while (!settled) {
+    throwIfCancelled(cancel);
+    await sleep(Math.min(pollMs, 1000));
+  }
+  if (error) throw error;
+  return value;
+}
+
+// Scalers fight manual replica control, so scenarios that need fixed counts
+// remove them first and remember what existed. Restore is shared-namespace
+// only: run namespaces are provisioned scaler-free on purpose.
+async function removeScalers(ns) {
+  const hadHpa = await kubectl(ns, 'get', 'hpa', 'app', '-o', 'name').then(() => true).catch(() => false);
+  const hadSO = await kubectl(ns, 'get', 'scaledobject', 'app-prometheus', '-o', 'name').then(() => true).catch(() => false);
+  await kubectl(ns, 'delete', 'hpa', '--all', '--ignore-not-found');
+  await kubectl(ns, 'delete', 'scaledobject', '--all', '--ignore-not-found');
+  return { hadHpa, hadSO };
+}
+
+async function restoreScalers(ns, had, emit) {
+  if (ns !== 'scaling-lab') return;
+  if (!had.hadHpa && !had.hadSO) return;
+  try {
+    const k8sDir = new URL('../k8s/', import.meta.url);
+    if (had.hadHpa) await kubectl(ns, 'apply', '-f', fileURLToPath(new URL('hpa.yaml', k8sDir)));
+    if (had.hadSO) await kubectl(ns, 'apply', '-f', fileURLToPath(new URL('prometheus-scaledobject.yaml', k8sDir)));
+    emit('note', { text: `Pre-existing scaler(s) re-applied (hpa=${had.hadHpa}, scaledobject=${had.hadSO}).` });
+  } catch (error) {
+    emit('error', { text: `Scaler restore FAILED: ${error.message}. Run make hpa-up or make prometheus-up.` });
+  }
+}
+
 async function podNames(ns = 'scaling-lab') {
   const raw = await kubectl(ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json');
   return JSON.parse(raw).items.filter(x => !x.metadata.deletionTimestamp).map(x => x.metadata.name);
 }
 
-async function waitStablePods(ns = 'scaling-lab', expected = 2, timeoutMs = 45000) {
+async function waitStablePods(ns = 'scaling-lab', expected = 2, timeoutMs = 45000, cancel = null) {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
+    throwIfCancelled(cancel);
     const state = await clusterState(ns);
     if (state.connected && state.pods.length === expected && state.pods.every(x => x.ready && !x.terminating)) return;
     await sleep(1000);
@@ -160,6 +212,448 @@ export function requireAutoscaler(state, kind) {
     : 'The Prometheus KEDA HPA is not active. Run make prometheus-up before the Prometheus lesson.');
 }
 
+export const CAPACITY_WORK = {
+  cheap: { label: 'cheap requests (/fast)', path: '/fast', rates: [5, 10, 15, 20, 30] },
+  expensive: { label: 'expensive CPU work (/cpu?ms=250)', path: '/cpu?ms=250', rates: [2, 4, 6, 8, 10] },
+};
+export const CAPACITY_STEP_MS = 12000;
+export const CAPACITY_TIMEOUT_MS = 5000;
+export const CAPACITY_MAX_INFLIGHT = 64;
+
+export function validateCapacityOptions(input = {}) {
+  const work = input.work === 'expensive' ? 'expensive' : 'cheap';
+  const sloP95Ms = Number(input.sloP95Ms ?? 500);
+  const sloErrorPct = Number(input.sloErrorPct ?? 5);
+  if (!Number.isFinite(sloP95Ms) || sloP95Ms < 50 || sloP95Ms > 10000) throw new Error('sloP95Ms must be between 50 and 10000.');
+  if (!Number.isFinite(sloErrorPct) || sloErrorPct < 0 || sloErrorPct > 50) throw new Error('sloErrorPct must be between 0 and 50.');
+  return { work, sloP95Ms, sloErrorPct };
+}
+
+function capacityRequest(path, baseUrl, timeoutMs, agent) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const deadline = started + timeoutMs;
+    let settled = false;
+    const done = (r) => { if (!settled) { settled = true; clearTimeout(kill); resolve(r); } };
+    const req = http.get(`${baseUrl}${path}`, { agent, timeout: timeoutMs }, (res) => {
+      // Drain without retaining: bodies are unused and must not accumulate.
+      res.resume();
+      res.on('end', () => done({ ok: res.statusCode === 200, complete: true, status: res.statusCode, ms: Date.now() - started, pod: res.headers['x-pod'] }));
+      res.on('error', (error) => done({ ok: false, complete: false, status: res.statusCode ?? null, ms: Date.now() - started, error: error.code || error.message }));
+    });
+    // Absolute per-request deadline: socket inactivity timeouts alone cannot
+    // bound a slowly-dribbling response, so destroy at started+timeoutMs.
+    const kill = setTimeout(() => req.destroy(new Error('request deadline exceeded')), Math.max(1, deadline - Date.now()));
+    req.on('timeout', () => { req.destroy(new Error('request timeout')); });
+    req.on('error', (error) => done({ ok: false, complete: false, status: null, ms: Date.now() - started, error: error.code || error.message, timeout: /timeout|deadline exceeded/i.test(error.message) }));
+  });
+}
+
+async function topSnapshot(ns) {
+  try {
+    const raw = await kubectl(ns, 'top', 'pods', '-l', 'app=scaling-app', '--no-headers');
+    const cpus = [];
+    for (const line of raw.split('\n')) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length >= 2) {
+        const m = /^([0-9]+)m?$/.exec(parts[1]);
+        if (m) cpus.push(parts[1].endsWith('m') ? Number(m[1]) : Number(m[1]) * 1000);
+      }
+    }
+    if (!cpus.length) return null;
+    return { pods: cpus.length, avgCpuMillicores: Math.round(cpus.reduce((a, b) => a + b, 0) / cpus.length) };
+  } catch { return null; }
+}
+
+async function runCapacityScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const { work, sloP95Ms, sloErrorPct } = validateCapacityOptions(opts.options);
+  const spec = CAPACITY_WORK[work];
+  const depRaw = await kubectl(ns, 'get', 'deployment/app', '-o', 'json');
+  const dep = JSON.parse(depRaw);
+  const container = dep.spec?.template?.spec?.containers?.[0] || {};
+  const config = {
+    replicas: 1, work: spec.label, path: spec.path,
+    resources: container.resources || null,
+    image: container.image || null,
+    stepMs: CAPACITY_STEP_MS, requestTimeoutMs: CAPACITY_TIMEOUT_MS, maxInflight: CAPACITY_MAX_INFLIGHT,
+  };
+  emit('note', { text: `Capacity sweep (${spec.label}) on exactly one pod; autoscaling disabled. Objective: p95 ≤ ${sloP95Ms}ms, errors ≤ ${sloErrorPct}%.` });
+  const removed = await removeScalers(ns);
+  try {
+  if (dep.spec?.replicas !== 1) {
+    await kubectl(ns, 'scale', 'deployment/app', '--replicas=1');
+  }
+  await waitStablePods(ns, 1, 90000, opts.cancel || null);
+  const agent = new http.Agent({ keepAlive: true, maxSockets: CAPACITY_MAX_INFLIGHT });
+  const steps = [];
+  for (const rate of spec.rates) {
+    const lat = [];
+    let offered = 0, started = 0, dropped = 0, completed = 0, failed = 0, timeouts = 0, timely = 0;
+    let inflight = 0, peakInflight = 0, missedSlots = 0, maxLateMs = 0;
+    const pending = new Set();
+    const until = Date.now() + CAPACITY_STEP_MS;
+    let n = 0;
+    const stepStart = Date.now();
+    const stepStartedAt = new Date(stepStart).toISOString();
+    const intervalMs = 1000 / rate;
+    while (Date.now() < until) {
+      throwIfCancelled(opts.cancel);
+      n += 1;
+      offered += 1;
+      const scheduledAt = stepStart + n * intervalMs;
+      const lateMs = Date.now() - scheduledAt;
+      // Loop-lateness diagnostic: how far behind schedule this offer ran.
+      // Actual missed slots are the end-of-step shortfall below, so a merely
+      // late (but still offered) slot is never double-counted as missed.
+      if (lateMs > 0) maxLateMs = Math.max(maxLateMs, Math.round(lateMs));
+      // Offer independently of completion, but never exceed the explicit
+      // laptop bound: excess offers are counted as dropped, never hidden.
+      if (inflight >= CAPACITY_MAX_INFLIGHT) {
+        dropped += 1;
+      } else {
+        started += 1;
+        inflight += 1;
+        peakInflight = Math.max(peakInflight, inflight);
+        const task = capacityRequest(spec.path, baseUrl, CAPACITY_TIMEOUT_MS, agent).then((r) => {
+          inflight -= 1;
+          pending.delete(task);
+          if (r.complete && r.ok) { completed += 1; lat.push(r.ms); if (r.ms <= sloP95Ms) timely += 1; }
+          else { failed += 1; if (r.timeout) timeouts += 1; }
+          if ((completed + failed) % 25 === 0) emit('sample', { pod: r.pod, ok: r.ok, ms: r.ms });
+          else if (!r.ok) emit('request', { pod: r.pod, ok: false, status: r.status, error: r.error, ms: r.ms });
+          return r;
+        });
+        pending.add(task);
+      }
+      const waitUntil = stepStart + (n * 1000) / rate;
+      const delay = waitUntil - Date.now();
+      if (delay > 0) await sleep(Math.min(delay, 1000));
+    }
+    await Promise.all([...pending]);
+    const stepFinishedAt = new Date().toISOString();
+    const elapsedMs = Date.now() - stepStart;
+    // Missed offered slots: schedule demanded floor(elapsed/interval) offers;
+    // any shortfall means the generator did not sustain the configured rate,
+    // even when the inflight cap never tripped.
+    missedSlots = Math.max(0, Math.floor(elapsedMs / intervalMs) - offered);
+    lat.sort((a, b) => a - b);
+    const total = completed + failed;
+    const top = await topSnapshot(ns);
+    const step = {
+      rate, startedAt: stepStartedAt, finishedAt: stepFinishedAt, elapsedMs,
+      offered, started, dropped, completed, failed, timeouts, timely,
+      missedSlots, maxLateMs, peakInflight,
+      generatorLimited: dropped > 0 || missedSlots > 0,
+      successRps: Math.round((completed / (elapsedMs / 1000)) * 10) / 10,
+      goodputRps: Math.round((timely / (elapsedMs / 1000)) * 10) / 10,
+      p50: percentile(lat, 50), p95: percentile(lat, 95), p99: percentile(lat, 99),
+      errorPct: total ? Math.round((failed / total) * 1000) / 10 : 100,
+      cpu: top,
+    };
+    steps.push(step);
+    emit('note', { text: `${rate} RPS offered over ${(elapsedMs / 1000).toFixed(1)}s: success ${step.successRps}/s, timely (≤${sloP95Ms}ms) goodput ${step.goodputRps}/s, p50/p95/p99 ${step.p50 ?? '?'}/${step.p95 ?? '?'}/${step.p99 ?? '?'}ms, errors ${step.errorPct}% (failed ${failed}, timeouts ${timeouts}, dropped ${dropped}, missed ${missedSlots}, peak inflight ${peakInflight})${top ? `, pod CPU ~${top.avgCpuMillicores}m` : ''}.` });
+  }
+  } finally {
+    agent.destroy();
+    await restoreScalers(ns, removed, emit);
+  }
+  return gradeCapacity({ steps, config, sloP95Ms, sloErrorPct, plannedRates: spec.rates });
+}
+
+export function validateHpaReactOptions(input = {}) {
+  const predictDesired = Number(input.predictDesired ?? 4);
+  if (!Number.isInteger(predictDesired) || predictDesired < 2 || predictDesired > 8) {
+    throw new Error('predictDesired must be an integer between 2 and 8.');
+  }
+  return { predictDesired };
+}
+
+export function validateCapstoneOptions(input = {}) {
+  const sloP95Ms = Number(input.sloP95Ms ?? 800);
+  const sloErrorPct = Number(input.sloErrorPct ?? 5);
+  const mix = input.mix === 'cpu-heavy' || input.mix === 'io-heavy' ? input.mix : 'balanced';
+  if (!Number.isFinite(sloP95Ms) || sloP95Ms < 100 || sloP95Ms > 5000) throw new Error('sloP95Ms must be between 100 and 5000.');
+  if (!Number.isFinite(sloErrorPct) || sloErrorPct < 0 || sloErrorPct > 20) throw new Error('sloErrorPct must be between 0 and 20.');
+  return { sloP95Ms, sloErrorPct, mix };
+}
+
+// Direct cgroup CPU-throttling readout (lesson 09): nr_throttled and
+// throttled_usec from the pod's own cpu.stat. Never inferred from latency.
+export async function cpuThrottle(ns, pod) {
+  for (const path of ['/sys/fs/cgroup/cpu.stat', '/sys/fs/cgroup/cpu/cpu.stat']) {
+    try {
+      const raw = await kubectl(ns, 'exec', pod, '--', 'cat', path);
+      const stat = {};
+      for (const line of raw.split('\n')) {
+        const [k, v] = line.trim().split(/\s+/);
+        if (k && v != null && Number.isFinite(Number(v))) stat[k] = Number(v);
+      }
+      if (stat.nr_periods != null) {
+        return { path, periods: stat.nr_periods, throttled: stat.nr_throttled ?? 0, throttledUsec: stat.throttled_usec ?? 0, usageUsec: stat.usage_usec ?? null };
+      }
+    } catch { /* try the next layout */ }
+  }
+  return null;
+}
+
+
+// Offered-rate load with settled accounting, reused by the post-capacity
+// scenarios. Offers at a fixed rate independent of completion; excess beyond
+// the inflight cap is counted dropped, never hidden.
+export async function pacedRequests(baseUrl, path, rps, durationMs, timeoutMs, emit, opts = {}) {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: opts.maxInflight || 64 });
+  const lat = [];
+  const statusCounts = {};
+  let offered = 0, started = 0, dropped = 0, completed = 0, failed = 0, timeouts = 0, shed = 0;
+  let inflight = 0, peakInflight = 0;
+  const pending = new Set();
+  const until = Date.now() + durationMs;
+  const stepStart = Date.now();
+  let n = 0;
+  try {
+    while (Date.now() < until) {
+      throwIfCancelled(opts.cancel);
+      n += 1;
+      offered += 1;
+      if (inflight >= (opts.maxInflight || 64)) {
+        dropped += 1;
+      } else {
+        started += 1;
+        inflight += 1;
+        peakInflight = Math.max(peakInflight, inflight);
+        const task = capacityRequest(path, baseUrl, timeoutMs, agent).then((r) => {
+          inflight -= 1;
+          pending.delete(task);
+          statusCounts[r.status ?? 'none'] = (statusCounts[r.status ?? 'none'] || 0) + 1;
+          if (r.complete && r.ok) { completed += 1; lat.push(r.ms); }
+          else { failed += 1; if (r.timeout) timeouts += 1; }
+          if (opts.countShed && r.status === 502) shed += 1;
+          if ((completed + failed) % 25 === 0) emit('sample', { pod: r.pod, ok: r.ok, ms: r.ms });
+          else if (!r.ok) emit('request', { pod: r.pod, ok: false, status: r.status, error: r.error, ms: r.ms });
+          return r;
+        });
+        pending.add(task);
+      }
+      const delay = stepStart + (n * 1000) / rps - Date.now();
+      if (delay > 0) await sleep(Math.min(delay, 1000));
+    }
+    await Promise.all([...pending]);
+  } finally {
+    agent.destroy();
+  }
+  const elapsedMs = Date.now() - stepStart;
+  lat.sort((a, b) => a - b);
+  return { offered, started, dropped, completed, failed, timeouts, shed, statusCounts, lat, peakInflight, elapsedMs };
+}
+
+export function summarizePaced(p, sloP95Ms) {
+  const timely = p.lat.filter((ms) => ms <= sloP95Ms).length;
+  const total = p.completed + p.failed;
+  return {
+    offered: p.offered, completed: p.completed, failed: p.failed, timeouts: p.timeouts, shed: p.shed,
+    dropped: p.dropped, peakInflight: p.peakInflight, elapsedMs: p.elapsedMs, statusCounts: p.statusCounts,
+    successRps: Math.round((p.completed / (p.elapsedMs / 1000)) * 10) / 10,
+    timelyRps: Math.round((timely / (p.elapsedMs / 1000)) * 10) / 10,
+    p50: percentile(p.lat, 50), p95: percentile(p.lat, 95), p99: percentile(p.lat, 99),
+    errorPct: total ? Math.round((p.failed / total) * 1000) / 10 : 100,
+  };
+}
+
+async function hpaSnapshot(ns) {
+  const raw = await kubectl(ns, 'get', 'hpa', 'app', '-o', 'json');
+  const h = JSON.parse(raw);
+  const cpuSpec = (h.spec?.metrics || []).find((m) => m.type === 'Resource' && m.resource?.name === 'cpu');
+  const cpuCur = (h.status?.currentMetrics || []).find((m) => m.type === 'Resource' && m.resource?.name === 'cpu');
+  return {
+    desired: h.status?.desiredReplicas ?? null,
+    current: h.status?.currentReplicas ?? null,
+    target: cpuSpec?.resource?.target?.averageUtilization ?? null,
+    currentCPU: cpuCur?.resource?.current?.averageUtilization ?? null,
+  };
+}
+
+async function readyPods(ns) {
+  const state = await clusterState(ns);
+  return state.pods.filter((p) => p.ready && !p.terminating).length;
+}
+
+async function sampleHpa(ns, emit, label, phase) {
+  const [snap, ready] = await Promise.all([hpaSnapshot(ns), readyPods(ns)]);
+  const missing = snap.currentCPU == null;
+  emit('hpa', { text: `${label}: desired ${snap.desired ?? '?'} · ready ${ready} · CPU ${snap.currentCPU ?? 'missing'}%/60%${missing ? ' (metric missing: controller holds, prediction is approximate)' : ''}` });
+  return { at: new Date().toISOString(), phase, desired: snap.desired, ready, currentCPU: snap.currentCPU, missingMetric: missing };
+}
+
+async function runHpaReactScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const { predictDesired } = validateHpaReactOptions(opts.options);
+  const hcancel = opts.cancel || null;
+  const snap0 = await hpaSnapshot(ns).catch(() => { throw new Error('The CPU HPA is not active in this run. Create a fresh hpareact run (it provisions its own HPA).'); });
+  const ready0 = await readyPods(ns);
+  const baseline = { target: snap0.target, replicas: snap0.current ?? ready0, desired: snap0.desired, currentCPU: snap0.currentCPU };
+  emit('note', { text: `Baseline: target ${baseline.target}% with ${baseline.replicas} replicas (desired ${baseline.desired ?? '?'}). Prediction: burst drives desired to ${predictDesired}. Formula: ceil(replicas × observed/target), then tolerance, readiness, bounds, stabilization.` });
+  // Phase 1: brief CPU burst. Sample fast (15 x 3s) so the genuine HPA
+  // scale-out lag — desired bump first, Ready pods catching up — is caught
+  // with timestamps instead of being averaged away.
+  const series = [];
+  emit('note', { text: 'Phase 1 (hpa-scale-out): 45s CPU burst — watch observed metric, desired replicas, and Ready pods separate.' });
+  const burst = traffic(45000, '/cpu?ms=120', emit, 150, 5, baseUrl, hcancel);
+  let firstBumpAt = null, allReadyAt = null;
+  for (let i = 0; i < 15; i++) {
+    throwIfCancelled(hcancel);
+    await unlessCancelled(sleep(3000), hcancel);
+    const s = await sampleHpa(ns, emit, `burst+${(i + 1) * 3}s`, 'hpa-scale-out');
+    series.push(s);
+    if (firstBumpAt == null && (s.desired ?? 0) > (baseline.desired ?? 2)) firstBumpAt = s.at;
+    if (firstBumpAt != null && allReadyAt == null && (s.ready ?? 0) >= (s.desired ?? 0) && (s.desired ?? 0) > 0) allReadyAt = s.at;
+  }
+  await burst;
+  const scaleOutLagSec = firstBumpAt && allReadyAt
+    ? Math.round((Date.parse(allReadyAt) - Date.parse(firstBumpAt)) / 1000)
+    : null;
+  if (firstBumpAt) emit('note', { text: `HPA desired first exceeded baseline at ${firstBumpAt}; Ready caught up at ${allReadyAt ?? 'not within the burst window'}${scaleOutLagSec != null ? ` (scale-out lag ~${scaleOutLagSec}s)` : ''}.` });
+  // Phase 2: bounded slow startup as a TEMPLATE-GATED ROLLOUT — explicitly
+  // not proof of an HPA decision. Patching readinessProbe changes the pod
+  // template, so every pod rolls gated; the stall (new pods unready while old
+  // ones serve) demonstrates the readiness stage, distinct from phase 1.
+  // The original probe value is preserved and restored exactly; a restore
+  // failure is recorded loudly in evidence, never swallowed.
+  emit('note', { text: 'Phase 2 (template-gated-rollout): 30s readiness delay on new pods. This gates the rollout, not an HPA decision.' });
+  let slowStartup = null;
+  // Preserve the original probe so restore is exact (absent stays absent).
+  const probeBefore = JSON.parse(await kubectl(ns, 'get', 'deployment/app', '-o', 'json')).spec?.template?.spec?.containers?.[0]?.readinessProbe ?? null;
+  const hadDelay = probeBefore?.initialDelaySeconds;
+  try {
+    if (hadDelay == null) {
+      await kubectl(ns, 'patch', 'deployment/app', '--type=json', '-p', '[{"op":"add","path":"/spec/template/spec/containers/0/readinessProbe/initialDelaySeconds","value":30}]');
+    } else {
+      await kubectl(ns, 'patch', 'deployment/app', '--type=json', '-p', '[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/initialDelaySeconds","value":30}]');
+    }
+    // The template change itself rolls pods gated: count unready,
+    // non-terminating pods while desired capacity is outstanding.
+    const depDesired = Number(JSON.parse(await kubectl(ns, 'get', 'deployment/app', '-o', 'json')).spec?.replicas ?? 0);
+    let unreadySamples = 0;
+    for (let i = 0; i < 6; i++) {
+      throwIfCancelled(hcancel);
+      await unlessCancelled(sleep(5000), hcancel);
+      const s = await sampleHpa(ns, emit, `slow-start+${(i + 1) * 5}s`, 'template-gated-rollout');
+      series.push(s);
+      const podsRaw = await kubectl(ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json');
+      const unready = (JSON.parse(podsRaw).items || []).filter((p) => !p.metadata?.deletionTimestamp
+        && !(p.status?.containerStatuses?.every((c) => c.ready))).length;
+      if (unready > 0 && depDesired >= 2) unreadySamples += 1;
+      if (unready > 0) emit('note', { text: `Slow-start (rollout-gated, not an HPA decision): ${unready} new pod(s) still unready, desired ${depDesired}, ready ${s.ready}.` });
+    }
+    slowStartup = { kind: 'template-gated-rollout', gapObserved: unreadySamples >= 3, desiredDuring: depDesired, unreadySamples, restored: false };
+  } finally {
+    // Exact restore, loudly: remove only what was added, replace back what
+    // was changed. A failure here must fail the run, not vanish. After an
+    // End-lesson cancellation the namespace teardown finalizes instead.
+    if (hcancel && hcancel()) {
+      if (slowStartup) { slowStartup.restored = false; slowStartup.restoreError = 'skipped after cancellation (namespace teardown finalizes)'; }
+      emit('error', { text: 'Slow-startup restore skipped after cancellation: namespace teardown finalizes. Verify the deployment before reuse.' });
+    } else try {
+      if (hadDelay == null) {
+        await kubectl(ns, 'patch', 'deployment/app', '--type=json', '-p', '[{"op":"remove","path":"/spec/template/spec/containers/0/readinessProbe/initialDelaySeconds"}]');
+      } else {
+        await kubectl(ns, 'patch', 'deployment/app', '--type=json', '-p', JSON.stringify([{ op: 'replace', path: '/spec/template/spec/containers/0/readinessProbe/initialDelaySeconds', value: hadDelay }]));
+      }
+      await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
+      if (slowStartup) slowStartup.restored = true;
+      emit('note', { text: 'Readiness probe restored to its original value; rollout settled.' });
+    } catch (error) {
+      if (slowStartup) { slowStartup.restored = false; slowStartup.restoreError = error.message; }
+      emit('error', { text: `Slow-startup restore FAILED and needs manual attention: ${error.message}. Check kubectl --context kind-scaling-lab -n ${ns} get deployment/app.` });
+    }
+  }
+  // Phase 3: stabilization — load already stopped; record the scale-down path.
+  emit('note', { text: 'Phase 3 (stabilization): load stopped — recording recovery (scale-down stabilization holds ~60s).' });
+  let samples = 0;
+  for (let i = 0; i < 5; i++) {
+    throwIfCancelled(hcancel);
+    await unlessCancelled(sleep(15000), hcancel);
+    series.push(await sampleHpa(ns, emit, `recover+${(i + 1) * 15}s`, 'stabilization'));
+    samples += 1;
+  }
+  return gradeHpaReact({ baseline, series, predictDesired, slowStartup, recovery: { samples }, scaleOut: { firstBumpAt, allReadyAt, scaleOutLagSec } });
+}
+
+async function podCounts(ns) {
+  const raw = await kubectl(ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json');
+  const items = JSON.parse(raw).items || [];
+  let scheduled = 0, running = 0, ready = 0, pending = 0;
+  for (const p of items) {
+    if (p.spec?.nodeName) scheduled += 1;
+    if (p.status?.phase === 'Pending') pending += 1;
+    if (p.status?.phase === 'Running') running += 1;
+    if (!p.metadata?.deletionTimestamp && p.status?.containerStatuses?.every((c) => c.ready)) ready += 1;
+  }
+  const depRaw = await kubectl(ns, 'get', 'deployment/app', '-o', 'json');
+  return { desired: JSON.parse(depRaw).spec?.replicas ?? null, scheduled, running, ready, pending, total: items.length };
+}
+
+async function schedulerReasons(ns) {
+  try {
+    const raw = await kubectl(ns, 'get', 'events', '--field-selector', 'reason=FailedScheduling', '-o', 'json');
+    return (JSON.parse(raw).items || []).slice(-5).map((e) => ({ reason: e.reason, message: (e.message || '').slice(0, 300), pod: e.involvedObject?.name || null }));
+  } catch { return []; }
+}
+
+export async function constrainPending(ns) {
+  await kubectl(ns, 'patch', 'deployment/app', '-p', '{"spec":{"template":{"spec":{"nodeSelector":{"scaling.lab/nonexistent":"true"}}}}}');
+  await kubectl(ns, 'scale', 'deployment/app', '--replicas=5');
+}
+
+export async function restorePending(ns) {
+  await kubectl(ns, 'patch', 'deployment/app', '--type=json', '-p', '[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]').catch(() => {});
+  await kubectl(ns, 'scale', 'deployment/app', '--replicas=2');
+  await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
+  await waitStablePods(ns, 2, 90000);
+}
+
+async function runPendingScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const cancel = opts.cancel || null;
+  const before = await podCounts(ns);
+  emit('note', { text: `Baseline in ${ns}: desired ${before.desired}, scheduled ${before.scheduled}, ready ${before.ready}. Disabling any autoscaler in this namespace (it would fight the manual scale), then applying a run-scoped impossible nodeSelector and scaling to 5.` });
+  // An HPA would rewrite spec.replicas toward its own desired count and hide
+  // the Pending demonstration, so existing scalers are removed first and
+  // re-applied in the finally below. Run namespaces have no scaler (nothing
+  // to restore); the shared CLI namespace gets its exact manifests back.
+  const removed = await removeScalers(ns);
+  let constrained = null, events = [];
+  try {
+    await constrainPending(ns);
+    // Let the constraint roll: old pods are pinned by maxUnavailable 0 while
+    // replacements cannot schedule, so Pending appears alongside survivors.
+    const until = Date.now() + 60000;
+    do {
+      throwIfCancelled(cancel);
+      await unlessCancelled(sleep(5000), cancel);
+      constrained = await podCounts(ns);
+    } while (Date.now() < until && !(constrained.desired === 5 && constrained.pending >= 2));
+    events = await schedulerReasons(ns);
+    emit('note', { text: `Constrained: desired ${constrained.desired}, scheduled ${constrained.scheduled}, running ${constrained.running}, ready ${constrained.ready}, pending ${constrained.pending}. ${events[0]?.message?.slice(0, 160) || 'No scheduler reason yet.'}` });
+    const probe = await capacityRequest('/fast', baseUrl, 3000, new http.Agent({ keepAlive: false }));
+    emit('note', { text: `Probe while constrained: ${probe.ok ? 'served by surviving pre-constraint pods (maxUnavailable 0 pins old pods until replacements are Ready — replacements never become Ready)' : `not served (${probe.error || `HTTP ${probe.status}`}) — Pending pods serve nothing`}.` });
+  } finally {
+    emit('note', { text: 'Restoring schedulability (removing the constraint, back to 2 replicas).' });
+    if (cancel && cancel()) {
+      emit('error', { text: 'Restore skipped after cancellation: namespace teardown finalizes. Verify the deployment before reuse.' });
+    } else {
+      await restorePending(ns).catch((e) => emit('error', { text: `Restore needs attention: ${e.message}` }));
+      await restoreScalers(ns, removed, emit);
+    }
+  }
+  const restored = await podCounts(ns);
+  emit('note', { text: `Restored: desired ${restored.desired}, ready ${restored.ready}, pending ${restored.pending}. kind never autoscales nodes — the GKE continuation covers node scale-up.` });
+  return gradePending({ constrained: constrained || before, restored, events });
+}
+
 async function runPrometheusScenario(emit, opts = {}) {
   const ns = opts.namespace || 'scaling-lab';
   const baseUrl = opts.endpoint || base;
@@ -195,7 +689,7 @@ async function runPrometheusScenario(emit, opts = {}) {
     };
     emit('note', { text: `Prometheus is scraping ${scrapeTargets} app pods. Sending request load.` });
     const timer = setInterval(sample, 5000);
-    const load = await traffic(80000, '/fast', emit, 30, 15, baseUrl);
+    const load = await traffic(80000, '/fast', emit, 30, 15, baseUrl, opts.cancel || null);
     clearInterval(timer);
     await sample();
     emit('note', { text: `Load stopped. Peak observed rate ${peakRps.toFixed(1)} req/s; watching scale down.` });
@@ -204,7 +698,8 @@ async function runPrometheusScenario(emit, opts = {}) {
     const drain = [];
     const until = Date.now() + 180000;
     while (Date.now() < until && !stableDown) {
-      drain.push(...await traffic(5000, '/fast', emit, 500, 5, baseUrl));
+      throwIfCancelled(opts.cancel || null);
+      drain.push(...await traffic(5000, '/fast', emit, 500, 5, baseUrl, opts.cancel || null));
       await sample();
       const state = await clusterState(ns);
       final = state.pods.filter(x => !x.terminating).length;
@@ -272,7 +767,7 @@ export async function runScenario(id, options, emit) {
     if (!slowHeaders.pod) throw new Error(`Long request did not reach a pod: ${slowHeaders.error}`);
     emit('slow-start', slowHeaders);
     const stopLogWatch = watchPodLogs(slowHeaders.pod, emit, ns);
-    const background = traffic(11000, '/fast', emit, 120, 1, baseUrl);
+    const background = traffic(11000, '/fast', emit, 120, 1, baseUrl, options.cancel || null);
     await sleep(900);
     emit('pod-delete', { pod: slowHeaders.pod });
     await kubectl(ns, 'delete', 'pod', slowHeaders.pod, '--wait=false');
@@ -287,7 +782,7 @@ export async function runScenario(id, options, emit) {
     await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
     await waitStablePods(ns);
     const before = await podNames(ns);
-    const background = traffic(15000, '/fast', emit, 120, 1, baseUrl);
+    const background = traffic(15000, '/fast', emit, 120, 1, baseUrl, options.cancel || null);
     await sleep(1000);
     emit('rollout', { text: 'Starting rolling update' });
     await kubectl(ns, 'set', 'env', 'deployment/app', `LAB_REV=${Date.now()}`);
@@ -318,7 +813,7 @@ export async function runScenario(id, options, emit) {
     requireAutoscaler(state, 'cpu');
     const initial = state.pods.filter(x => !x.terminating).length;
     emit('note', { text: `Starting CPU load with ${initial} pods` });
-    const samples = await traffic(75000, '/cpu?ms=120', emit, 150, 1, baseUrl);
+    const samples = await traffic(75000, '/cpu?ms=120', emit, 150, 1, baseUrl, options.cancel || null);
     const scaled = await clusterState(ns);
     const peak = scaled.pods.filter(x => !x.terminating).length;
     emit('note', { text: `CPU load stopped at ${peak} pods; watching scale down` });
@@ -327,7 +822,8 @@ export async function runScenario(id, options, emit) {
     const drainSamples = [];
     const until = Date.now() + 180000;
     while (Date.now() < until && !stableDown) {
-      drainSamples.push(...await traffic(5000, '/fast', emit, 250, 1, baseUrl));
+      throwIfCancelled(options.cancel || null);
+      drainSamples.push(...await traffic(5000, '/fast', emit, 250, 1, baseUrl, options.cancel || null));
       const current = await clusterState(ns);
       final = current.pods.filter(x => !x.terminating).length;
       stableDown = current.pods.length === initial && current.pods.every(x => x.ready && !x.terminating);
@@ -347,5 +843,641 @@ export async function runScenario(id, options, emit) {
     };
   }
   if (id === 'prometheus') return runPrometheusScenario(emit, options);
+  if (id === 'capacity') return runCapacityScenario(emit, options);
+  if (id === 'hpareact') return runHpaReactScenario(emit, options);
+  if (id === 'pending') return runPendingScenario(emit, options);
+  if (id === 'resources') return runResourcesScenario(emit, options);
+  if (id === 'signals') return runSignalsScenario(emit, options);
+  if (id === 'downstream') return runDownstreamScenario(emit, options);
+  if (id === 'disruptions') return runDisruptionsScenario(emit, options);
+  if (id === 'gateway') return runGatewayScenario(emit, options);
+  if (id === 'capstone') return runCapstoneScenario(emit, options);
   throw new Error('Unknown scenario');
+}
+
+function kubectlApply(ns, obj) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('kubectl', ['--context', 'kind-scaling-lab', ...(ns ? ['-n', ns] : []), 'apply', '-f', '-'], { timeout: 60000 });
+    let err = '';
+    child.stderr.on('data', (c) => { err += c.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`kubectl apply failed: ${err.trim().slice(0, 300)}`))));
+    child.stdin.write(JSON.stringify(obj));
+    child.stdin.end();
+  });
+}
+
+function kubectlRaw(ns, path, body) {
+  return new Promise((resolve) => {
+    const child = spawn('kubectl', ['--context', 'kind-scaling-lab', '-n', ns, 'create', '--raw', path, '-f', '-'], { timeout: 30000 });
+    let out = '', err = '';
+    child.stdout.on('data', (c) => { out += c.toString(); });
+    child.stderr.on('data', (c) => { err += c.toString(); });
+    child.on('error', (e) => resolve({ code: 1, out: '', err: String(e?.message || e) }));
+    child.on('close', (code) => resolve({ code: code ?? 1, out: out.trim(), err: err.trim() }));
+    child.stdin.write(JSON.stringify(body));
+    child.stdin.end();
+  });
+}
+
+async function evictPod(ns, pod) {
+  const r = await kubectlRaw(ns, `/api/v1/namespaces/${ns}/pods/${pod}/eviction`, { apiVersion: 'policy/v1', kind: 'Eviction', metadata: { name: pod, namespace: ns } });
+  const text = `${r.out} ${r.err}`.trim();
+  const blocked = r.code !== 0 && /429|TooManyRequests|Forbidden|disruption budget/i.test(text);
+  return { pod, allowed: r.code === 0, status: r.code, detail: text.slice(0, 300) || `exit ${r.code}` };
+}
+
+async function topFor(ns, label) {
+  try {
+    const raw = await kubectl(ns, 'top', 'pods', '-l', label, '--no-headers');
+    const cpus = [];
+    for (const line of raw.split('\n')) {
+      const parts = line.trim().split(/\s+/);
+      const m = parts.length >= 2 ? /^([0-9]+)m?$/.exec(parts[1]) : null;
+      if (m) cpus.push(parts[1].endsWith('m') ? Number(m[1]) : Number(m[1]) * 1000);
+    }
+    if (!cpus.length) return null;
+    return { pods: cpus.length, avgCpuM: Math.round(cpus.reduce((a, b) => a + b, 0) / cpus.length) };
+  } catch { return null; }
+}
+
+async function depInflightGauge(ns) {
+  try {
+    const out = await kubectl(ns, 'exec', 'deployment/dep', '--', 'node', '-e', `fetch('http://127.0.0.1:3000/metrics').then((r)=>r.text()).then((t)=>{const m=t.match(/scaling_lab_http_inflight_requests\\{pod=("[^"]*")\\} ([0-9.]+)/);console.log(m?m[2]:'none')})`);
+    const v = Number(out.trim().split('\n').pop());
+    return Number.isFinite(v) ? v : null;
+  } catch { return null; }
+}
+
+async function containerResources(ns) {
+  const raw = await kubectl(ns, 'get', 'deployment/app', '-o', 'json');
+  return JSON.parse(raw).spec?.template?.spec?.containers?.[0]?.resources || null;
+}
+
+async function patchContainerResources(ns, resources, cancel = null, expected = null) {
+  throwIfCancelled(cancel);
+  await kubectl(ns, 'patch', 'deployment/app', '-p', JSON.stringify({ spec: { template: { spec: { containers: [{ name: 'app', resources }] } } } }));
+  await unlessCancelled(kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s'), cancel);
+  // expected==null skips the count wait: under a live HPA the replica count
+  // legitimately moves, so only the rollout gate applies.
+  if (expected != null) await waitStablePods(ns, expected, 90000, cancel);
+}
+
+async function restartInfo(ns) {
+  const raw = await kubectl(ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json');
+  let restarts = 0;
+  const reasons = [];
+  for (const p of JSON.parse(raw).items || []) {
+    for (const c of p.status?.containerStatuses || []) {
+      restarts += c.restartCount || 0;
+      const reason = c.lastState?.terminated?.reason;
+      if (reason) reasons.push(`${p.metadata.name}:${reason}`);
+    }
+  }
+  return { restarts, reasons };
+}
+
+async function avgUtil(ns, samples, cancel = null) {
+  // Median, not mean: rollout transients spike single samples, and the
+  // median survives them while the mean does not.
+  const vals = [];
+  for (let i = 0; i < samples; i++) {
+    throwIfCancelled(cancel);
+    await unlessCancelled(sleep(5000), cancel);
+    const s = await hpaSnapshot(ns).catch(() => null);
+    if (s?.currentCPU != null) vals.push(s.currentCPU);
+  }
+  if (vals.length < 2) return null;
+  vals.sort((a, b) => a - b);
+  const mid = Math.floor(vals.length / 2);
+  return vals.length % 2 ? vals[mid] : Math.round((vals[mid - 1] + vals[mid]) / 2);
+}
+
+// cpu.stat snapshot keyed by pod name, so deltas always compare the same
+// pod instance: the hottest same-name pod carries the signal, and a pod
+// that vanished mid-window voids its delta instead of comparing strangers.
+async function cpuStatAll(ns) {
+  const raw = await kubectl(ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json');
+  const names = (JSON.parse(raw).items || [])
+    .filter((p) => !p.metadata?.deletionTimestamp && p.status?.phase === 'Running')
+    .map((p) => p.metadata.name);
+  const map = {};
+  for (const name of names) {
+    const stat = await cpuThrottle(ns, name);
+    if (stat) map[name] = stat;
+  }
+  return map;
+}
+
+function hottestDelta(before, after) {
+  let best = null;
+  for (const name of Object.keys(before)) {
+    const a = before[name], b = after[name];
+    if (!b || a.usageUsec == null || b.usageUsec == null) continue;
+    const usage = b.usageUsec - a.usageUsec;
+    const throttled = (b.throttledUsec ?? 0) - (a.throttledUsec ?? 0);
+    if (usage < 0 || throttled < 0) continue; // counter reset: pod recycled mid-window
+    if (!best || usage > best.usageMs * 1000) best = { name, usageMs: Math.round(usage / 1000), throttledUsec: throttled };
+  }
+  return best;
+}
+
+const RES_DEFAULTS = { requests: { cpu: '100m', memory: '64Mi' }, limits: { cpu: '1', memory: '128Mi' } };
+
+const RES_CPU_HPA = {
+  apiVersion: 'autoscaling/v2', kind: 'HorizontalPodAutoscaler',
+  metadata: { name: 'app' },
+  spec: {
+    scaleTargetRef: { apiVersion: 'apps/v1', kind: 'Deployment', name: 'app' },
+    minReplicas: 2, maxReplicas: 5,
+    behavior: { scaleDown: { stabilizationWindowSeconds: 60 } },
+    metrics: [{ type: 'Resource', resource: { name: 'cpu', target: { type: 'Utilization', averageUtilization: 60 } } }],
+  },
+};
+
+async function runResourcesScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const cancel = opts.cancel || null;
+  await hpaSnapshot(ns).catch(() => { throw new Error('The CPU HPA is not active in this namespace. Create a fresh resources run (it provisions its own HPA).'); });
+  // Preserve the exact original resources: every phase restores from these,
+  // and the finally below restores them even on error or cancellation.
+  // (Request must never exceed limit — Kubernetes rejects such pairs.)
+  const original = await containerResources(ns);
+  emit('note', { text: `Baseline resources: ${JSON.stringify(original)}. Phase 1 keeps the HPA and holds CPU traffic constant while the CPU request quadruples (limit stays 1, so 400m ≤ 1 is valid).` });
+  let denom = null, throttle = null, oom = null, restored = false, hpaRestored = false;
+  const bg = [];
+  // Local token merges End-lesson cancellation with internal-error teardown:
+  // any failure below first stops background work, settles it, then restores.
+  const local = { requested: false };
+  const cancelFn = () => (typeof cancel === 'function' && cancel()) || local.requested;
+  try {
+    // Phase 1: denominator effect at constant traffic. The utilization ratio
+    // (usage ÷ request) is robust to HPA replica changes, but HPA metrics lag
+    // ~30s, so the load runs 120s and sampling starts after 40s.
+    const load = traffic(120000, '/cpu?ms=120', emit, 200, 5, baseUrl, cancelFn);
+    bg.push(load.catch((e) => { if (e?.code !== CANCELLED) throw e; return []; }));
+    await unlessCancelled(sleep(40000), cancelFn);
+    const utilBefore = await avgUtil(ns, 3, cancelFn);
+    const desiredBefore = (await hpaSnapshot(ns).catch(() => ({}))).desired ?? null;
+    await patchContainerResources(ns, { requests: { cpu: '400m', memory: original?.requests?.memory || '64Mi' }, limits: { cpu: '1', memory: original?.limits?.memory || '128Mi' } }, cancelFn, null);
+    emit('note', { text: `CPU request ${original?.requests?.cpu || '?'}→400m (same traffic). Utilization was ${utilBefore}%; settling 30s past the rollout, then resampling.` });
+    await unlessCancelled(sleep(30000), cancelFn);
+    const utilAfter = await avgUtil(ns, 5, cancelFn);
+    const desiredAfter = (await hpaSnapshot(ns).catch(() => ({}))).desired ?? null;
+    await unlessCancelled(load, cancelFn);
+    denom = { utilBefore, utilAfter, desiredBefore, desiredAfter, trafficSame: true };
+    emit('note', { text: `Denominator: ${utilBefore}%→${utilAfter}% at the same offered traffic (desired ${desiredBefore}→${desiredAfter}).` });
+    // Phases 2–3 need FIXED capacity: the HPA would spread load across new
+    // pods and hide both throttling and OOM. It is removed here (metrics
+    // still flow; only the scaler object goes) and re-applied in the
+    // finally, with its absence stated in evidence.
+    await kubectl(ns, 'delete', 'hpa', '--all', '--ignore-not-found');
+    await kubectl(ns, 'scale', 'deployment/app', '--replicas=2');
+    await waitStablePods(ns, 2, 90000, cancelFn);
+    emit('note', { text: 'HPA removed and callers pinned to exactly 2 pods for deterministic throttle/OOM measurement (re-applied at the end).' });
+    // Phase 2: throttling measured directly via cpu.stat. Valid pair:
+    // request 100m ≤ limit 150m. Measured on the hottest pod (pinned by edge
+    // keepalive), UID-pinned across the window: a pod change mid-window
+    // voids the delta honestly instead of comparing strangers.
+    const stats0 = await cpuStatAll(ns);
+    const loadA = await pacedRequests(baseUrl, '/cpu?ms=120', 5, 25000, 8000, emit, { cancel: cancelFn });
+    const stats1 = await cpuStatAll(ns);
+    const hotA = hottestDelta(stats0, stats1);
+    const baseDelta = hotA?.throttledUsec ?? null;
+    const baseUsage = hotA?.usageMs ?? null;
+    await patchContainerResources(ns, { requests: { cpu: '100m', memory: original?.requests?.memory || '64Mi' }, limits: { cpu: '150m', memory: original?.limits?.memory || '128Mi' } }, cancelFn, 2);
+    const stats2 = await cpuStatAll(ns);
+    const loadB = await pacedRequests(baseUrl, '/cpu?ms=120', 5, 30000, 8000, emit, { cancel: cancelFn });
+    const stats3 = await cpuStatAll(ns);
+    const hotB = hottestDelta(stats2, stats3);
+    const top = await topFor(ns, 'app=scaling-app');
+    const tightDelta = hotB?.throttledUsec ?? null;
+    const tightUsage = hotB?.usageMs ?? null;
+    const loadSummary = (p) => ({ offered: p.offered, completed: p.completed, failed: p.failed, timeouts: p.timeouts, dropped: p.dropped });
+    throttle = { baseDeltaUsec: baseDelta, tightDeltaUsec: tightDelta, baseUsageMs: baseUsage, tightUsageMs: tightUsage, cappedCpuM: top?.avgCpuM ?? null, capped: top != null && top.avgCpuM < 250, fixedReplicas: 2, loadBase: loadSummary(loadA), loadTight: loadSummary(loadB), podBase: hotA?.name || null, podTight: hotB?.name || null, samePod: Boolean(hotA && hotB) };
+    emit('note', { text: `Throttling (cpu.stat, hottest same-name pod each window): +${baseDelta}µs over ${baseUsage}ms burned at limit 1 vs +${tightDelta}µs over ${tightUsage}ms at limit 150m; pod CPU capped ~${top?.avgCpuM ?? '?'}m.` });
+    // Phase 3: bounded OOM with restart + termination-reason evidence.
+    // Exactly 2 pods × up to 4 concurrent 32MB allocs each (128MB > 96Mi).
+    await patchContainerResources(ns, { requests: { cpu: '100m', memory: original?.requests?.memory || '64Mi' }, limits: { cpu: '150m', memory: '96Mi' } }, cancelFn, 2);
+    const r0 = await restartInfo(ns);
+    const agent = new http.Agent({ keepAlive: false });
+    let allocOk = 0, allocFailed = 0;
+    try {
+      throwIfCancelled(cancelFn);
+      const results = await Promise.all(Array.from({ length: 8 }, () => capacityRequest('/alloc?mb=32&holdMs=1500', baseUrl, 8000, agent)));
+      allocOk = results.filter((r) => r.ok).length;
+      allocFailed = results.length - allocOk;
+    } finally {
+      agent.destroy();
+    }
+    emit('note', { text: `Memory burst: ${allocOk} served, ${allocFailed} failed during the burst; waiting for termination state.` });
+    await unlessCancelled(sleep(8000), cancelFn);
+    const r1 = await restartInfo(ns);
+    oom = { restartsBefore: r0.restarts, restartsAfter: r1.restarts, reason: r1.reasons.find((x) => /OOMKilled/.test(x)) || r1.reasons[0] || null, reasons: r1.reasons.slice(0, 4), allocOk, allocFailed, fixedReplicas: 2 };
+    emit('note', { text: `OOM demo: restarts ${r0.restarts}→${r1.restarts}, termination ${oom.reason || 'none recorded'}.` });
+  } catch (error) {
+    local.requested = true;
+    await settleBg(bg);
+    throw error;
+  } finally {
+    try {
+      if (typeof cancel === 'function' && cancel()) throw Object.assign(new Error('restore skipped after cancellation: namespace teardown finalizes'), { code: CANCELLED });
+      await patchContainerResources(ns, {
+        requests: { cpu: original?.requests?.cpu || '100m', memory: original?.requests?.memory || '64Mi' },
+        limits: { cpu: original?.limits?.cpu || '1', memory: original?.limits?.memory || '128Mi' },
+      }, null, 2);
+      const back = await containerResources(ns);
+      restored = back?.requests?.cpu === (original?.requests?.cpu || '100m')
+        && back?.limits?.cpu === (original?.limits?.cpu || '1')
+        && back?.limits?.memory === (original?.limits?.memory || '128Mi');
+      emit('note', { text: `Resources restored to originals: ${JSON.stringify(back)}.` });
+      await kubectlApply(ns, { ...RES_CPU_HPA, metadata: { ...RES_CPU_HPA.metadata, namespace: ns } });
+      await kubectl(ns, 'get', 'hpa', 'app', '-o', 'name');
+      hpaRestored = true;
+      emit('note', { text: 'CPU HPA re-applied after deterministic phases.' });
+    } catch (error) {
+      if (error?.code === CANCELLED) emit('note', { text: 'Restore skipped after cancellation: namespace teardown finalizes. Verify the deployment before reuse.' });
+      else emit('error', { text: `Restore FAILED: ${error.message}. Check kubectl --context kind-scaling-lab -n ${ns} get deployment/app,hpa.` });
+    }
+  }
+  return gradeResources({ denom, throttle, oom, restored: restored && hpaRestored });
+}
+
+// Settle background promises after requesting their end: they observe the
+// local token every iteration and finish promptly, so restoration never waits
+// on a full-length load window.
+async function settleBg(bg) {
+  if (bg.length) await Promise.allSettled(bg);
+}
+
+async function runSignalsScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const cancel = opts.cancel || null;
+  const rps = 6;
+  emit('note', { text: `Comparing CPU burn vs slow I/O at equal offered RPS (${rps}/s, 20s each). CPU is sampled DURING each phase; missing samples stay missing, never zero.` });
+  async function phase(path) {
+    const tops = [];
+    const sampler = (async () => {
+      for (let i = 0; i < 4; i++) {
+        await unlessCancelled(sleep(5000), cancel);
+        tops.push(await topFor(ns, 'app=scaling-app'));
+      }
+    })();
+    try {
+      // Instant per-pod cgroup usage brackets the whole phase: the hottest
+      // same-name pod's burned CPU separates the workloads even though edge
+      // keepalive pins all of a phase's load onto one pod.
+      const usage0 = await cpuStatAll(ns);
+      const p = await pacedRequests(baseUrl, path, rps, 20000, 8000, emit, { cancel });
+      const usage1 = await cpuStatAll(ns);
+      await unlessCancelled(sampler, cancel);
+      const hot = hottestDelta(usage0, usage1);
+      const valid = tops.filter((t) => t != null);
+      return { ...summarizePaced(p, 1e9), avgCpuM: valid.length ? Math.round(valid.reduce((a, t) => a + t.avgCpuM, 0) / valid.length) : null, cpuSamples: valid.length, hotPod: hot?.name || null, hotUsageMs: hot?.usageMs ?? null };
+    } finally {
+      await sampler.catch(() => {});
+    }
+  }
+  const cpuPhase = await phase('/cpu?ms=200');
+  const ioPhase = await phase('/slow?ms=800');
+  emit('note', { text: `CPU work: hottest pod burned ${cpuPhase.hotUsageMs ?? 'unread'}ms over the phase (top avg ~${cpuPhase.avgCpuM ?? 'unread'}m, ${cpuPhase.cpuSamples}/4 samples), p50 ${cpuPhase.p50}ms. Slow I/O: hottest pod burned ${ioPhase.hotUsageMs ?? 'unread'}ms (top avg ~${ioPhase.avgCpuM ?? 'unread'}m), p50 ${ioPhase.p50}ms — same RPS, different cost.` });
+  return gradeSignals({ cpuPhase, ioPhase, rps });
+}
+
+// Bounded attempts sample: reads at most 20 small JSON bodies with
+// concurrency 4 to measure the real retry-attempt distribution per policy.
+async function sampleDepAttempts(baseUrl, path, n = 20) {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 4 });
+  const attempts = [];
+  try {
+    const queue = Array.from({ length: n }, () => path);
+    await Promise.all(Array.from({ length: 4 }, async () => {
+      while (queue.length) {
+        const p = queue.shift();
+        try {
+          const r = await fetch(`${baseUrl}${p}`, { signal: AbortSignal.timeout(10000) });
+          const body = await r.json().catch(() => ({}));
+          if (Number.isFinite(body.attempts)) attempts.push(body.attempts);
+        } catch { /* counted as missing, not invented */ }
+      }
+    }));
+  } finally {
+    agent.destroy();
+  }
+  attempts.sort((a, b) => a - b);
+  return { n: attempts.length, avg: attempts.length ? Math.round((attempts.reduce((a, b) => a + b, 0) / attempts.length) * 100) / 100 : null, max: attempts.length ? attempts[attempts.length - 1] : null };
+}
+
+async function setDepPolicy(ns, { retries, timeoutMs, backoffMs }, cancel) {
+  throwIfCancelled(cancel);
+  await kubectl(ns, 'set', 'env', 'deployment/app', `DEP_RETRIES=${retries}`, `DEP_TIMEOUT_MS=${timeoutMs}`, `DEP_BACKOFF_MS=${backoffMs}`);
+  await unlessCancelled(kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s'), cancel);
+  await waitStablePods(ns, 4, 90000, cancel);
+}
+
+async function runDownstreamScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const cancel = opts.cancel || null;
+  await kubectl(ns, 'get', 'deployment/dep', '-o', 'name').catch(() => { throw new Error('The isolated dependency is missing. Create a fresh downstream run (it provisions its own dep).'); });
+  const probeAgent = new http.Agent({ keepAlive: false });
+  let probe;
+  try {
+    probe = await capacityRequest('/dep?ms=100&via=cpu', baseUrl, 4000, probeAgent);
+  } finally {
+    probeAgent.destroy();
+  }
+  if (!probe.ok) throw new Error(`Dependency probe failed (${probe.error || probe.status}). Check deployment/dep in ${ns}.`);
+  let phaseA = null, phaseB = null, depA = null, depB = null, restored = false;
+  try {
+    emit('note', { text: 'Phase A (aggressive but bounded): 4 callers, 3 retries, 2.5s timeout — 12 RPS at a 1-pod CPU-bound dependency. Reducing, not raising, the budget is the fix direction.' });
+    await kubectl(ns, 'scale', 'deployment/app', '--replicas=4');
+    await waitStablePods(ns, 4, 90000, cancel);
+    await setDepPolicy(ns, { retries: 3, timeoutMs: 2500, backoffMs: 50 }, cancel);
+    const depCpu0 = await topFor(ns, 'app=scaling-dep');
+    const a = await pacedRequests(baseUrl, '/dep?ms=300&via=cpu', 12, 30000, 6000, emit, { countShed: true, cancel });
+    const attemptsA = await sampleDepAttempts(baseUrl, '/dep?ms=300&via=cpu');
+    depA = { cpuM: (await topFor(ns, 'app=scaling-dep'))?.avgCpuM ?? null, inflight: await depInflightGauge(ns), cpuBeforeM: depCpu0?.avgCpuM ?? null };
+    phaseA = { ...summarizePaced(a, 2000), depCpuM: depA.cpuM, attemptsAvg: attemptsA.avg, attemptsMax: attemptsA.max, attemptsN: attemptsA.n, policy: 'retries=3,timeout=2500ms' };
+    emit('note', { text: `Phase A: timely ${phaseA.timelyRps}/s, shed ${phaseA.shed}, timeouts ${phaseA.timeouts}, p95 ${phaseA.p95}ms, attempts avg ${attemptsA.avg} (max ${attemptsA.max}, n=${attemptsA.n}); dep CPU ~${depA.cpuM}m (was ~${depA.cpuBeforeM}m), dep inflight gauge ${depA.inflight ?? 'unread'}.` });
+    emit('note', { text: 'Phase B (strict): same callers and load, no retries, 1s fail-fast timeout — shed early instead of amplifying.' });
+    await setDepPolicy(ns, { retries: 0, timeoutMs: 1000, backoffMs: 100 }, cancel);
+    const b = await pacedRequests(baseUrl, '/dep?ms=300&via=cpu', 12, 30000, 6000, emit, { countShed: true, cancel });
+    const attemptsB = await sampleDepAttempts(baseUrl, '/dep?ms=300&via=cpu');
+    depB = { cpuM: (await topFor(ns, 'app=scaling-dep'))?.avgCpuM ?? null, inflight: await depInflightGauge(ns) };
+    phaseB = { ...summarizePaced(b, 2000), depCpuM: depB.cpuM, attemptsAvg: attemptsB.avg, attemptsMax: attemptsB.max, attemptsN: attemptsB.n, policy: 'retries=0,timeout=1000ms' };
+    emit('note', { text: `Phase B: timely ${phaseB.timelyRps}/s, shed ${phaseB.shed}, timeouts ${phaseB.timeouts}, p95 ${phaseB.p95}ms, attempts avg ${attemptsB.avg} (max ${attemptsB.max}, n=${attemptsB.n}); dep CPU ~${depB.cpuM}m.` });
+  } finally {
+    try {
+      throwIfCancelled(cancel);
+      await kubectl(ns, 'scale', 'deployment/app', '--replicas=2');
+      await kubectl(ns, 'set', 'env', 'deployment/app', 'DEP_RETRIES=0', 'DEP_TIMEOUT_MS=1500', 'DEP_BACKOFF_MS=100');
+      await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
+      await waitStablePods(ns, 2, 90000);
+      restored = true;
+      emit('note', { text: 'Callers restored to 2 replicas with the default dependency policy.' });
+    } catch (error) {
+      if (error?.code !== CANCELLED) emit('error', { text: `Downstream restore FAILED: ${error.message}. Check kubectl --context kind-scaling-lab -n ${ns} get deployment/app.` });
+      else emit('error', { text: 'Downstream restore skipped after cancellation: namespace teardown finalizes. Verify the deployment before reuse.' });
+    }
+  }
+  return gradeDownstream({ phaseA, phaseB, depA, depB, restored });
+}
+
+const DISRUPTION_PDB = (ns) => ({
+  apiVersion: 'policy/v1', kind: 'PodDisruptionBudget',
+  metadata: { name: 'app-pdb', namespace: ns },
+  spec: { maxUnavailable: 1, selector: { matchLabels: { app: 'scaling-app' } } },
+});
+
+async function pdbStatus(ns) {
+  try {
+    const raw = await kubectl(ns, 'get', 'pdb', 'app-pdb', '-o', 'json');
+    const p = JSON.parse(raw);
+    return {
+      disruptionsAllowed: p.status?.disruptionsAllowed ?? null,
+      currentHealthy: p.status?.currentHealthy ?? null,
+      desiredHealthy: p.status?.desiredHealthy ?? null,
+      expectedPods: p.status?.expectedPods ?? null,
+    };
+  } catch { return null; }
+}
+
+async function runDisruptionsScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const cancel = opts.cancel || null;
+  let e1 = null, e2 = null, deleted = null, trafficRes = null, pdbRemoved = false;
+  const bg = [];
+  try {
+    await kubectlApply(ns, DISRUPTION_PDB(ns));
+    emit('note', { text: 'PDB applied (maxUnavailable 1 over 3 pods). Background traffic started; evictions honor the budget, deletes do not.' });
+    const trafficP = traffic(90000, '/fast', emit, 120, 5, baseUrl, cancel);
+    bg.push(trafficP.catch((e) => { if (e?.code !== CANCELLED) throw e; return []; }));
+    await unlessCancelled(sleep(3000), cancel);
+    const pods = await podNames(ns);
+    throwIfCancelled(cancel);
+    e1 = await evictPod(ns, pods[0]);
+    emit('note', { text: `Evict ${pods[0]}: ${e1.allowed ? 'ALLOWED' : `refused (${e1.detail.slice(0, 120)})`}.` });
+    // Deterministic block condition: poll the PDB itself until it reports
+    // zero allowed disruptions (the first victim must actually count as
+    // unavailable) BEFORE attempting the second eviction. A fixed sleep
+    // races pod termination and proves nothing.
+    let budgetWaitSecs = 0;
+    {
+      const until = Date.now() + 90000;
+      let allowedNow = null;
+      while (Date.now() < until) {
+        throwIfCancelled(cancel);
+        const st = await pdbStatus(ns);
+        allowedNow = st?.disruptionsAllowed ?? null;
+        if (allowedNow === 0) break;
+        budgetWaitSecs = Math.round((Date.now() - (until - 90000)) / 1000);
+        await unlessCancelled(sleep(3000), cancel);
+      }
+      emit('note', { text: `PDB disruptionsAllowed=${allowedNow ?? 'unread'} after ${budgetWaitSecs}s of waiting for the first victim to count as unavailable.` });
+    }
+    const remainingRaw = await kubectl(ns, 'get', 'pods', '-l', 'app=scaling-app', '-o', 'json');
+    const remaining = (JSON.parse(remainingRaw).items || [])
+      .filter((p) => !p.metadata?.deletionTimestamp && p.status?.containerStatuses?.every((c) => c.ready))
+      .map((p) => p.metadata.name)
+      .filter((p) => p !== pods[0]);
+    if (!remaining.length) throw new Error('No Ready surviving pod to attempt the second eviction on.');
+    e2 = await evictPod(ns, remaining[0]);
+    const pdb = await pdbStatus(ns);
+    e2.pdbAllowed = pdb?.disruptionsAllowed ?? null;
+    e2.pdb = pdb;
+    emit('note', { text: `Evict ${remaining[0] || pods[1]}: ${e2.allowed ? 'ALLOWED (budget had room — see PDB status)' : `BLOCKED (${e2.detail.slice(0, 120)})`}; PDB disruptionsAllowed=${pdb?.disruptionsAllowed ?? 'unread'}.` });
+    await unlessCancelled(sleep(3000), cancel);
+    const victim = (await podNames(ns))[0];
+    throwIfCancelled(cancel);
+    await kubectl(ns, 'delete', 'pod', victim, '--wait=false');
+    deleted = { pod: victim, deleted: true };
+    emit('note', { text: `Direct delete of ${victim}: succeeded (PDBs do not stop deletes). Rolling under traffic.` });
+    await kubectl(ns, 'set', 'env', 'deployment/app', `LAB_REV=${Date.now()}`);
+    await unlessCancelled(kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s'), cancel);
+    const samples = await unlessCancelled(trafficP, cancel);
+    const failures = samples.filter((x) => !x.ok);
+    trafficRes = { total: samples.length, failures: failures.length, kinds: [...new Set(failures.map((x) => x.error || `HTTP ${x.status}`))].slice(0, 5) };
+    emit('note', { text: `Background: ${samples.length} sampled, ${failures.length} failed (${trafficRes.kinds.join(', ') || 'none'}).` });
+  } catch (error) {
+    if (error?.code !== CANCELLED) {
+      await settleBg(bg);
+    }
+    throw error;
+  } finally {
+    try {
+      await kubectl(ns, 'delete', 'pdb', 'app-pdb', '--ignore-not-found');
+      pdbRemoved = (await pdbStatus(ns)) === null;
+      if (!pdbRemoved) emit('error', { text: 'PDB cleanup FAILED: app-pdb still present.' });
+    } catch (error) {
+      emit('error', { text: `PDB cleanup FAILED: ${error.message}.` });
+    }
+  }
+  return gradeDisruptions({ evict1: e1, evict2: e2, deleted, traffic: trafficRes, pdbRemoved });
+}
+
+async function endpointReadyGoneAt(ns, pod, timeoutMs = 15000, cancel = null) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    throwIfCancelled(cancel);
+    try {
+      const raw = await kubectl(ns, 'get', 'endpointslices', '-l', 'kubernetes.io/service-name=app', '-o', 'json');
+      const present = (JSON.parse(raw).items || []).flatMap((x) => x.endpoints || [])
+        .some((e) => e.targetRef?.name === pod && e.conditions?.ready && !e.conditions?.terminating);
+      if (!present) return new Date().toISOString();
+    } catch { /* keep polling */ }
+    await sleep(500);
+  }
+  return null;
+}
+
+async function runGatewayScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const cancel = opts.cancel || null;
+  const agent = new http.Agent({ keepAlive: true });
+  try {
+    const slowReq = startRequest('/slow?ms=8000', agent, baseUrl);
+    const headers = await slowReq.headers;
+    if (!headers.pod) throw new Error(`Drain request did not reach a pod: ${headers.error}`);
+    emit('slow-start', headers);
+    const bgP = traffic(25000, '/fast', emit, 150, 5, baseUrl, cancel);
+    await unlessCancelled(sleep(900), cancel);
+    const podDeleteAt = new Date().toISOString();
+    emit('pod-delete', { pod: headers.pod });
+    await kubectl(ns, 'delete', 'pod', headers.pod, '--wait=false');
+    // Request completion and endpoint observation run INDEPENDENTLY: the end
+    // timestamp is stamped the moment the request promise settles, never
+    // after awaiting the endpoint poll, so neither order can be fabricated.
+    let requestEndAt = null, slow = null;
+    const doneP = slowReq.done.then((r) => {
+      slow = { ...r, pod: headers.pod };
+      requestEndAt = new Date().toISOString();
+      emit('slow-end', slow);
+      return r;
+    });
+    const goneP = endpointReadyGoneAt(ns, headers.pod, 15000, cancel);
+    await doneP;
+    const endpointGoneAt = await goneP;
+    const samples = await bgP;
+  const bg = { ok: 0, http502: 0, transport: 0 };
+  for (const s of samples) {
+    if (s.ok) bg.ok += 1;
+    else if ([502, 503, 504].includes(s.status)) bg.http502 += 1;
+    else bg.transport += 1;
+  }
+  const ordering = endpointGoneAt && requestEndAt
+    ? (Date.parse(endpointGoneAt) <= Date.parse(requestEndAt)
+      ? `endpoint removal preceded response completion by ${Math.round((Date.parse(requestEndAt) - Date.parse(endpointGoneAt)) / 100) / 10}s`
+      : `response completion preceded endpoint removal by ${Math.round((Date.parse(endpointGoneAt) - Date.parse(requestEndAt)) / 100) / 10}s`)
+    : null;
+  emit('note', { text: `Drain: slow request ${slow.complete ? `completed in ${slow.ms}ms` : `interrupted (${slow.error || 'no body'})`}; ${ordering || 'endpoint timing unrecorded'}. Background: ${bg.ok} ok, ${bg.http502} HTTP 502/503/504, ${bg.transport} transport failures.` });
+  return gradeGateway({ drain: { podDeleteAt, endpointGoneAt, requestEndAt, ordering, slowOutcome: { complete: slow.complete, ms: slow.ms, status: slow.status, error: slow.error || null }, bg } });
+  } catch (error) {
+    try { await bgP; } catch { /* settled for evidence; original error wins */ }
+    throw error;
+  } finally {
+    agent.destroy();
+  }
+}
+
+const CAPSTONE_MIX = {
+  balanced: { path: '/fast', rps: 15 },
+  'cpu-heavy': { path: '/cpu?ms=120', rps: 8 },
+  'io-heavy': { path: '/slow?ms=600', rps: 8 },
+};
+
+async function probePhase(baseUrl, path, durationMs, timeoutMs, opts = {}) {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 16 });
+  const lat = [];
+  let failed = 0;
+  const until = Date.now() + durationMs;
+  try {
+    while (Date.now() < until) {
+      throwIfCancelled(opts.cancel);
+      const r = await capacityRequest(path, baseUrl, timeoutMs, agent);
+      if (r.complete && r.ok) lat.push(r.ms);
+      else failed += 1;
+      await sleep(2000);
+    }
+  } finally {
+    agent.destroy();
+  }
+  lat.sort((a, b) => a - b);
+  const samples = lat.length + failed;
+  return { p95: percentile(lat, 95), errorPct: samples ? Math.round((failed / samples) * 1000) / 10 : 100, samples };
+}
+
+async function runCapstoneScenario(emit, opts = {}) {
+  const ns = opts.namespace || 'scaling-lab';
+  const baseUrl = opts.endpoint || base;
+  const cancel = opts.cancel || null;
+  const { sloP95Ms, sloErrorPct, mix } = validateCapstoneOptions(opts.options);
+  const spec = CAPSTONE_MIX[mix];
+  const objective = { sloP95Ms, sloErrorPct, mix, path: spec.path, rps: spec.rps };
+  emit('note', { text: `Capstone objective: p95 ≤ ${sloP95Ms}ms, errors ≤ ${sloErrorPct}% on ${mix} traffic (${spec.rps} RPS ${spec.path}). Graded traffic runs THROUGHOUT each event — post-event probes alone never pass. Replica growth alone never passes.` });
+  // Every phase grades the actual paced stream concurrent with its event.
+  // Partial evidence is emitted as notes throughout, so cancellation or
+  // failure still leaves an honest trail in the archived events.
+  const toPhase = (stream) => {
+    const total = stream.completed + stream.failed;
+    return {
+      p95: percentile(stream.lat, 95),
+      errorPct: total ? Math.round((stream.failed / total) * 1000) / 10 : 100,
+      samples: total, offered: stream.offered, dropped: stream.dropped,
+      timeouts: stream.timeouts, statusCounts: stream.statusCounts,
+    };
+  };
+  const phases = {};
+  const bg = [];
+  try {
+    // Burst.
+    emit('note', { text: 'Phase burst: 40s elevated load, graded throughout.' });
+    const burst = await pacedRequests(baseUrl, spec.path, spec.rps, 40000, 5000, emit, { cancel });
+    phases.burst = toPhase(burst);
+    emit('note', { text: `Burst: offered ${burst.offered}, p95 ${phases.burst.p95}ms, errors ${phases.burst.errorPct}% (${phases.burst.samples} samples).` });
+    // Rollout under traffic: the stream covers trigger, roll, and settle.
+    emit('note', { text: 'Phase rollout: traffic runs through trigger, roll, and settle.' });
+    const rollP = pacedRequests(baseUrl, spec.path, spec.rps, 45000, 5000, emit, { cancel });
+    bg.push(rollP.catch((e) => { if (e?.code !== CANCELLED) throw e; return null; }));
+    await unlessCancelled(sleep(3000), cancel);
+    throwIfCancelled(cancel);
+    await kubectl(ns, 'set', 'env', 'deployment/app', `LAB_REV=${Date.now()}`);
+    await unlessCancelled(kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s'), cancel);
+    const roll = await unlessCancelled(rollP, cancel);
+    phases.rollout = toPhase(roll);
+    emit('note', { text: `Rollout: offered ${roll.offered}, p95 ${phases.rollout.p95}ms, errors ${phases.rollout.errorPct}% (${phases.rollout.samples} samples).` });
+    // Guarded disruption: PDB-honoring eviction under traffic. An actual
+    // allowed eviction is required — a refused one fails the phase openly.
+    emit('note', { text: 'Phase disruption: PDB-guarded eviction under traffic (allowed eviction required).' });
+    await kubectlApply(ns, DISRUPTION_PDB(ns));
+    const disP = pacedRequests(baseUrl, spec.path, spec.rps, 30000, 5000, emit, { cancel });
+    bg.push(disP.catch((e) => { if (e?.code !== CANCELLED) throw e; return null; }));
+    await unlessCancelled(sleep(3000), cancel);
+    const dpods = await podNames(ns);
+    throwIfCancelled(cancel);
+    const ev = await evictPod(ns, dpods[0]);
+    emit('note', { text: `Eviction of ${dpods[0]}: ${ev.allowed ? 'allowed' : `REFUSED (${ev.detail.slice(0, 100)}) — phase cannot pass without an allowed disruption`}.` });
+    const dis = await unlessCancelled(disP, cancel);
+    phases.disruption = { ...toPhase(dis), eviction: ev.allowed ? 'allowed' : 'refused' };
+    emit('note', { text: `Disruption: offered ${dis.offered}, p95 ${phases.disruption.p95}ms, errors ${phases.disruption.errorPct}% (${phases.disruption.samples} samples), eviction ${phases.disruption.eviction}.` });
+    // Recovery: settling traffic, still graded.
+    emit('note', { text: 'Phase recovery: 30s settling traffic, still graded.' });
+    const rec = await pacedRequests(baseUrl, spec.path, Math.max(3, Math.floor(spec.rps / 3)), 30000, 5000, emit, { cancel });
+    phases.recovery = toPhase(rec);
+    emit('note', { text: `Recovery: p95 ${phases.recovery.p95}ms, errors ${phases.recovery.errorPct}% (${phases.recovery.samples} samples).` });
+  } catch (error) {
+    if (error?.code !== CANCELLED) await settleBg(bg);
+    throw error;
+  } finally {
+    try {
+      await kubectl(ns, 'delete', 'pdb', 'app-pdb', '--ignore-not-found');
+    } catch (error) {
+      emit('error', { text: `PDB cleanup FAILED: ${error.message}.` });
+    }
+  }
+  return gradeCapstone({ objective, phases });
 }
