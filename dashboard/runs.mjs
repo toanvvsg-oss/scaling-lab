@@ -64,6 +64,82 @@ export const RUN_CONFIG = {
   gateway: { replicas: 2, scaler: null },
   capstone: { replicas: 2, scaler: 'cpu-hpa' },
 };
+export const LEARNING_VERSION = 2;
+// Diagnosis-report version, independent of LEARNING_VERSION: bump only when
+// the shape below changes. Absent diagnosis sections in old archives stay
+// null and read as unknown, never as completed.
+export const DIAGNOSIS_VERSION = 1;
+export const HINT_LEVELS = [1, 2, 3];
+
+// Versioned learning record attached to each attempt (run). Absent fields in
+// old archives must be treated as unknown, never as completed or failed.
+export function blankLearning() {
+  return { version: LEARNING_VERSION, prediction: null, explanation: null, selfReview: null, modelRevealed: null, diagnosis: null };
+}
+
+// Blank diagnosis report (Milestone 5): hints used, the learner's own
+// initial diagnosis / change / outcome, and the challenge variant that
+// produced them. Hints are never a gate and reasoning is never auto-graded —
+// this record only preserves what the learner did, separately from the
+// machine-observable experiment verdict.
+export function blankDiagnosis() {
+  return { version: DIAGNOSIS_VERSION, hintsUsed: [], initialDiagnosis: null, change: null, outcome: null, variant: null };
+}
+
+// Normalize a stored diagnosis report without inventing activity: a missing
+// or malformed report stays null (unknown); well-formed parts are kept, and
+// hint entries with an invalid level are dropped rather than repaired.
+export function normalizeDiagnosis(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const clean = blankDiagnosis();
+  if (Array.isArray(raw.hintsUsed)) {
+    for (const h of raw.hintsUsed) {
+      if (h && typeof h === 'object' && HINT_LEVELS.includes(h.level) && typeof h.at === 'string') {
+        clean.hintsUsed.push({ level: h.level, at: h.at });
+      }
+    }
+    clean.hintsUsed = clean.hintsUsed.slice(-20);
+  }
+  for (const f of ['initialDiagnosis', 'change', 'outcome']) {
+    if (typeof raw[f] === 'string') clean[f] = raw[f];
+  }
+  if (raw.variant && typeof raw.variant === 'object') clean.variant = raw.variant;
+  if (typeof raw.at === 'string') clean.at = raw.at;
+  if (typeof raw.lesson === 'string') clean.lesson = raw.lesson;
+  if (typeof raw.run === 'string') clean.run = raw.run;
+  clean.version = DIAGNOSIS_VERSION;
+  return clean;
+}
+
+// Normalize a stored learning record without inventing activity: missing or
+// malformed sections stay null (readers render them as unavailable/unknown).
+export function normalizeLearning(raw) {
+  const base = blankLearning();
+  if (!raw || typeof raw !== 'object') return base;
+  if (raw.prediction && typeof raw.prediction === 'object') base.prediction = raw.prediction;
+  if (raw.explanation && typeof raw.explanation === 'object') base.explanation = raw.explanation;
+  if (raw.selfReview && typeof raw.selfReview === 'object') base.selfReview = raw.selfReview;
+  if (raw.modelRevealed && typeof raw.modelRevealed === 'object') base.modelRevealed = raw.modelRevealed;
+  base.diagnosis = normalizeDiagnosis(raw.diagnosis);
+  base.version = LEARNING_VERSION;
+  return base;
+}
+
+export function learningStatus(learning) {
+  const l = normalizeLearning(learning);
+  const prediction = !l.prediction ? 'unknown-none' : (l.prediction.status === 'skipped' ? 'skipped' : l.prediction.status === 'recorded' ? 'recorded' : 'unknown-none');
+  const explanation = !l.explanation ? 'unknown-none' : (l.explanation.status === 'skipped' ? 'skipped' : l.explanation.status === 'submitted' ? 'submitted' : 'unknown-none');
+  const diagnosis = !l.diagnosis ? 'unknown-none'
+    : (typeof l.diagnosis.initialDiagnosis === 'string' && l.diagnosis.initialDiagnosis ? 'submitted'
+      : (Array.isArray(l.diagnosis.hintsUsed) && l.diagnosis.hintsUsed.length ? 'hints-only' : 'unknown-none'));
+  return {
+    prediction,
+    explanation,
+    diagnosis,
+    selfReview: l.selfReview?.done === true ? 'done' : 'unknown-none',
+    modelRevealed: Boolean(l.modelRevealed?.at),
+  };
+}
 export function runConfig(lesson) {
   const cfg = RUN_CONFIG[lesson];
   if (!cfg) throw new Error(`Unknown run lesson: ${lesson}.`);
@@ -156,6 +232,7 @@ export async function adoptOrphanRuns(deps = realDeps) {
       createdAt: ns.metadata.creationTimestamp || new Date().toISOString(),
       steps: [], events: [], timeline: createHistory(), result: null,
       load: null, forward: null, forwardPort: null, prev: null, readopted: true,
+      learning: blankLearning(),
     };
     if (present) {
       try {
@@ -340,15 +417,18 @@ function edgeManifests(ns) {
   ];
 }
 
-function cpuHpaManifest(ns) {
+export function cpuHpaManifest(ns, opts = {}) {
+  const minReplicas = Number.isInteger(opts.minReplicas) ? opts.minReplicas : 2;
+  const maxReplicas = Number.isInteger(opts.maxReplicas) ? opts.maxReplicas : 5;
+  const cpuTarget = Number.isInteger(opts.cpuTarget) ? opts.cpuTarget : 60;
   return {
     apiVersion: 'autoscaling/v2', kind: 'HorizontalPodAutoscaler',
     metadata: { name: 'app', namespace: ns },
     spec: {
       scaleTargetRef: { apiVersion: 'apps/v1', kind: 'Deployment', name: 'app' },
-      minReplicas: 2, maxReplicas: 5,
+      minReplicas, maxReplicas,
       behavior: { scaleDown: { stabilizationWindowSeconds: 60 } },
-      metrics: [{ type: 'Resource', resource: { name: 'cpu', target: { type: 'Utilization', averageUtilization: 60 } } }],
+      metrics: [{ type: 'Resource', resource: { name: 'cpu', target: { type: 'Utilization', averageUtilization: cpuTarget } } }],
     },
   };
 }
@@ -488,6 +568,10 @@ export function describeRun(run) {
     hasPendingLong: Boolean(run.pendingLong),
     actions: run.actions || 0,
     resultStatus: run.result?.status || null,
+    learning: normalizeLearning(run.learning),
+    learningStatus: learningStatus(run.learning),
+    attempt: run.attempt || null,
+    attemptCount: (run.attempts?.length || 0) + 1,
     resources: {
       appReplicas: runConfig(run.lesson).replicas, appCpuRequest: '100m', appMemoryRequest: '64Mi',
       edgeReplicas: 1, scaler: runConfig(run.lesson).scaler || 'none',
@@ -509,6 +593,7 @@ export function beginRun(lesson, onEvent, deps = realDeps) {
     id, ns, lesson, status: 'creating', createdAt: new Date().toISOString(),
     error: null, steps: [], events: [], timeline: createHistory(), result: null,
     load: null, forward: null, forwardPort: null, prev: null,
+    learning: blankLearning(),
   };
   runs.set(id, run);
   return run;
@@ -586,6 +671,8 @@ export function buildArchive(run) {
     steps: run.steps, load: run.load ? run.load.state() : null,
     queue: run.queue ? run.queue.stats() : null,
     result: run.result, timeline: run.timeline, events: run.events,
+    learning: normalizeLearning(run.learning),
+    attempt: run.attempt || null, attempts: run.attempts || [],
   };
 }
 

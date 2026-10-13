@@ -7,10 +7,11 @@ import { LoadSession, PROFILES, CPU_PROFILES, CAPACITY_PROFILES, profileSet, pro
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, runReset } from './reset.mjs';
 import { queryPrometheus, queryRunSamples, LEGACY_RATE_QUERY, rateQueryForRun, upQueryForRun, counterSelForRun, upSelForRun } from './prometheus.mjs';
-import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns, checkLessonPrereqs } from './runs.mjs';
+import { runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS, validateRunId, describeRun, beginRun, finishRun, createRun, cleanupRun, runClusterState, buildArchive, adoptOrphanRuns, checkLessonPrereqs, blankLearning, normalizeLearning, blankDiagnosis, normalizeDiagnosis, HINT_LEVELS } from './runs.mjs';
 import { runAction } from './actions.mjs';
 import { grafanaStatus, closeGrafanaForward, dashboardUrl, panelEmbedUrl } from './grafana.mjs';
 import { learnerPath, proxyRunApp } from './app-route.mjs';
+import { currentAttempt, prepareAttempt, startAttempt, savePractice, restorePractice } from './learning.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const resultsDir = process.env.SCALING_LAB_RESULTS_DIR ? resolve(process.env.SCALING_LAB_RESULTS_DIR) : join(root, '..', 'results');
@@ -27,10 +28,10 @@ export const EXPLANATIONS = {
   prometheus: 'Prometheus scrapes every 5s, KEDA polls every 5s, and HPA stabilizes scale-down for 60s. Expect: offered RPS rises first, scraped RPS follows, desired replicas follow, Ready pods arrive last; reverse on scale-in.',
   capacity: 'One pod can only do so much: offered load queues or times out while goodput flattens and tail latency climbs. The sweep finds the highest offered rate meeting your latency/error objective on this exact configuration — a measurement, not a production rating.',
   resources: 'CPU requests size the HPA utilization denominator and schedule pods; CPU limits throttle at runtime. Raising requests can move HPA decisions with zero traffic change, and memory limits kill (OOMKill) instead of slowing down.',
-  hpareact: 'HPA desired = ceil(currentReplicas × observed / target) per metric, then tolerance (±10% ignores small moves) applies; pods that are unready or lack metrics are left out of the calculation and the controller holds rather than guessing from zero; min/max bounds and scale-down stabilization delay the visible reaction. Desired replicas are a decision; Ready pods are usable capacity, minutes apart.',
+  hpareact: 'HPA desired = ceil(currentReplicas × observed / target) per metric, then tolerance (±10% ignores small moves) applies; missing-metric pods are set aside initially, then included conservatively at the target for scale-down or zero for scale-up; not-yet-ready CPU pods can dampen scale-up. The controller holds if the adjusted ratio reverses direction or falls within tolerance; min/max bounds and scale-down stabilization delay the visible reaction. Desired replicas are a decision; Ready pods are usable capacity, minutes apart.',
   signals: 'Equal RPS can mean wildly different work: CPU burn vs waiting on slow I/O look identical as request counts. A scaling signal should move when useful capacity is added — CPU is a poor signal for queue or I/O-bound work.',
   downstream: 'Adding app replicas cannot beat a saturated dependency: throughput caps at the dependency, queues and tail latency grow instead. Bounded retries, concurrency limits, and early shedding protect timely success; unbounded retries amplify the overload.',
-  pending: 'HPA can desire replicas that never run: requests exceeding allocatable capacity, unsatisfiable placement constraints, or fragmentation leave pods Pending. Desired ≠ scheduled ≠ Running ≠ Ready, and only node capacity (not HPA) fixes Pending.',
+  pending: 'HPA can desire replicas that never run: requests exceeding allocatable capacity, unsatisfiable placement constraints, or fragmentation leave pods Pending. Desired ≠ scheduled ≠ Running ≠ Ready, and the remedy depends on the scheduler reason: add schedulable capacity when resources are insufficient, or fix an impossible placement constraint. HPA alone fixes neither.',
   disruptions: 'Evictions honor PodDisruptionBudgets; direct pod deletion, rollouts, and involuntary node loss do not wait for them. Availability through change needs spare Ready capacity plus topology spread — and a guarded, reversible drain procedure for real nodes.',
   gateway: 'A pod being Ready is only half the path: backends must attach to the load balancer (NEGs/endpoints), pass health checks, and drain gracefully on shutdown. When 502/503 appear during rollouts, compare endpoint-removal order against response completion before concluding: early backend removal is one common cause among several. This local exercise is a backend-drain analogue, not GKE.',
   capstone: 'Meeting an objective through burst, rollout, and disruption takes warm headroom, bounded max replicas, and honest measurement: replica growth alone never passes. Export the raw evidence, the criteria, and the limitations.',
@@ -38,6 +39,47 @@ export const EXPLANATIONS = {
 
 export const LOAD_DURATIONS = [60, 120, 180, 300];
 const PREDICT_VALUES = new Set(['up', 'down', 'same', 'share', 'fresh']);
+
+// Milestone 3 learning-record bounds and self-review content (Q3.1–Q3.4).
+// Predictions/explanations are the learner's own work: stored verbatim within
+// bounds, never auto-graded, and absent fields in old archives stay unknown.
+export const PREDICT_REASONING_MAX = 2000;
+export const EXPLAIN_FIELD_MAX = 2000;
+export const DIAGNOSIS_TEXT_MAX = 2000;
+export const SELF_REVIEW_RUBRIC = [
+  'Names a specific observed change with its timing or phase (not a general claim).',
+  'Cites concrete evidence: a metric value, phase, timeline point, check, or event from this attempt.',
+  'Explains why the evidence supports the interpretation (the mechanism), rather than restating the observation.',
+  'Proposes a next measurement or bounded change that would test the interpretation.',
+];
+export const DIAGNOSIS_VARIANT_ALLOWLIST = new Set(['capacity-challenge']);
+export const HINT_TEXTS = {
+  1: 'Where to inspect: compare offered RPS against generator-clean steps, timely goodput, and p95/error per step in the sweep evidence.',
+  2: 'How to interpret: only generator-clean steps (no dropped offers, no missed slots) can judge service capacity; a generator-limited step measures the generator.',
+  3: 'Worked diagnosis: the highest generator-clean rate meeting the stated p95/error objective is the per-pod estimate; size pods as ceil(peak / estimate) plus explicit headroom, then name what to re-measure before production.',
+};
+
+function ensureLearning(run) {
+  if (!run.learning || typeof run.learning !== 'object') run.learning = blankLearning();
+  return run.learning;
+}
+
+function modelExplanationFor(lesson) {
+  return EXPLANATIONS[lesson] || EXPLANATIONS.prometheus;
+}
+
+function rubricFor() {
+  return [...SELF_REVIEW_RUBRIC];
+}
+
+function explainSnapshot(e) {
+  if (!e || typeof e !== 'object') return null;
+  const snap = { status: e.status || null, at: e.at || null };
+  for (const f of ['observation', 'evidence', 'interpretation', 'nextAction']) {
+    if (typeof e[f] === 'string') snap[f] = e[f];
+  }
+  return snap;
+}
 
 export const prodDeps = {
   clusterState, runScenario, checkLessonPrereqs,
@@ -133,6 +175,7 @@ async function endLessonRun(run, ctx) {
     if (run.actionRunning) { fail('A learner action is still running. Retry End; nothing was deleted.'); return; }
     stage('archive', 'Persisting evidence and deleting only the owned lesson namespace.');
     run.ended = run.result?.status === 'cancelled' ? 'cancelled' : run.result ? 'completed' : 'incomplete';
+    if (run.practiceSave) await run.practiceSave;
     await R.cleanupRun(run.id, io.resultsDir);
     emit('note', { text: `Lesson ended; evidence retained for run ${run.id}.` });
     clear();
@@ -335,6 +378,17 @@ export function createApp(overrides = {}) {
     return R.runs.get(id) || null;
   }
 
+  function editableLearningRun(id) {
+    const run = getRun(id);
+    if (!run) throw Object.assign(new Error(`Unknown run: ${id}`), { status: 404 });
+    if (run.status !== 'ready' || lessonFlow.migration ||
+        (lessonFlow.active && (lessonFlow.active.runId !== id || lessonFlow.active.status !== 'ready'))) {
+      throw Object.assign(new Error('Learning records are writable only in the ready active lesson. History is read-only.'), { status: 409 });
+    }
+    currentAttempt(run);
+    return run;
+  }
+
   function lessonProfiles(lesson) {
     return profilesForLesson(lesson, io.profiles);
   }
@@ -507,10 +561,15 @@ function summarizeAction(s) {
       return;
     }
     function lessonHistory() {
-      return [...R.archives.values()].map((a) => ({
-        run: a.run, lesson: a.lesson, archivedAt: a.archivedAt,
-        status: a.result?.status || a.status, ended: a.ended || null,
-      })).sort((a, b) => (a.archivedAt < b.archivedAt ? 1 : -1));
+      return [...R.archives.values()].map((a) => {
+        const l = normalizeLearning(a.learning);
+        return {
+          run: a.run, lesson: a.lesson, archivedAt: a.archivedAt,
+          status: a.result?.status || a.status, ended: a.ended || null,
+          prediction: l.prediction || null, explanation: l.explanation || null,
+          selfReview: l.selfReview || null,
+        };
+      }).sort((a, b) => (a.archivedAt < b.archivedAt ? 1 : -1));
     }
 
     if (req.method === 'GET' && path === '/api/lesson') {
@@ -656,10 +715,15 @@ function summarizeAction(s) {
       if (req.method === 'GET' && !sub) {
         const key = `run:${run.id}`;
         const pred = state.predictions[key];
+        const learning = normalizeLearning(run.learning);
         return send(res, 200, {
           ...R.describeRun(run), rev: run.rev || 0, events: run.events.slice(-200),
           predicted: Boolean(pred), revealed: Boolean(pred?.revealed), predictGuess: pred?.guess || null,
           observed: Boolean(run.experimentAt),
+          prediction: learning.prediction || null, explanation: learning.explanation || null,
+          selfReview: learning.selfReview || null, modelRevealed: learning.modelRevealed || null,
+          modelExplanation: learning.modelRevealed ? modelExplanationFor(run.lesson) : null,
+          rubric: learning.explanation ? rubricFor() : [],
         });
       }
       if (req.method === 'GET' && sub === 'timeline') return send(res, 200, run.timeline);
@@ -681,10 +745,20 @@ function summarizeAction(s) {
         run.scenarioRunning = true;
         run.scenario = input.id;
         run.mode = input.mode;
+        startAttempt(run);
+        delete state.predictions[`run:${run.id}`];
+        if (run.learning?.prediction) state.predictions[`run:${run.id}`] = {
+          guess: run.learning.prediction.answer || null, at: run.learning.prediction.at,
+          lesson: run.lesson, revealed: false,
+        };
         run.result = null;
         run.error = null;
         run.cancel = { requested: false };
-        run.experimentAt = new Date().toISOString();
+        try { await savePractice(run, io.resultsDir); }
+        catch (error) {
+          run.scenarioRunning = false;
+          return send(res, 500, { error: `Could not save the attempt: ${error.message}` });
+        }
         send(res, 202, { started: true });
         const stopObs = observeRun(run);
         // Retained-cleanup retry rejoins the SAME outstanding work instead of
@@ -709,8 +783,13 @@ function summarizeAction(s) {
           rateQuery: io.rateQueryForRun(run.id), upQuery: io.upQueryForRun(run.id), options,
           cancel: () => Boolean(run.cancel?.requested),
         }, (t, d) => runEmit(run, t, d)))
-          .then((result) => { run.result = result; runEmit(run, 'result', { status: result.status }); })
-          .catch((error) => {
+          .then(async (result) => {
+            run.result = result;
+            currentAttempt(run).completedAt = new Date().toISOString();
+            runEmit(run, 'result', { status: result.status });
+            await savePractice(run, io.resultsDir);
+          })
+          .catch(async (error) => {
             if (error?.code === CLEANUP_UNSETTLED && error?.cleanupKey) {
               // Distinct cleanup failure wins — even when the original
               // scenario was cancelled: retain the allocation with ownership
@@ -724,6 +803,10 @@ function summarizeAction(s) {
             } else {
               run.error = error.message; runEmit(run, 'error', { text: error.message });
             }
+            await savePractice(run, io.resultsDir).catch((e) => {
+              run.error = `Evidence persistence failed: ${e.message}`;
+              runEmit(run, 'error', { text: run.error });
+            });
           })
           // Never clear the running flag while cleanup is retained: the
           // record is removed only after the SAME work is awaited to
@@ -738,7 +821,11 @@ function summarizeAction(s) {
           if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before sending traffic.` });
           if (run.cleanupPending && input.action !== 'stop') return send(res, 409, { error: `Retained background work from ${run.cleanupPending.scenario} is unsettled. No new load until it settles.` });
           const out = await runLoadAction(run, input.action, input.profile, input.durationMs);
-          if (input.action === 'start') run.experimentAt = new Date().toISOString();
+          if (input.action === 'start') {
+            run.experimentAt = new Date().toISOString();
+            currentAttempt(run).startedAt ||= run.experimentAt;
+          }
+          await savePractice(run, io.resultsDir);
           return send(res, 200, out);
         } catch (error) {
           return send(res, error.status || 400, { error: error.message });
@@ -761,7 +848,9 @@ function summarizeAction(s) {
             const summary = await io.runAction(run, input.action, input, (t, d) => runEmit(run, t, d));
             run.actions = (run.actions || 0) + 1;
             run.experimentAt = new Date().toISOString();
+            currentAttempt(run).startedAt ||= run.experimentAt;
             runEmit(run, 'action', { text: `${input.action}: ${summarizeAction(summary)}`, detail: JSON.stringify(summary).slice(0, 300), action: input.action });
+            await savePractice(run, io.resultsDir);
             return send(res, 200, summary);
           } finally {
             run.actionRunning = false;
@@ -788,13 +877,57 @@ function summarizeAction(s) {
       }
       return send(res, 405, { error: 'Method not allowed for this run resource.' });
     }
-    if (req.method === 'POST' && path === '/api/predict') {
+    if (req.method === 'POST' && path === '/api/attempt') {
       try {
         const input = await readBody(req);
+        const run = editableLearningRun(input.run);
+        if (run.scenarioRunning || run.actionRunning || run.pendingLong || run.load?.active || run.queue?.active) {
+          return send(res, 409, { error: 'Stop active work before preparing another attempt.' });
+        }
+        prepareAttempt(run);
+        delete state.predictions[`run:${run.id}`];
+        await savePractice(run, io.resultsDir);
+        return send(res, 200, { attempt: run.attempt });
+      } catch (error) { return send(res, error.status || 400, { error: error.message }); }
+    }
+    if (req.method === 'POST' && path === '/api/predict') {
+      try {
+        const input = await readBody(req, 16384);
+        const reasoningRaw = input.reasoning ?? '';
+        if (typeof reasoningRaw !== 'string') return send(res, 400, { error: 'reasoning must be a string.' });
+        if (reasoningRaw.length > PREDICT_REASONING_MAX) return send(res, 400, { error: `reasoning must be at most ${PREDICT_REASONING_MAX} characters.` });
+        const reasoning = reasoningRaw;
+        const skip = input.skip === true;
+        if (input.run != null) {
+          const run = editableLearningRun(input.run);
+          if (input.lesson != null && input.lesson !== run.lesson) {
+            return send(res, 400, { error: `Lesson ${input.lesson} does not belong to run ${run.id} (lesson ${run.lesson}).` });
+          }
+          const at = new Date().toISOString();
+          const prior = !Boolean(run.experimentAt);
+          let prediction;
+          if (skip) {
+            prediction = { status: 'skipped', reasoning, at, lesson: run.lesson, run: run.id, attempt: run.attempt.id, prior };
+          } else {
+            const answer = input.guess ?? input.answer;
+            if (!PREDICT_VALUES.has(answer)) return send(res, 400, { error: 'Unknown prediction value.' });
+            prediction = { status: 'recorded', answer, reasoning, at, lesson: run.lesson, run: run.id, attempt: run.attempt.id, prior };
+          }
+          ensureLearning(run).prediction = prediction;
+          const key = `run:${run.id}`;
+          state.predictions[key] = { guess: skip ? null : prediction.answer, skipped: skip, lesson: run.lesson, at, revealed: false };
+          await savePractice(run, io.resultsDir);
+          return send(res, 200, { recorded: true, scope: key, prior, prediction });
+        }
+        const lesson = input.lesson || state.scenario || 'prometheus';
+        const at = new Date().toISOString();
+        if (skip) {
+          state.predictions.legacy = { guess: null, skipped: true, lesson, at, revealed: false };
+          return send(res, 200, { recorded: true, scope: 'legacy', skipped: true });
+        }
         if (!PREDICT_VALUES.has(input.guess)) return send(res, 400, { error: 'Unknown prediction value.' });
-        const scope = predictionScope(input);
-        state.predictions[scope.key] = { guess: input.guess, lesson: scope.lesson, at: new Date().toISOString(), revealed: false };
-        return send(res, 200, { recorded: true, scope: scope.key });
+        state.predictions.legacy = { guess: input.guess, lesson, at, revealed: false };
+        return send(res, 200, { recorded: true, scope: 'legacy', prior: !Boolean(state.experimentAt) });
       } catch (error) {
         return send(res, error.status || 400, { error: error.message });
       }
@@ -811,7 +944,149 @@ function summarizeAction(s) {
         if (rec.lesson === 'shutdown' && scope.run?.mode === 'abrupt') {
           explanation += ' This run used abrupt mode, so expect the long request interrupted and background errors possible — compare with a graceful run.';
         }
+        // Revealing the model answer never submits the learner's explanation:
+        // it only records that the reference was shown for this attempt.
+        if (scope.run) {
+          editableLearningRun(scope.run.id);
+          const learning = ensureLearning(scope.run);
+          if (!learning.modelRevealed) {
+            learning.modelRevealed = { at: new Date().toISOString(), lesson: rec.lesson, run: scope.run.id };
+          }
+          await savePractice(scope.run, io.resultsDir);
+        }
         return send(res, 200, { explanation });
+      } catch (error) {
+        return send(res, error.status || 400, { error: error.message });
+      }
+    }
+    if (req.method === 'POST' && path === '/api/explain') {
+      try {
+        const input = await readBody(req, 32768);
+        if (input.run == null) return send(res, 400, { error: 'run is required.' });
+        const run = editableLearningRun(input.run);
+        const learning = ensureLearning(run);
+        const prev = learning.explanation;
+        const prevRevisions = Array.isArray(prev?.revisions) ? prev.revisions : (prev ? [explainSnapshot(prev)].filter(Boolean) : []);
+        const at = new Date().toISOString();
+        let explanation;
+        if (input.skip === true) {
+          const revision = (prev?.revision || 0) + 1;
+          const snap = { status: 'skipped', at, lesson: run.lesson, run: run.id };
+          explanation = { status: 'skipped', observation: null, evidence: null, interpretation: null, nextAction: null, at, lesson: run.lesson, run: run.id, attempt: run.attempt.id, revision, revisions: [prevRevisions[0] || snap, ...[...prevRevisions.slice(1), ...(prevRevisions.length ? [snap] : [])].slice(-9)] };
+        } else {
+          const fields = ['observation', 'evidence', 'interpretation', 'nextAction'];
+          const clean = {};
+          for (const f of fields) {
+            const v = input[f];
+            if (typeof v !== 'string' || !v.trim()) return send(res, 400, { error: `explanation field ${f} is required (1-${EXPLAIN_FIELD_MAX} chars).` });
+            if (v.length > EXPLAIN_FIELD_MAX) return send(res, 400, { error: `explanation field ${f} must be at most ${EXPLAIN_FIELD_MAX} characters.` });
+            clean[f] = v;
+          }
+          const revision = (prev?.revision || 0) + 1;
+          const snap = { status: 'submitted', ...clean, at, lesson: run.lesson, run: run.id };
+          explanation = { status: 'submitted', ...clean, at, lesson: run.lesson, run: run.id, attempt: run.attempt.id, revision, revisions: [prevRevisions[0] || snap, ...[...prevRevisions.slice(1), ...(prevRevisions.length ? [snap] : [])].slice(-9)] };
+        }
+        learning.explanation = explanation;
+        learning.selfReview = null;
+        await savePractice(run, io.resultsDir);
+        return send(res, 200, { submitted: true, revision: explanation.revision, explanation });
+      } catch (error) {
+        return send(res, error.status || 400, { error: error.message });
+      }
+    }
+    // Milestone 5 minimal (Q5.1+Q5.4 shape): bounded hints and a diagnosis
+    // report stored on the M3 learning record. Hints never gate and reasoning
+    // is never auto-graded — this only preserves what the learner did. The
+    // challenge variant is allowlisted to capacity-challenge so runs reproduce
+    // exactly; UI is intentionally skipped (persistence + tests only).
+    if (req.method === 'POST' && path === '/api/hint') {
+      try {
+        const input = await readBody(req);
+        if (input.run == null) return send(res, 400, { error: 'run is required.' });
+        const run = editableLearningRun(input.run);
+        if (!HINT_LEVELS.includes(input.level)) return send(res, 400, { error: `Unknown hint level. Expected one of ${HINT_LEVELS.join(', ')}.` });
+        const learning = ensureLearning(run);
+        if (!learning.diagnosis || typeof learning.diagnosis !== 'object') learning.diagnosis = blankDiagnosis();
+        if (!Array.isArray(learning.diagnosis.hintsUsed)) learning.diagnosis.hintsUsed = [];
+        learning.diagnosis.hintsUsed.push({ level: input.level, at: new Date().toISOString() });
+        learning.diagnosis.hintsUsed = learning.diagnosis.hintsUsed.slice(-20);
+        learning.diagnosis.lesson = run.lesson;
+        learning.diagnosis.run = run.id;
+        await savePractice(run, io.resultsDir);
+        return send(res, 200, { level: input.level, text: HINT_TEXTS[input.level], hintsUsed: learning.diagnosis.hintsUsed.length });
+      } catch (error) {
+        return send(res, error.status || 400, { error: error.message });
+      }
+    }
+    if (req.method === 'POST' && path === '/api/diagnosis') {
+      try {
+        const input = await readBody(req, 16384);
+        if (input.run == null) return send(res, 400, { error: 'run is required.' });
+        const run = editableLearningRun(input.run);
+        const fields = ['initialDiagnosis', 'change', 'outcome'];
+        const clean = {};
+        let provided = 0;
+        for (const f of fields) {
+          if (input[f] === undefined) continue;
+          if (typeof input[f] !== 'string' || !input[f].trim()) return send(res, 400, { error: `diagnosis field ${f} must be a non-empty string.` });
+          if (input[f].length > DIAGNOSIS_TEXT_MAX) return send(res, 400, { error: `diagnosis field ${f} must be at most ${DIAGNOSIS_TEXT_MAX} characters.` });
+          clean[f] = input[f];
+          provided += 1;
+        }
+        if (provided === 0 && input.variant === undefined) {
+          return send(res, 400, { error: 'Provide at least one of initialDiagnosis, change, outcome, or variant.' });
+        }
+        let variant = null;
+        if (input.variant !== undefined) {
+          if (!input.variant || typeof input.variant !== 'object' || !DIAGNOSIS_VARIANT_ALLOWLIST.has(input.variant.kind)) {
+            return send(res, 400, { error: `Unknown challenge variant. Expected kind one of ${[...DIAGNOSIS_VARIANT_ALLOWLIST].join(', ')}.` });
+          }
+          if (input.variant.config !== undefined) {
+            try {
+              validateCapacityOptions(input.variant.config);
+            } catch (error) {
+              return send(res, 400, { error: `Invalid challenge config: ${error.message}` });
+            }
+          }
+          variant = input.variant;
+        }
+        const learning = ensureLearning(run);
+        if (!learning.diagnosis || typeof learning.diagnosis !== 'object') learning.diagnosis = blankDiagnosis();
+        const prev = normalizeDiagnosis(learning.diagnosis) || blankDiagnosis();
+        const next = { ...prev, ...clean };
+        if (variant) next.variant = variant;
+        next.at = new Date().toISOString();
+        next.lesson = run.lesson;
+        next.run = run.id;
+        learning.diagnosis = next;
+        await savePractice(run, io.resultsDir);
+        return send(res, 200, { submitted: true, diagnosis: normalizeDiagnosis(learning.diagnosis) });
+      } catch (error) {
+        return send(res, error.status || 400, { error: error.message });
+      }
+    }
+    if (req.method === 'POST' && path === '/api/self-review') {
+      try {
+        const input = await readBody(req);
+        if (input.run == null) return send(res, 400, { error: 'run is required.' });
+        const run = editableLearningRun(input.run);
+        const learning = ensureLearning(run);
+        const expl = learning.explanation;
+        if (!expl || (expl.status !== 'submitted' && expl.status !== 'skipped')) {
+          return send(res, 400, { error: 'Submit or skip your explanation first.' });
+        }
+        const modelExplanation = modelExplanationFor(run.lesson);
+        const rubric = rubricFor();
+        if (learning.selfReview?.done === true) {
+          return send(res, 200, { done: true, at: learning.selfReview.at, modelExplanation, rubric, idempotent: true });
+        }
+        const at = new Date().toISOString();
+        learning.selfReview = { done: true, at, lesson: run.lesson, run: run.id };
+        if (!learning.modelRevealed) {
+          learning.modelRevealed = { at, lesson: run.lesson, run: run.id };
+        }
+        await savePractice(run, io.resultsDir);
+        return send(res, 200, { done: true, at, modelExplanation, rubric });
       } catch (error) {
         return send(res, error.status || 400, { error: error.message });
       }
@@ -937,8 +1212,18 @@ function summarizeAction(s) {
       }
       const adopted = await R.adoptOrphanRuns();
       for (const run of adopted) {
+        try {
+          await restorePractice(run, io.resultsDir);
+          const pred = run.learning?.prediction;
+          if (pred) state.predictions[`run:${run.id}`] = {
+            guess: pred.answer || null, at: pred.at, lesson: run.lesson,
+            revealed: Boolean(run.learning?.modelRevealed), skipped: pred.status === 'skipped',
+          };
+        } catch (error) {
+          run.status = 'degraded'; run.error = error.message;
+        }
         if (run.status === 'ready') wireRunLoad(run);
-        emit('note', { text: `Re-adopted run ${run.id} (${run.ns}): ${run.status}${run.error ? ' — ' + run.error : ''}. Previous in-memory events are gone; archive files persist.` });
+        emit('note', { text: `Re-adopted run ${run.id} (${run.ns}): ${run.status}${run.error ? ' — ' + run.error : ''}. Saved learning and attempt evidence recovered where available.` });
       }
       // Single-lesson reconciliation: 0 → nothing; 1 → resume it as the
       // active lesson; >1 → one-time explicit migration choice (never silent

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from './components/button.jsx';
 import { Card, CardContent } from './components/card.jsx';
 import { TimelineChart } from './components/timeline.jsx';
@@ -40,10 +40,21 @@ export default function App() {
   const [capErr, setCapErr] = useState(5);
   const [hpaPredict, setHpaPredict] = useState(4);
   const [capMix, setCapMix] = useState('balanced');
+  const [capMin, setCapMin] = useState(2);
+  const [capMax, setCapMax] = useState(5);
+  const [capCpu, setCapCpu] = useState(60);
+  const [capRationale, setCapRationale] = useState('');
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState('');
   const [guess, setGuess] = useState(null);
   const [quizPick, setQuizPick] = useState(null);
+  const [predReason, setPredReason] = useState('');
+  const [expObs, setExpObs] = useState('');
+  const [expEv, setExpEv] = useState('');
+  const [expInterp, setExpInterp] = useState('');
+  const [expNext, setExpNext] = useState('');
+  const [modelText, setModelText] = useState('');
+  const hydratedAttempt = useRef(null);
   const [evidence, setEvidence] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [switchTarget, setSwitchTarget] = useState(null);
@@ -67,6 +78,13 @@ export default function App() {
     setEvidence(null);
     setGuess(null);
     setQuizPick(null);
+    setPredReason('');
+    setExpObs('');
+    setExpEv('');
+    setExpInterp('');
+    setExpNext('');
+    setModelText('');
+    hydratedAttempt.current = null;
     setSwitchTarget(null);
   }, []);
 
@@ -127,6 +145,22 @@ export default function App() {
       clearInterval(t);
     };
   }, [activeRunId, monitorView]);
+
+  // Hydrate once per attempt, rather than on every poll (which would erase
+  // edits in progress). Refresh/restart restores submitted learner work.
+  useEffect(() => {
+    if (!activeRunId || !runDetail || runDetail.id !== activeRunId) return;
+    const key = `${activeRunId}:${runDetail.attempt?.id || 'initial'}`;
+    if (hydratedAttempt.current === key) return;
+    hydratedAttempt.current = key;
+    setGuess(runDetail.prediction?.answer || null);
+    setPredReason(runDetail.prediction?.reasoning || '');
+    setExpObs(runDetail.explanation?.observation || '');
+    setExpEv(runDetail.explanation?.evidence || '');
+    setExpInterp(runDetail.explanation?.interpretation || '');
+    setExpNext(runDetail.explanation?.nextAction || '');
+    setModelText(runDetail.modelExplanation || '');
+  }, [activeRunId, runDetail]);
 
   const startLesson = async (id) => {
     setBusy('Starting lesson…');
@@ -202,6 +236,10 @@ export default function App() {
           sloP95Ms: Math.min(5000, Math.max(100, Number(capP95) || 800)),
           sloErrorPct: Math.min(20, Math.max(0, Number(capErr) || 0)),
           mix: ['balanced', 'cpu-heavy', 'io-heavy'].includes(capMix) ? capMix : 'balanced',
+          minReplicas: Math.min(5, Math.max(1, Math.round(Number(capMin)) || 2)),
+          maxReplicas: Math.min(8, Math.max(1, Math.round(Number(capMax)) || 5)),
+          cpuTarget: Math.min(90, Math.max(30, Math.round(Number(capCpu)) || 60)),
+          rationale: String(capRationale || '').slice(0, 500),
         };
       }
       await postJSON(`/api/runs/${activeRunId}/run`, body);
@@ -241,11 +279,42 @@ export default function App() {
     }
   };
 
+  const refreshRunDetail = async () => {
+    if (!activeRunId) return;
+    try {
+      const d = await getJSON(`/api/runs/${activeRunId}`).catch(() => null);
+      if (d) {
+        setRunDetail(d);
+        if (d.prediction?.answer) setGuess(d.prediction.answer);
+      }
+    } catch { /* keep last */ }
+  };
+
+  const prepareNextAttempt = async () => {
+    try {
+      await postJSON('/api/attempt', { run: activeRunId });
+      await refreshRunDetail();
+      setNotice('New attempt prepared. Record your next prediction before running. Previous results remain in the evidence export.');
+    } catch (e) { setNotice(e.message); }
+  };
+
   const predict = async (g) => {
     try {
-      await postJSON('/api/predict', { guess: g, lesson: lesson.id, run: activeRunId || undefined });
+      const out = await postJSON('/api/predict', { guess: g, reasoning: predReason, lesson: lesson.id, run: activeRunId || undefined });
       setGuess(g);
-      setNotice('Predicted. Observe, then reveal.');
+      setNotice(out.prior === false ? 'Recorded after the experiment — kept with the attempt, not labeled a prior prediction.' : 'Predicted. Observe, then reveal the model explanation.');
+      refreshRunDetail();
+    } catch (e) {
+      setNotice(e.message);
+    }
+  };
+
+  const skipPrediction = async () => {
+    try {
+      await postJSON('/api/predict', { skip: true, reasoning: predReason, lesson: lesson.id, run: activeRunId || undefined });
+      setGuess(null);
+      setNotice('Prediction skipped — recorded as skipped for this attempt.');
+      refreshRunDetail();
     } catch (e) {
       setNotice(e.message);
     }
@@ -254,7 +323,52 @@ export default function App() {
   const reveal = async () => {
     try {
       const out = await postJSON('/api/reveal', { lesson: lesson.id, run: activeRunId || undefined });
-      setNotice(out.explanation);
+      setModelText(out.explanation);
+      setNotice('Model explanation shown. It does not complete Explain — submit your own explanation below.');
+      refreshRunDetail();
+    } catch (e) {
+      setNotice(e.message);
+    }
+  };
+
+  const submitExplanation = async () => {
+    if (!activeRunId) {
+      setNotice('Start the lesson first.');
+      return;
+    }
+    try {
+      await postJSON('/api/explain', { run: activeRunId, observation: expObs, evidence: expEv, interpretation: expInterp, nextAction: expNext });
+      setNotice('Explanation submitted. Compare it with the model explanation in self-review.');
+      refreshRunDetail();
+    } catch (e) {
+      setNotice(e.message);
+    }
+  };
+
+  const skipExplanation = async () => {
+    if (!activeRunId) {
+      setNotice('Start the lesson first.');
+      return;
+    }
+    try {
+      await postJSON('/api/explain', { run: activeRunId, skip: true });
+      setNotice('Explanation skipped — recorded as skipped for this attempt.');
+      refreshRunDetail();
+    } catch (e) {
+      setNotice(e.message);
+    }
+  };
+
+  const completeSelfReview = async () => {
+    if (!activeRunId) {
+      setNotice('Start the lesson first.');
+      return;
+    }
+    try {
+      const out = await postJSON('/api/self-review', { run: activeRunId });
+      setModelText(out.modelExplanation || '');
+      setNotice('Self-review recorded. Revising keeps your initial response.');
+      refreshRunDetail();
     } catch (e) {
       setNotice(e.message);
     }
@@ -299,12 +413,25 @@ export default function App() {
   const history = flow.history || [];
   const runUnavailable = Boolean(busy || !activeRun || activeRun.status !== 'ready' || activeRun.actionRunning || activeRun.scenarioRunning);
   const defs = ACTION_DEFS[lesson.id] || [];
+  // Progress states stay distinct: the experiment verdict never depends on
+  // the prediction, revealing the model answer never completes Explain, and
+  // a submission is never labeled mastered/correct/graded.
+  const prediction = runDetail?.prediction || null;
+  const explanation = runDetail?.explanation || null;
+  const selfReview = runDetail?.selfReview || null;
+  const modelRevealed = Boolean(runDetail?.modelRevealed);
+  const predLabel = !prediction ? 'not recorded'
+    : prediction.status === 'skipped' ? `skipped ${new Date(prediction.at).toLocaleTimeString()}`
+    : `recorded ${new Date(prediction.at).toLocaleTimeString()} · ${prediction.prior ? 'prior prediction' : 'recorded after observation — not a prior prediction'}`;
+  const explLabel = !explanation ? 'not submitted'
+    : explanation.status === 'skipped' ? `skipped ${new Date(explanation.at).toLocaleTimeString()}`
+    : `submitted ${new Date(explanation.at).toLocaleTimeString()}${explanation.revision > 1 ? ` · revision ${explanation.revision} (initial preserved)` : ''}`;
   const done = {
     baseline: activeRun?.status === 'ready',
-    predict: Boolean(runDetail?.predicted),
+    predict: Boolean(prediction),
     act: Boolean(activeRun?.scenario || (activeRun?.actions || 0) > 0 || (activeRun?.load?.total || 0) > 0),
     observe: Boolean(runDetail?.observed),
-    explain: Boolean(runDetail?.revealed),
+    explain: Boolean(explanation),
     checks: Boolean(activeRun?.resultStatus),
   };
   const nextLesson = lesson.next ? byId[lesson.next] : null;
@@ -479,6 +606,28 @@ export default function App() {
                   </select>
                 </label>
                 )}
+                {lesson.id === 'capstone' && (
+                <label className="flex items-center gap-2">Min replicas
+                  <input value={capMin} onChange={(e) => setCapMin(e.target.value)} inputMode="numeric" min={1} max={5} className="w-16 rounded-md border p-1 text-sm" aria-label="Capstone minimum replicas" />
+                </label>
+                )}
+                {lesson.id === 'capstone' && (
+                <label className="flex items-center gap-2">Max replicas
+                  <input value={capMax} onChange={(e) => setCapMax(e.target.value)} inputMode="numeric" min={1} max={8} className="w-16 rounded-md border p-1 text-sm" aria-label="Capstone maximum replicas" />
+                </label>
+                )}
+                {lesson.id === 'capstone' && (
+                <label className="flex items-center gap-2">CPU target
+                  <input value={capCpu} onChange={(e) => setCapCpu(e.target.value)} inputMode="numeric" min={30} max={90} className="w-16 rounded-md border p-1 text-sm" aria-label="Capstone CPU target percent" /> %
+                </label>
+                )}
+              </div>
+            )}
+            {lesson.id === 'capstone' && (
+              <div className="rounded-md border bg-muted/40 p-2 text-sm">
+                <label className="block">Rationale (required, ≤500 chars): why do these HPA bounds fit the objective?
+                  <textarea value={capRationale} onChange={(e) => setCapRationale(e.target.value)} rows={2} maxLength={500} className="mt-1 w-full rounded-md border bg-card p-1.5 text-sm text-foreground" placeholder="e.g. min 2 holds warm headroom for the burst; max 5 caps laptop load; 60% leaves scale room." aria-label="Capstone rationale" />
+                </label>
               </div>
             )}
             {lesson.id === 'shutdown' && (
@@ -498,10 +647,28 @@ export default function App() {
                 <span className="text-xs text-muted-foreground">Formula: ceil(replicas × observed ÷ target), ±1 counts as agreement.</span>
               </div>
             )}
+            <div className="space-y-2 rounded-md border p-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">Attempt {runDetail?.attempt?.id || '1'} · {(runDetail?.attemptCount || 1) - 1} previous attempts retained</span>
+                {runDetail?.observed && <Button variant="outline" size="sm" disabled={runUnavailable || activeRun?.load?.active || activeRun?.hasPendingLong} onClick={prepareNextAttempt}>Prepare next attempt</Button>}
+              </div>
+              <p className="text-sm"><strong>Predict first:</strong> {lesson.predict}</p>
+              <div className="flex flex-wrap gap-2">
+                {lesson.guesses.map(([v, label]) => (
+                  <Button key={v} variant={guess === v || prediction?.answer === v ? 'default' : 'outline'} size="sm" onClick={() => predict(v)}>{label}</Button>
+                ))}
+                <Button variant="ghost" size="sm" onClick={skipPrediction}>Skip prediction</Button>
+              </div>
+              <label className="block text-xs text-muted-foreground">Reasoning (short, saved with this attempt)
+                <textarea aria-label="Reasoning (short, saved with this attempt)" value={predReason} onChange={(e) => setPredReason(e.target.value)} rows={2} maxLength={2000} className="mt-1 w-full rounded-md border bg-card p-1.5 text-sm text-foreground" placeholder="What do you expect, and why?" />
+              </label>
+              <p className="text-xs text-muted-foreground">Prediction: {predLabel}. An incorrect prediction never fails the experiment.</p>
+            </div>
             <div className="flex flex-wrap gap-1">
               {STEPS.map((s) => (
                 <span key={s} className={`rounded-full border px-2 py-1 font-mono text-[10px] ${done[s] ? 'border-green-600 bg-green-50 text-green-800' : 'text-muted-foreground'}`}>{s}</span>
               ))}
+              <span className={`rounded-full border px-2 py-1 font-mono text-[10px] ${selfReview?.done ? 'border-green-600 bg-green-50 text-green-800' : 'text-muted-foreground'}`} title="Self-review is done only after you submit or skip your explanation">self-review{selfReview?.done ? ' ✓' : ''}</span>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button disabled={runUnavailable && !busy} onClick={runScenario}>Run + verify →</Button>
@@ -559,15 +726,6 @@ export default function App() {
                 <p className="text-xs text-muted-foreground">{activeRun?.load?.active ? `${activeRun.load.profile} · target ${activeRun.load.targetRps} req/s · total ${activeRun.load.total}` : 'Manual load idle.'}</p>
               </div>
             )}
-            <div className="space-y-2 border-t pt-2">
-              <p className="text-sm"><strong>Predict:</strong> {lesson.predict}</p>
-              <div className="flex flex-wrap gap-2">
-                {lesson.guesses.map(([v, label]) => (
-                  <Button key={v} variant={guess === v ? 'default' : 'outline'} size="sm" onClick={() => predict(v)}>{label}</Button>
-                ))}
-                <Button variant="ghost" size="sm" onClick={reveal}>Reveal explanation</Button>
-              </div>
-            </div>
             {notice && <p className="rounded-md bg-muted p-2 text-xs">{notice}</p>}
           </CardContent></Card>
           )}
@@ -595,16 +753,56 @@ export default function App() {
           {showPractice && (
           <Card><CardContent className="space-y-2">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold">Check your understanding</h3>
+              <h3 className="text-sm font-semibold">Explain with evidence</h3>
               <span className="font-mono text-[10px] text-muted-foreground">04 / EXPLAIN</span>
             </div>
-            <p className="text-sm">{lesson.quiz}</p>
+            <p className="text-xs text-muted-foreground">Saved with this attempt, included in evidence export and History. A submission is your work — it is never auto-graded or labeled mastered/correct.</p>
+            <label className="block text-sm">Observation
+              <textarea aria-label="Observation" value={expObs} onChange={(e) => setExpObs(e.target.value)} rows={2} maxLength={2000} className="mt-1 w-full rounded-md border bg-card p-1.5 text-sm" placeholder="What changed, and when?" />
+            </label>
+            <label className="block text-sm">Cited evidence (metric, phase, or event)
+              <textarea aria-label="Cited evidence (metric, phase, or event)" value={expEv} onChange={(e) => setExpEv(e.target.value)} rows={2} maxLength={2000} className="mt-1 w-full rounded-md border bg-card p-1.5 text-sm" placeholder="Which timeline point, check, or event supports it?" />
+            </label>
+            <label className="block text-sm">Interpretation
+              <textarea aria-label="Interpretation" value={expInterp} onChange={(e) => setExpInterp(e.target.value)} rows={2} maxLength={2000} className="mt-1 w-full rounded-md border bg-card p-1.5 text-sm" placeholder="Why does the evidence mean that?" />
+            </label>
+            <label className="block text-sm">Proposed next action
+              <textarea aria-label="Proposed next action" value={expNext} onChange={(e) => setExpNext(e.target.value)} rows={2} maxLength={2000} className="mt-1 w-full rounded-md border bg-card p-1.5 text-sm" placeholder="What would you measure or change next?" />
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" onClick={submitExplanation}>Submit explanation</Button>
+              <Button variant="ghost" size="sm" onClick={skipExplanation}>Skip explanation</Button>
+              <Button variant="outline" size="sm" onClick={reveal}>Reveal model explanation</Button>
+            </div>
+            <p className="text-xs text-muted-foreground">Explanation: {explLabel}. Revealing the model answer does not submit yours.</p>
+            {(modelText || modelRevealed) && (
+              <div className="space-y-1 rounded-md border bg-muted/40 p-2">
+                <p className="text-xs font-semibold">Model explanation (reference, not a grade)</p>
+                <p className="text-sm">{modelText || runDetail?.modelExplanation || ''}</p>
+              </div>
+            )}
+            {explanation && (
+              <div className="space-y-1 rounded-md border p-2">
+                <p className="text-xs font-semibold">Self-review — compare your explanation against these criteria, then mark done</p>
+                <ul className="list-disc space-y-0.5 pl-5 text-sm">
+                  {(runDetail?.rubric || []).map((c, i) => <li key={i}>{c}</li>)}
+                </ul>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={completeSelfReview}>Mark self-review done</Button>
+                  {selfReview?.done && <span className="text-xs text-green-700">Self-review done {new Date(selfReview.at).toLocaleTimeString()}. Revising above keeps your initial response.</span>}
+                </div>
+              </div>
+            )}
+            <div className="space-y-2 border-t pt-2">
+              <p className="text-sm font-semibold">Check your understanding</p>
+              <p className="text-sm">{lesson.quiz}</p>
             <div className="flex flex-wrap gap-2">
               {lesson.answers.map((a, i) => (
                 <Button key={i} variant={quizPick === i ? (i === lesson.correct ? 'default' : 'outline') : 'outline'} size="sm" onClick={() => setQuizPick(i)}>{a}</Button>
               ))}
             </div>
             {quizPick != null && <p className="text-xs text-muted-foreground">{quizPick === lesson.correct ? 'Correct. ' : 'Try again. '}{lesson.why}</p>}
+            </div>
           </CardContent></Card>
           )}
 
@@ -633,11 +831,28 @@ export default function App() {
             {history.length ? (
               <div className="max-h-48 space-y-1 overflow-auto">
                 {history.map((h) => (
-                  <div key={h.run} className="flex flex-wrap items-center gap-2 text-xs">
+                  <div key={h.run} className="space-y-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="font-mono">{h.run}</span>
                     <span className="text-muted-foreground">{byId[h.lesson]?.title || h.lesson}</span>
                     <span className={`font-semibold ${h.status === 'pass' ? 'text-green-700' : h.status === 'fail' ? 'text-red-700' : 'text-muted-foreground'}`}>{h.status}{h.ended && h.ended !== 'completed' ? ` · ${h.ended}` : ''}</span>
+                    <span className="text-muted-foreground">
+                      prediction {h.prediction ? `${h.prediction.status}${h.prediction.prior === false ? ' (after observation)' : ''}` : 'unavailable'}
+                      {' · '}explanation {h.explanation ? h.explanation.status : 'unavailable'}
+                      {' · '}self-review {h.selfReview?.done ? 'done' : 'unavailable'}
+                    </span>
                     <button className="underline" onClick={() => downloadEvidence(h.run)}>Evidence</button>
+                  </div>
+                  {(h.prediction || h.explanation) && <details className="rounded border p-2">
+                    <summary className="cursor-pointer">Read saved learning</summary>
+                    {h.prediction && <p className="mt-2">Prediction: {h.prediction.answer || h.prediction.status} — {h.prediction.reasoning}</p>}
+                    {h.explanation?.status === 'submitted' && <div className="mt-2 space-y-1 whitespace-pre-wrap">
+                      <p><strong>Observation:</strong> {h.explanation.observation}</p>
+                      <p><strong>Evidence:</strong> {h.explanation.evidence}</p>
+                      <p><strong>Interpretation:</strong> {h.explanation.interpretation}</p>
+                      <p><strong>Next action:</strong> {h.explanation.nextAction}</p>
+                    </div>}
+                  </details>}
                   </div>
                 ))}
               </div>

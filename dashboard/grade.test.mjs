@@ -224,20 +224,90 @@ test('signals grader separates equal-RPS cost', async () => {
   assert.equal(missing.status, 'inconclusive', 'missing CPU samples stay inconclusive, never zero-filled');
 });
 
-test('downstream grader reports the strict-vs-aggressive verdict honestly', async () => {
+test('downstream grader reports the 3-phase comparison honestly', async () => {
   const { gradeDownstream } = await import('./grade.mjs');
-  const mk = (timely, shed) => ({ offered: 360, timelyRps: timely, shed, timeouts: 10, p95: 1500, attemptsAvg: 1, attemptsMax: 1, attemptsN: 20 });
-  const win = gradeDownstream({
-    phaseA: mk(4, 60), phaseB: mk(9, 20),
-    depA: { cpuM: 950, inflight: 6 }, depB: { cpuM: 940, inflight: 4 }, restored: true,
+  const workload = { path: '/dep?ms=300&via=cpu', rps: 12, durationMs: 30000 };
+  const agg = { retries: 3, timeoutMs: 2500, backoffMs: 50 };
+  const strict = { retries: 0, timeoutMs: 1000, backoffMs: 100 };
+  const mk = (timely, shed, callers, policy) => ({
+    offered: 360, started: 360, dropped: 0, missedSlots: 0, completed: 300, failed: 60, timelyRps: timely, shed, timeouts: 10,
+    p95: 1500, p50: 800, p99: 2500, errorPct: 16.7, elapsedMs: 30000,
+    workload: { ...workload }, settings: { callersDesired: callers, callersReady: callers, policy: { ...policy }, depReplicas: 1 },
+    attemptsAvg: 1.5, attemptsMax: 3, attemptsN: 20,
   });
+  const settling = [
+    { label: 'Settle S→A', waitMs: 12000, residualInflight: 0 },
+    { label: 'Settle A→B', waitMs: 12000, residualInflight: 0 },
+  ];
+  const good = () => gradeDownstream({
+    phaseS: mk(5, 60, 2, agg), phaseA: mk(4, 80, 4, agg), phaseB: mk(9, 20, 4, strict),
+    depS: { cpuM: 950, inflight: 6 }, depA: { cpuM: 950, inflight: 6 }, depB: { cpuM: 940, inflight: 4 },
+    settling, restored: true,
+  });
+  const win = good();
   assert.equal(win.status, 'pass');
-  assert.match(win.evidence.verdict, /strict policy raised/);
+  assert.match(win.evidence.verdict, /strict budget raised/);
+  assert.match(win.evidence.verdict, /combined budget/);
+  assert.equal(win.evidence.comparison.length, 3);
+  assert.ok(win.checks.length === 5);
+
+  const worse = gradeDownstream({
+    phaseS: mk(5, 60, 2, agg), phaseA: mk(4, 80, 4, agg), phaseB: mk(2, 90, 4, strict),
+    depS: { cpuM: 950, inflight: 6 }, depA: { cpuM: 950, inflight: 6 }, depB: { cpuM: 940, inflight: 4 },
+    settling, restored: true,
+  });
+  assert.equal(worse.status, 'pass', 'a strict budget that performs worse is still a valid measurement');
+  assert.match(worse.evidence.verdict, /lowered/);
+
+  assert.equal(gradeDownstream({}).status, 'inconclusive', 'missing phases stay inconclusive');
+  assert.equal(gradeDownstream({
+    phaseS: mk(5, 60, 2, agg), phaseA: mk(4, 80, 4, agg), phaseB: mk(9, 20, 4, strict),
+    depS: { cpuM: 950, inflight: 6 }, depA: { cpuM: 950, inflight: 6 }, depB: { cpuM: 940, inflight: 4 },
+    settling: settling.slice(0, 1), restored: true,
+  }).status, 'inconclusive', 'missing settling stays inconclusive');
+
   const thin = gradeDownstream({
-    phaseA: { ...mk(4, 60), offered: 50 }, phaseB: mk(9, 20),
-    depA: { cpuM: 950, inflight: 6 }, depB: { cpuM: 940, inflight: 4 }, restored: true,
+    phaseS: mk(5, 60, 2, agg), phaseA: { ...mk(4, 80, 4, agg), offered: 50 }, phaseB: mk(9, 20, 4, strict),
+    depS: { cpuM: 950, inflight: 6 }, depA: { cpuM: 950, inflight: 6 }, depB: { cpuM: 940, inflight: 4 },
+    settling, restored: true,
   });
   assert.equal(thin.status, 'inconclusive', 'thin phases cannot compare policies');
+
+  const unrestored = good();
+  assert.equal(gradeDownstream({ ...unrestored.evidence, restored: false, restoreError: 'scale stuck' }).status, 'inconclusive', 'failed restore stays inconclusive');
+
+  const unsaturated = gradeDownstream({
+    phaseS: mk(5, 5, 2, agg), phaseA: mk(6, 5, 4, agg), phaseB: mk(9, 5, 4, strict),
+    depS: { cpuM: 200, inflight: 0 }, depA: { cpuM: 210, inflight: 0 }, depB: { cpuM: 220, inflight: 0 },
+    settling, restored: true,
+  });
+  assert.equal(unsaturated.status, 'inconclusive', 'no saturation stays inconclusive');
+
+  const uncontrolled = gradeDownstream({
+    phaseS: mk(5, 60, 2, agg),
+    phaseA: { ...mk(4, 80, 4, agg), workload: { path: '/dep?ms=300&via=cpu', rps: 24, durationMs: 30000 } },
+    phaseB: mk(9, 20, 4, strict),
+    depS: { cpuM: 950, inflight: 6 }, depA: { cpuM: 950, inflight: 6 }, depB: { cpuM: 940, inflight: 4 },
+    settling, restored: true,
+  });
+  assert.equal(uncontrolled.status, 'inconclusive', 'differing workloads warn instead of comparing');
+  assert.ok(uncontrolled.evidence.warnings.length > 0);
+
+  const noDep = { ...good().evidence, depS: null, depA: null, depB: null };
+  assert.equal(gradeDownstream(noDep).status, 'inconclusive', 'app shedding without dependency observations never proves saturation');
+  const dropped = structuredClone(good().evidence);
+  for (const name of ['phaseS', 'phaseA', 'phaseB']) Object.assign(dropped[name], { started: 1, dropped: 359, completed: 0, failed: 1, timeouts: 0, timelyRps: 0 });
+  assert.equal(gradeDownstream(dropped).status, 'inconclusive', 'offered count is not a settled sample count');
+  const missingAttempts = structuredClone(good().evidence);
+  missingAttempts.phaseA.attemptsN = 0;
+  missingAttempts.phaseA.attemptsAvg = null;
+  assert.equal(gradeDownstream(missingAttempts).status, 'inconclusive');
+  const unreadDrain = structuredClone(good().evidence);
+  unreadDrain.settling[0].residualInflight = null;
+  assert.equal(gradeDownstream(unreadDrain).status, 'inconclusive', 'an unread drain does not prove a controlled comparison');
+  const missed = structuredClone(good().evidence);
+  missed.phaseS.missedSlots = 1;
+  assert.equal(gradeDownstream(missed).status, 'inconclusive');
 });
 
 test('disruptions grader needs API refusal plus budget status', async () => {

@@ -117,6 +117,18 @@ make down     # delete only the scaling-lab kind cluster
 
 Checks may return **inconclusive** if the intended race or enough traffic was not observed. The result includes raw request and pod evidence. A passing local experiment is evidence for this topology and workload, not a guarantee for a different ingress, service mesh, or cloud load balancer.
 
+Predictions and explanations are saved with an experiment attempt, separately
+from its verifier result. Use **Prepare next attempt** before making a new
+prediction after an experiment. Rerunning also retains the previous attempt;
+earlier results, explanations, and the initial explanation revision remain
+in the evidence export. Submitted learning records survive a dashboard
+restart through atomic local snapshots. Unsaved text is a browser draft.
+
+The capstone console requires a rationale for its replica bounds and CPU
+target. `make verify SCENARIO=capstone` uses an explicit baseline rationale
+with the default settings; set `SCALING_LAB_CAPSTONE_RATIONALE` to supply your
+own rationale for that CLI baseline. This is recorded in its evidence.
+
 You can run most lessons without the browser using `make verify SCENARIO=shutdown MODE=graceful` (any of the sixteen IDs except `downstream`, which needs its dashboard-provisioned dependency). The command writes a JSON evidence report under `results/` and exits nonzero for a failed or inconclusive check. Run the relevant setup target before either autoscaling verifier (`make hpa-up` for CPU lessons, `make prometheus-up` for the Prometheus lesson).
 
 Use the dashboard's **configuration worksheet** after the lessons. It checks shutdown timing and compares measured per-pod capacity with peak demand and HPA replica limits. It exports a JSON record of your choices. The worksheet is a consistency check; rerun live experiments with the actual settings before applying them elsewhere.

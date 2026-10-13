@@ -273,6 +273,24 @@ export function validateCapacityOptions(input = {}) {
   return { work, sloP95Ms, sloErrorPct };
 }
 
+// Milestone 5 capacity challenge (Q5.1): a FIXED workload/objective the
+// learner must size headroom against — not a tunable. The estimate and
+// headroom choice live in the learner's diagnosis report (never auto-graded);
+// the only machine-observable requirement is that any cited rate comes from
+// a generator-clean step (gradeCapacity already reports generatorLimited per
+// step). The returned variant is what the diagnosis report records so the
+// challenge reproduces exactly.
+export const CAPACITY_CHALLENGE = {
+  work: 'expensive',
+  sloP95Ms: 500,
+  sloErrorPct: 5,
+  prompt: 'Expensive CPU work (/cpu?ms=250) must hold p95 ≤ 500ms with errors ≤ 5%. State a defensible per-pod capacity estimate, choose explicit headroom, and size pods for the stated peak — then show that every rate you cite is generator-clean (no dropped offers, no missed slots). A generator-limited step measures the generator, never the service.',
+};
+
+export function challengeVariantForCapacity() {
+  return { kind: 'capacity-challenge', config: validateCapacityOptions(CAPACITY_CHALLENGE) };
+}
+
 function capacityRequest(path, baseUrl, timeoutMs, agent) {
   return new Promise((resolve) => {
     const started = Date.now();
@@ -420,7 +438,18 @@ export function validateCapstoneOptions(input = {}) {
   const mix = input.mix === 'cpu-heavy' || input.mix === 'io-heavy' ? input.mix : 'balanced';
   if (!Number.isFinite(sloP95Ms) || sloP95Ms < 100 || sloP95Ms > 5000) throw new Error('sloP95Ms must be between 100 and 5000.');
   if (!Number.isFinite(sloErrorPct) || sloErrorPct < 0 || sloErrorPct > 20) throw new Error('sloErrorPct must be between 0 and 20.');
-  return { sloP95Ms, sloErrorPct, mix };
+  const minReplicas = Number(input.minReplicas ?? 2);
+  const maxReplicas = Number(input.maxReplicas ?? 5);
+  const cpuTarget = Number(input.cpuTarget ?? 60);
+  if (!Number.isInteger(minReplicas) || minReplicas < 1 || minReplicas > 5) throw new Error('minReplicas must be an integer between 1 and 5.');
+  if (!Number.isInteger(maxReplicas) || maxReplicas < 1 || maxReplicas > 8) throw new Error('maxReplicas must be an integer between 1 and 8.');
+  if (maxReplicas < minReplicas) throw new Error('maxReplicas must be greater than or equal to minReplicas.');
+  if (!Number.isInteger(cpuTarget) || cpuTarget < 30 || cpuTarget > 90) throw new Error('cpuTarget must be an integer between 30 and 90.');
+  if (typeof input.rationale !== 'string') throw new Error('rationale is required: state briefly why these HPA bounds fit the objective.');
+  const rationale = input.rationale.trim();
+  if (!rationale) throw new Error('rationale is required: state briefly why these HPA bounds fit the objective.');
+  if (rationale.length > 500) throw new Error('rationale must be at most 500 characters.');
+  return { sloP95Ms, sloErrorPct, mix, minReplicas, maxReplicas, cpuTarget, rationale };
 }
 
 // Direct cgroup CPU-throttling readout (lesson 09): nr_throttled and
@@ -451,7 +480,7 @@ export async function pacedRequests(baseUrl, path, rps, durationMs, timeoutMs, e
   const lat = [];
   const statusCounts = {};
   let offered = 0, started = 0, dropped = 0, completed = 0, failed = 0, timeouts = 0, shed = 0;
-  let inflight = 0, peakInflight = 0;
+  let inflight = 0, peakInflight = 0, missedSlots = 0;
   const pending = new Set();
   const until = Date.now() + durationMs;
   const stepStart = Date.now();
@@ -459,6 +488,11 @@ export async function pacedRequests(baseUrl, path, rps, durationMs, timeoutMs, e
   try {
     while (Date.now() < until) {
       throwIfCancelled(opts.cancel);
+      const missed = Math.max(0, Math.floor((Date.now() - stepStart - n * 1000 / rps) / (1000 / rps)));
+      n += missed;
+      missedSlots += missed;
+      offered += missed;
+      dropped += missed;
       n += 1;
       offered += 1;
       if (inflight >= (opts.maxInflight || 64)) {
@@ -489,14 +523,14 @@ export async function pacedRequests(baseUrl, path, rps, durationMs, timeoutMs, e
   }
   const elapsedMs = Date.now() - stepStart;
   lat.sort((a, b) => a - b);
-  return { offered, started, dropped, completed, failed, timeouts, shed, statusCounts, lat, peakInflight, elapsedMs };
+  return { offered, started, dropped, missedSlots, completed, failed, timeouts, shed, statusCounts, lat, peakInflight, elapsedMs };
 }
 
 export function summarizePaced(p, sloP95Ms) {
   const timely = p.lat.filter((ms) => ms <= sloP95Ms).length;
   const total = p.completed + p.failed;
   return {
-    offered: p.offered, completed: p.completed, failed: p.failed, timeouts: p.timeouts, shed: p.shed,
+    offered: p.offered, started: p.started, missedSlots: p.missedSlots, completed: p.completed, failed: p.failed, timeouts: p.timeouts, shed: p.shed,
     dropped: p.dropped, peakInflight: p.peakInflight, elapsedMs: p.elapsedMs, statusCounts: p.statusCounts,
     successRps: Math.round((p.completed / (p.elapsedMs / 1000)) * 10) / 10,
     timelyRps: Math.round((timely / (p.elapsedMs / 1000)) * 10) / 10,
@@ -518,7 +552,7 @@ async function hpaSnapshot(ns) {
   };
 }
 
-async function readyPods(ns) {
+export async function readyPods(ns) {
   const state = await clusterState(ns);
   return state.pods.filter((p) => p.ready && !p.terminating).length;
 }
@@ -931,7 +965,7 @@ async function evictPod(ns, pod) {
   return { pod, allowed: r.code === 0, status: r.code, detail: text.slice(0, 300) || `exit ${r.code}` };
 }
 
-async function topFor(ns, label) {
+export async function topFor(ns, label) {
   try {
     const raw = await kubectl(ns, 'top', 'pods', '-l', label, '--no-headers');
     const cpus = [];
@@ -945,7 +979,7 @@ async function topFor(ns, label) {
   } catch { return null; }
 }
 
-async function depInflightGauge(ns) {
+export async function depInflightGauge(ns) {
   try {
     const out = await kubectl(ns, 'exec', 'deployment/dep', '--', 'node', '-e', `fetch('http://127.0.0.1:3000/metrics').then((r)=>r.text()).then((t)=>{const m=t.match(/scaling_lab_http_inflight_requests\\{pod=("[^"]*")\\} ([0-9.]+)/);console.log(m?m[2]:'none')})`);
     const v = Number(out.trim().split('\n').pop());
@@ -1349,9 +1383,29 @@ async function runSignalsScenario(emit, opts = {}) {
   return gradeSignals({ cpuPhase, ioPhase, rps });
 }
 
+// Laptop-bounded downstream experiment shape (Milestone 4): every load phase
+// offers the same workload for the same duration; settling gaps between
+// phases are bounded and residual in-flight work is captured, never assumed
+// away. The Dashboard-provisioned dep workload is required; there is no CLI
+// substitute (see make verify docs).
+export const DOWNSTREAM_RPS = 12;
+export const DOWNSTREAM_PHASE_MS = 30000;
+export const DOWNSTREAM_SETTLE_MS = 12000;
+export const DOWNSTREAM_REQUEST_TIMEOUT_MS = 6000;
+export const DOWNSTREAM_SLO_MS = 2000;
+export const DOWNSTREAM_MIN_OFFERED = 200;
+export const DOWNSTREAM_PATH = '/dep?ms=300&via=cpu';
+export const DOWNSTREAM_POLICY_AGGRESSIVE = { retries: 3, timeoutMs: 2500, backoffMs: 50 };
+export const DOWNSTREAM_POLICY_STRICT = { retries: 0, timeoutMs: 1000, backoffMs: 100 };
+export const DOWNSTREAM_POLICY_DEFAULT = { retries: 0, timeoutMs: 1500, backoffMs: 100 };
+
+export function depPolicyLabel({ retries, timeoutMs, backoffMs }) {
+  return `retries=${retries},timeout=${timeoutMs}ms,backoff=${backoffMs}ms`;
+}
+
 // Bounded attempts sample: reads at most 20 small JSON bodies with
 // concurrency 4 to measure the real retry-attempt distribution per policy.
-async function sampleDepAttempts(baseUrl, path, n = 20) {
+export async function sampleDepAttempts(baseUrl, path, n = 20) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: 4 });
   const attempts = [];
   try {
@@ -1373,17 +1427,42 @@ async function sampleDepAttempts(baseUrl, path, n = 20) {
   return { n: attempts.length, avg: attempts.length ? Math.round((attempts.reduce((a, b) => a + b, 0) / attempts.length) * 100) / 100 : null, max: attempts.length ? attempts[attempts.length - 1] : null };
 }
 
-async function setDepPolicy(ns, { retries, timeoutMs, backoffMs }, cancel) {
+export async function setDepPolicy(ns, { retries, timeoutMs, backoffMs }, cancel, expected = null) {
   throwIfCancelled(cancel);
   await kubectl(ns, 'set', 'env', 'deployment/app', `DEP_RETRIES=${retries}`, `DEP_TIMEOUT_MS=${timeoutMs}`, `DEP_BACKOFF_MS=${backoffMs}`);
   await unlessCancelled(kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s'), cancel);
-  await waitStablePods(ns, 4, 90000, cancel);
+  if (expected != null) await waitStablePods(ns, expected, 90000, cancel);
 }
 
-async function runDownstreamScenario(emit, opts = {}) {
+// Bounded settling between downstream phases (Q4.3): stop offering load for
+// a fixed window so queues drain, then read the residual dependency
+// in-flight gauge. The gauge may legitimately read null (metrics endpoint
+// unreadable); the attempt itself is recorded so the grader can tell
+// "captured none" apart from "never looked".
+export async function settleDownstream(ns, emit, label, ms = DOWNSTREAM_SETTLE_MS, cancel = null) {
+  const startedAt = new Date().toISOString();
+  throwIfCancelled(cancel);
+  emit('note', { text: `${label}: settling ${Math.round(ms / 1000)}s — no offered load while queues drain.` });
+  await unlessCancelled(sleep(ms), cancel);
+  const residualInflight = await depInflightGauge(ns);
+  emit('note', { text: `${label}: residual dep in-flight ${residualInflight ?? 'unread'} after settling.` });
+  return { label, startedAt, finishedAt: new Date().toISOString(), waitMs: ms, residualInflight };
+}
+
+export async function depReplicaCount(ns) {
+  try {
+    const raw = await kubectl(ns, 'get', 'deployment/dep', '-o', 'json');
+    return JSON.parse(raw).spec?.replicas ?? null;
+  } catch { return null; }
+}
+
+export async function runDownstreamScenario(emit, opts = {}) {
   const ns = opts.namespace || 'scaling-lab';
   const baseUrl = opts.endpoint || base;
   const cancel = opts.cancel || null;
+  const rps = DOWNSTREAM_RPS;
+  const phaseMs = Number(opts.phaseMs ?? DOWNSTREAM_PHASE_MS);
+  const settleMs = Number(opts.settleMs ?? DOWNSTREAM_SETTLE_MS);
   await kubectl(ns, 'get', 'deployment/dep', '-o', 'name').catch(() => { throw new Error('The isolated dependency is missing. Create a fresh downstream run (it provisions its own dep).'); });
   const probeAgent = new http.Agent({ keepAlive: false });
   let probe;
@@ -1393,40 +1472,86 @@ async function runDownstreamScenario(emit, opts = {}) {
     probeAgent.destroy();
   }
   if (!probe.ok) throw new Error(`Dependency probe failed (${probe.error || probe.status}). Check deployment/dep in ${ns}.`);
-  let phaseA = null, phaseB = null, depA = null, depB = null, restored = false;
+  const depReplicas = await depReplicaCount(ns);
+  let phaseS = null, phaseA = null, phaseB = null;
+  let depS = null, depA = null, depB = null;
+  let settling = [];
+  let restored = false;
+  let restoreError = null;
+  async function measurePhase({ label, callers, policy }) {
+    const depCpuBefore = await topFor(ns, 'app=scaling-dep');
+    const depSamples = [];
+    let measuring = true;
+    const observation = (async () => {
+      while (measuring) {
+        const cpu = await topFor(ns, 'app=scaling-dep');
+        depSamples.push({ at: new Date().toISOString(), cpuM: cpu?.avgCpuM ?? null });
+        if (measuring) await sleep(2000);
+      }
+    })();
+    let raw;
+    try {
+      raw = await pacedRequests(baseUrl, DOWNSTREAM_PATH, rps, phaseMs, DOWNSTREAM_REQUEST_TIMEOUT_MS, emit, { countShed: true, cancel });
+    } finally { measuring = false; await observation; }
+    const attempts = await sampleDepAttempts(baseUrl, DOWNSTREAM_PATH);
+    const measuredCpu = depSamples.map((s) => s.cpuM).filter(Number.isFinite);
+    const dep = { cpuM: measuredCpu.length ? Math.max(...measuredCpu) : null, samples: depSamples, inflight: await depInflightGauge(ns), cpuBeforeM: depCpuBefore?.avgCpuM ?? null, depReplicas };
+    const callersReady = await readyPods(ns);
+    const phase = {
+      ...summarizePaced(raw, DOWNSTREAM_SLO_MS),
+      workload: { path: DOWNSTREAM_PATH, rps, durationMs: phaseMs },
+      settings: { callersDesired: callers, callersReady, policy: { ...policy }, depReplicas },
+      depCpuM: dep.cpuM,
+      attemptsAvg: attempts.avg, attemptsMax: attempts.max, attemptsN: attempts.n,
+      policyLabel: depPolicyLabel(policy),
+    };
+    emit('note', { text: `${label}: ${callers} callers (ready ${callersReady}), ${depPolicyLabel(policy)} — timely ${phase.timelyRps}/s, shed ${phase.shed}, timeouts ${phase.timeouts}, p95 ${phase.p95}ms, attempts avg ${attempts.avg} (max ${attempts.max}, n=${attempts.n}); dep CPU ~${dep.cpuM}m (was ~${dep.cpuBeforeM}m), dep inflight gauge ${dep.inflight ?? 'unread'}.` });
+    return { phase, dep };
+  }
   try {
-    emit('note', { text: 'Phase A (aggressive but bounded): 4 callers, 3 retries, 2.5s timeout — 12 RPS at a 1-pod CPU-bound dependency. Reducing, not raising, the budget is the fix direction.' });
+    // Q4.1 — two-caller measured baseline with the aggressive budget, so the
+    // later four-caller phase compares measurement against measurement under
+    // the same dependency, offered workload, resources, and retry policy.
+    emit('note', { text: `Phase S (scale baseline, Q4.1): 2 callers, ${depPolicyLabel(DOWNSTREAM_POLICY_AGGRESSIVE)} — ${rps} RPS at a ${depReplicas ?? 1}-pod CPU-bound dependency.` });
+    await kubectl(ns, 'scale', 'deployment/app', '--replicas=2');
+    await waitStablePods(ns, 2, 90000, cancel);
+    await setDepPolicy(ns, DOWNSTREAM_POLICY_AGGRESSIVE, cancel, 2);
+    ({ phase: phaseS, dep: depS } = await measurePhase({ label: 'Phase S', callers: 2, policy: DOWNSTREAM_POLICY_AGGRESSIVE }));
+    settling.push(await settleDownstream(ns, emit, 'Settle S→A', settleMs, cancel));
+    // Q4.1 — same budget and workload at four callers: only the caller count
+    // moves. Actual Ready counts plus dep-side saturation decide the verdict.
+    emit('note', { text: `Phase A (scale-out, Q4.1): 4 callers, same ${depPolicyLabel(DOWNSTREAM_POLICY_AGGRESSIVE)} and workload — only the caller count moves.` });
     await kubectl(ns, 'scale', 'deployment/app', '--replicas=4');
     await waitStablePods(ns, 4, 90000, cancel);
-    await setDepPolicy(ns, { retries: 3, timeoutMs: 2500, backoffMs: 50 }, cancel);
-    const depCpu0 = await topFor(ns, 'app=scaling-dep');
-    const a = await pacedRequests(baseUrl, '/dep?ms=300&via=cpu', 12, 30000, 6000, emit, { countShed: true, cancel });
-    const attemptsA = await sampleDepAttempts(baseUrl, '/dep?ms=300&via=cpu');
-    depA = { cpuM: (await topFor(ns, 'app=scaling-dep'))?.avgCpuM ?? null, inflight: await depInflightGauge(ns), cpuBeforeM: depCpu0?.avgCpuM ?? null };
-    phaseA = { ...summarizePaced(a, 2000), depCpuM: depA.cpuM, attemptsAvg: attemptsA.avg, attemptsMax: attemptsA.max, attemptsN: attemptsA.n, policy: 'retries=3,timeout=2500ms' };
-    emit('note', { text: `Phase A: timely ${phaseA.timelyRps}/s, shed ${phaseA.shed}, timeouts ${phaseA.timeouts}, p95 ${phaseA.p95}ms, attempts avg ${attemptsA.avg} (max ${attemptsA.max}, n=${attemptsA.n}); dep CPU ~${depA.cpuM}m (was ~${depA.cpuBeforeM}m), dep inflight gauge ${depA.inflight ?? 'unread'}.` });
-    emit('note', { text: 'Phase B (strict): same callers and load, no retries, 1s fail-fast timeout — shed early instead of amplifying.' });
-    await setDepPolicy(ns, { retries: 0, timeoutMs: 1000, backoffMs: 100 }, cancel);
-    const b = await pacedRequests(baseUrl, '/dep?ms=300&via=cpu', 12, 30000, 6000, emit, { countShed: true, cancel });
-    const attemptsB = await sampleDepAttempts(baseUrl, '/dep?ms=300&via=cpu');
-    depB = { cpuM: (await topFor(ns, 'app=scaling-dep'))?.avgCpuM ?? null, inflight: await depInflightGauge(ns) };
-    phaseB = { ...summarizePaced(b, 2000), depCpuM: depB.cpuM, attemptsAvg: attemptsB.avg, attemptsMax: attemptsB.max, attemptsN: attemptsB.n, policy: 'retries=0,timeout=1000ms' };
-    emit('note', { text: `Phase B: timely ${phaseB.timelyRps}/s, shed ${phaseB.shed}, timeouts ${phaseB.timeouts}, p95 ${phaseB.p95}ms, attempts avg ${attemptsB.avg} (max ${attemptsB.max}, n=${attemptsB.n}); dep CPU ~${depB.cpuM}m.` });
+    await setDepPolicy(ns, DOWNSTREAM_POLICY_AGGRESSIVE, cancel, 4);
+    ({ phase: phaseA, dep: depA } = await measurePhase({ label: 'Phase A', callers: 4, policy: DOWNSTREAM_POLICY_AGGRESSIVE }));
+    settling.push(await settleDownstream(ns, emit, 'Settle A→B', settleMs, cancel));
+    // Q4.2 — same callers and workload, tighter budget. Timeout moves together
+    // with retries, so the verdict names the COMBINED budget change and never
+    // attributes it to retries alone.
+    emit('note', { text: `Phase B (strict budget, Q4.2): same 4 callers and load, combined budget change to ${depPolicyLabel(DOWNSTREAM_POLICY_STRICT)} — shed early instead of amplifying.` });
+    await setDepPolicy(ns, DOWNSTREAM_POLICY_STRICT, cancel, 4);
+    ({ phase: phaseB, dep: depB } = await measurePhase({ label: 'Phase B', callers: 4, policy: DOWNSTREAM_POLICY_STRICT }));
+  } catch (error) {
+    if (error?.code === CANCELLED) throw error;
+    emit('error', { text: `Downstream measurement FAILED: ${error.message}. Partial phases are kept; restore still runs.` });
+    throw error;
   } finally {
     try {
       throwIfCancelled(cancel);
       await kubectl(ns, 'scale', 'deployment/app', '--replicas=2');
-      await kubectl(ns, 'set', 'env', 'deployment/app', 'DEP_RETRIES=0', 'DEP_TIMEOUT_MS=1500', 'DEP_BACKOFF_MS=100');
+      await kubectl(ns, 'set', 'env', 'deployment/app', `DEP_RETRIES=${DOWNSTREAM_POLICY_DEFAULT.retries}`, `DEP_TIMEOUT_MS=${DOWNSTREAM_POLICY_DEFAULT.timeoutMs}`, `DEP_BACKOFF_MS=${DOWNSTREAM_POLICY_DEFAULT.backoffMs}`);
       await kubectl(ns, 'rollout', 'status', 'deployment/app', '--timeout=180s');
       await waitStablePods(ns, 2, 90000);
       restored = true;
       emit('note', { text: 'Callers restored to 2 replicas with the default dependency policy.' });
     } catch (error) {
+      restoreError = error.message;
       if (error?.code !== CANCELLED) emit('error', { text: `Downstream restore FAILED: ${error.message}. Check kubectl --context kind-scaling-lab -n ${ns} get deployment/app.` });
       else emit('error', { text: 'Downstream restore skipped after cancellation: namespace teardown finalizes. Verify the deployment before reuse.' });
     }
   }
-  return gradeDownstream({ phaseA, phaseB, depA, depB, restored });
+  return gradeDownstream({ phaseS, phaseA, phaseB, depS, depA, depB, settling, restored, restoreError });
 }
 
 const DISRUPTION_PDB = (ns) => ({
@@ -1623,10 +1748,23 @@ async function runCapstoneScenario(emit, opts = {}) {
   const ns = opts.namespace || 'scaling-lab';
   const baseUrl = opts.endpoint || base;
   const cancel = opts.cancel || null;
-  const { sloP95Ms, sloErrorPct, mix } = validateCapstoneOptions(opts.options);
+  const { sloP95Ms, sloErrorPct, mix, minReplicas, maxReplicas, cpuTarget, rationale } = validateCapstoneOptions(opts.options);
   const spec = CAPSTONE_MIX[mix];
-  const objective = { sloP95Ms, sloErrorPct, mix, path: spec.path, rps: spec.rps };
-  emit('note', { text: `Capstone objective: p95 ≤ ${sloP95Ms}ms, errors ≤ ${sloErrorPct}% on ${mix} traffic (${spec.rps} RPS ${spec.path}). Graded traffic runs THROUGHOUT each event — post-event probes alone never pass. Replica growth alone never passes.` });
+  const objective = { sloP95Ms, sloErrorPct, mix, path: spec.path, rps: spec.rps, minReplicas, maxReplicas, cpuTarget, rationale };
+  emit('note', { text: `Capstone objective: p95 ≤ ${sloP95Ms}ms, errors ≤ ${sloErrorPct}% on ${mix} traffic (${spec.rps} RPS ${spec.path}). HPA min ${minReplicas}, max ${maxReplicas}, CPU target ${cpuTarget}%. Rationale: ${rationale.slice(0, 120)}. Graded traffic runs THROUGHOUT each event — post-event probes alone never pass. Replica growth alone never passes.` });
+  // Apply the learner-configured HPA bounds to the provisioned scaler before
+  // any graded phase. Laptop bounds are enforced by validateCapstoneOptions.
+  await kubectlApply(ns, {
+    apiVersion: 'autoscaling/v2', kind: 'HorizontalPodAutoscaler',
+    metadata: { name: 'app', namespace: ns },
+    spec: {
+      scaleTargetRef: { apiVersion: 'apps/v1', kind: 'Deployment', name: 'app' },
+      minReplicas, maxReplicas,
+      behavior: { scaleDown: { stabilizationWindowSeconds: 60 } },
+      metrics: [{ type: 'Resource', resource: { name: 'cpu', target: { type: 'Utilization', averageUtilization: cpuTarget } } }],
+    },
+  });
+  emit('note', { text: `Capstone HPA applied: minReplicas ${minReplicas}, maxReplicas ${maxReplicas}, CPU target ${cpuTarget}%.` });
   // Every phase grades the actual paced stream concurrent with its event.
   // Partial evidence is emitted as notes throughout, so cancellation or
   // failure still leaves an honest trail in the archived events.

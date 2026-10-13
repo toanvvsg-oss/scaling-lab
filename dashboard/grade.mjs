@@ -20,8 +20,8 @@ export function gradeHpaReact({ baseline, series, predictDesired, slowStartup, r
   const evidence = {
     baseline, series, predictDesired: predicted, desiredPeak, slowStartup: slowStartup || null, recovery: recovery || null,
     scaleOut: scaleOut || null,
-    formula: 'desiredReplicas = ceil(currentReplicas × observedUtilization / targetUtilization), then tolerance (±10% ignores small moves) applies; unready or metric-less pods are left out of the calculation (controller holds rather than guessing); min/max bounds and scale-down stabilization apply.',
-    note: 'Predictions are approximations: when too few pods report a current metric, the HPA skips those pods and may hold the last decision instead of computing from incomplete data. Missing metrics are never treated as zero.',
+    formula: 'desiredReplicas = ceil(currentReplicas × observedUtilization / targetUtilization), then tolerance (±10% ignores small moves) applies; missing-metric pods are set aside initially, then included conservatively at the target for scale-down or zero for scale-up; not-yet-ready CPU pods can dampen scale-up. The controller holds if the adjusted ratio reverses direction or falls within tolerance; min/max bounds and scale-down stabilization apply.',
+    note: 'Predictions are approximations: when too few pods report a current metric, the HPA skips those pods and may hold the last decision instead of computing from incomplete data. The lab never plots missing observations as measured zero; the HPA algorithm itself uses conservative assumptions when recomputing the ratio.',
   };
   const checks = [
     { pass: baseline.target === 60, label: `Baseline recorded the HPA target (60%) with ${baseline.replicas} replicas, desired ${baseline.desired ?? '?'}` },
@@ -47,7 +47,7 @@ export function gradePending({ constrained, restored, events }) {
   const evidence = {
     constrained: constrained || null, restored: restored || null,
     schedulerEvents: (events || []).slice(0, 10),
-    note: 'Desired (deployment spec) vs scheduled (assigned to a node) vs Running vs Ready (passing probes) are four different numbers. HPA can raise desired all day; only schedulable node capacity clears Pending. kind never autoscales nodes — the GKE continuation covers node scale-up.',
+    note: 'Desired (deployment spec) vs scheduled (assigned to a node) vs Running vs Ready (passing probes) are four different numbers. HPA can raise desired all day; missing resources need schedulable capacity; impossible placement needs a constraint change. kind never autoscales nodes — the GKE continuation covers node scale-up.',
   };
   const checks = [
     { pass: sawPending, label: sawPending ? `${constrained.pending} pod(s) stayed Pending under the run-scoped constraint` : 'No Pending pods were observed while constrained' },
@@ -231,21 +231,176 @@ export function gradeSignals({ cpuPhase, ioPhase, rps }) {
   return { status: checks.every((c) => c.pass) ? 'pass' : 'inconclusive', checks, evidence };
 }
 
-export function gradeDownstream({ phaseA, phaseB, depA, depB, restored }) {
-  const measured = phaseA && phaseB && depA && depB && Number.isFinite(depA.cpuM) && Number.isFinite(depB.cpuM);
-  const bottleneck = measured && (depA.cpuM >= 800 || (phaseA.shed + phaseA.timeouts) / Math.max(1, phaseA.offered) > 0.2);
-  const determinate = measured && phaseA.offered >= 200 && phaseB.offered >= 200;
-  const attemptsLine = `attempts/call ${phaseA.attemptsAvg ?? '?'} (max ${phaseA.attemptsMax ?? '?'}) → ${phaseB.attemptsAvg ?? '?'} (max ${phaseB.attemptsMax ?? '?'})`;
-  const verdict = determinate ? (phaseB.timelyRps > phaseA.timelyRps ? `strict policy raised timely success ${phaseA.timelyRps}→${phaseB.timelyRps}/s with ${attemptsLine}` : phaseB.timelyRps < phaseA.timelyRps ? `strict policy lowered timely success ${phaseA.timelyRps}→${phaseB.timelyRps}/s with ${attemptsLine} — failing fast is not always winning, and the numbers say so here` : `timely success unchanged (${phaseA.timelyRps}/s) with ${attemptsLine}: the dependency cap dominates both policies`) : 'comparison indeterminate';
+export const DOWNSTREAM_MIN_OFFERED = 200;
+
+export function gradeDownstream({ phaseS, phaseA, phaseB, depS, depA, depB, settling, restored, restoreError }) {
+  const warnings = [];
+  const num = (v) => Number.isFinite(v);
+  const phaseOk = (p) => p && num(p.offered) && num(p.timelyRps);
+  const generatorClean = (p) => phaseOk(p) &&
+    ['started', 'dropped', 'completed', 'failed', 'timeouts', 'missedSlots'].every((k) => num(p[k]) && p[k] >= 0) &&
+    p.offered === p.started + p.dropped && p.started === p.completed + p.failed &&
+    p.timeouts <= p.failed && p.dropped === 0 && p.missedSlots === 0 &&
+    p.started >= DOWNSTREAM_MIN_OFFERED;
+  const shedRatio = (p) => ((p?.shed || 0) + (p?.timeouts || 0)) / Math.max(1, p?.offered || 0);
+  const workloadOf = (p) => p?.workload || null;
+  const settingsOf = (p) => p?.settings || null;
+  const sameWorkload = (a, b) => {
+    const wa = workloadOf(a), wb = workloadOf(b);
+    if (!wa || !wb) return false;
+    return wa.path === wb.path && wa.rps === wb.rps && wa.durationMs === wb.durationMs;
+  };
+  const samePolicy = (a, b) => {
+    const pa = settingsOf(a)?.policy, pb = settingsOf(b)?.policy;
+    if (!pa || !pb) return false;
+    return pa.retries === pb.retries && pa.timeoutMs === pb.timeoutMs && pa.backoffMs === pb.backoffMs;
+  };
+  const sameDepReplicas = (a, b) => Number.isInteger(settingsOf(a)?.depReplicas) &&
+    settingsOf(a).depReplicas > 0 && settingsOf(a).depReplicas === settingsOf(b)?.depReplicas;
+  const policyLabel = (p) => {
+    const pol = settingsOf(p)?.policy;
+    if (!pol) return p?.policyLabel || p?.policy || 'unknown policy';
+    return `retries=${pol.retries},timeout=${pol.timeoutMs}ms,backoff=${pol.backoffMs}ms`;
+  };
+
+  // Scale check (Q4.1): 2-vs-4 callers, same policy/workload/dependency, with
+  // actual Ready counts proving the intended caller counts ran.
+  let scaleOk = false, scaleLabel = '';
+  if (!phaseOk(phaseS) || !phaseOk(phaseA)) {
+    scaleLabel = 'Scale comparison missing: need measured 2-caller (S) and 4-caller (A) phases';
+  } else {
+    const sSet = settingsOf(phaseS), aSet = settingsOf(phaseA);
+    const callersOk = sSet?.callersDesired === 2 && aSet?.callersDesired === 4
+      && sSet?.callersReady === 2 && aSet?.callersReady === 4;
+    const controlled = sameWorkload(phaseS, phaseA) && samePolicy(phaseS, phaseA) && sameDepReplicas(phaseS, phaseA);
+    if (!sSet || !aSet) {
+      warnings.push('Scale comparison uncontrolled: caller settings not recorded for S/A.');
+      scaleLabel = 'Scale comparison uncontrolled: caller settings not recorded (need callersDesired/Ready per phase)';
+    } else {
+      if (!callersOk) warnings.push(`Scale callers unexpected: S desired/ready ${sSet.callersDesired}/${sSet.callersReady}, A ${aSet.callersDesired}/${aSet.callersReady} (need 2/2 vs 4/4).`);
+      if (!sameWorkload(phaseS, phaseA)) warnings.push('Scale comparison uncontrolled: S and A workloads differ (path/rps/duration must match).');
+      if (!samePolicy(phaseS, phaseA)) warnings.push('Scale comparison uncontrolled: S and A retry policies differ (only the caller count may move).');
+      if (!sameDepReplicas(phaseS, phaseA)) warnings.push('Scale comparison uncontrolled: dependency replica counts differ between S and A.');
+      scaleOk = callersOk && controlled && generatorClean(phaseS) && generatorClean(phaseA);
+      if (!generatorClean(phaseS) || !generatorClean(phaseA)) warnings.push('Scale comparison needs sufficient generator-clean, settled samples in S and A.');
+      scaleLabel = scaleOk
+        ? `Scale measured 2→4 callers under the same budget (${policyLabel(phaseS)}), same workload and dependency: timely ${phaseS.timelyRps}→${phaseA.timelyRps}/s (ready ${sSet.callersReady}→${aSet.callersReady})`
+        : `Scale comparison indeterminate (need 2 vs 4 callers with identical policy/workload/dependency, matching Ready counts, and sufficient generator-clean settled samples)`;
+    }
+  }
+
+  // Saturation check: measured on the dependency, never inferred from app
+  // shedding alone. App errors cannot establish which component is saturated.
+  const depCpu = (d) => (d && num(d.cpuM) ? d.cpuM : null);
+  const saturatedIn = (_p, d) => depCpu(d) != null && depCpu(d) >= 800;
+  let saturationOk = false, saturationLabel = '';
+  if (!phaseOk(phaseS) || !phaseOk(phaseA)) {
+    saturationLabel = 'Saturation unknown: S/A phases missing';
+  } else {
+    saturationOk = saturatedIn(phaseS, depS) || saturatedIn(phaseA, depA);
+    const cpuTxt = `dep CPU S~${depCpu(depS) ?? '?'}m/A~${depCpu(depA) ?? '?'}m`;
+    saturationLabel = saturationOk
+      ? `Bottleneck measured on the dependency (${cpuTxt}; shed+timeouts/offered S ${(shedRatio(phaseS) * 100).toFixed(0)}%, A ${(shedRatio(phaseA) * 100).toFixed(0)}%)`
+      : `No bottleneck measured: dependency not saturated in S or A (${cpuTxt}; shed ratios below 20%)`;
+  }
+
+  // Retry check (Q4.2): same callers and workload, combined timeout+retry
+  // budget change — never attributed to retries alone. A strict budget that
+  // performs worse is still a valid measurement, so it passes.
+  let retryOk = false, retryLabel = '', retryVerdict = 'retry comparison indeterminate';
+  if (!phaseOk(phaseA) || !phaseOk(phaseB)) {
+    retryLabel = 'Retry comparison missing: need measured 4-caller phases A and B';
+  } else {
+    const aSet = settingsOf(phaseA), bSet = settingsOf(phaseB);
+    const thin = !generatorClean(phaseA) || !generatorClean(phaseB);
+    const attemptsMeasured = [phaseA, phaseB].every((p) =>
+      num(p.attemptsAvg) && num(p.attemptsMax) && p.attemptsN >= 10);
+    const sameCallers = aSet && bSet && aSet.callersDesired === bSet.callersDesired && aSet.callersReady === bSet.callersReady;
+    const controlled = sameCallers && sameWorkload(phaseA, phaseB) && sameDepReplicas(phaseA, phaseB) && !samePolicy(phaseA, phaseB);
+    const attemptsLine = `attempts/call ${phaseA.attemptsAvg ?? '?'} (max ${phaseA.attemptsMax ?? '?'}) → ${phaseB.attemptsAvg ?? '?'} (max ${phaseB.attemptsMax ?? '?'})`;
+    const budgetLine = `combined budget change (${policyLabel(phaseA)} → ${policyLabel(phaseB)}) at ${aSet?.callersDesired ?? '?'} callers`;
+    if (phaseB.timelyRps > phaseA.timelyRps) {
+      retryVerdict = `strict budget raised timely success ${phaseA.timelyRps}→${phaseB.timelyRps}/s via ${budgetLine} with ${attemptsLine}`;
+    } else if (phaseB.timelyRps < phaseA.timelyRps) {
+      retryVerdict = `strict budget lowered timely success ${phaseA.timelyRps}→${phaseB.timelyRps}/s via ${budgetLine} with ${attemptsLine} — failing fast is not always winning, and the numbers say so here`;
+    } else {
+      retryVerdict = `timely success unchanged (${phaseA.timelyRps}/s) via ${budgetLine} with ${attemptsLine}: the dependency cap dominates both budgets`;
+    }
+    if (!aSet || !bSet) {
+      warnings.push('Retry comparison uncontrolled: caller settings not recorded for A/B.');
+      retryLabel = 'Retry comparison uncontrolled: caller settings not recorded (need matching callers per phase)';
+    } else {
+      if (!sameCallers) warnings.push(`Retry callers differ: A ${aSet.callersDesired}/${aSet.callersReady} vs B ${bSet.callersDesired}/${bSet.callersReady} (must match).`);
+      if (!sameWorkload(phaseA, phaseB)) warnings.push('Retry comparison uncontrolled: A and B workloads differ (path/rps/duration must match).');
+      if (samePolicy(phaseA, phaseB)) warnings.push('Retry comparison uncontrolled: A and B policies identical (need a combined timeout/retry budget change).');
+      if (!sameDepReplicas(phaseA, phaseB)) warnings.push('Retry comparison uncontrolled: dependency replica counts differ between A and B.');
+      if (thin) warnings.push(`Generator evidence insufficient: A settled ${(phaseA.completed || 0) + (phaseA.failed || 0)}, B settled ${(phaseB.completed || 0) + (phaseB.failed || 0)}; need ≥${DOWNSTREAM_MIN_OFFERED} per phase, no dropped/missed offers, and settled accounting.`);
+      retryOk = controlled && !thin && attemptsMeasured;
+      if (!attemptsMeasured) warnings.push('Retry comparison needs measured attempts per call in both phases (at least 10 observations).');
+      retryLabel = retryOk ? `Both retry phases generator-clean with separated reject counts — ${retryVerdict}` : `Retry comparison indeterminate (${thin ? `need ≥${DOWNSTREAM_MIN_OFFERED} offered per phase` : 'workload/settings must match except the combined budget'})`;
+    }
+    if (!retryOk) retryVerdict = 'retry comparison indeterminate; insufficient controlled evidence to attribute a policy outcome';
+  }
+
+  // Settling check (Q4.3): bounded waits between phases with residual
+  // in-flight work measured at zero. Missing observations do not prove drain.
+  let settlingOk = false, settlingLabel = '';
+  if (!Array.isArray(settling) || settling.length < 2) {
+    settlingLabel = 'Settling missing: need ≥2 bounded waits with residual in-flight captured';
+  } else {
+    const bounded = settling.filter((s) => s && num(s.waitMs) && s.waitMs > 0 && s.waitMs <= 60000 && s.residualInflight === 0);
+    settlingOk = bounded.length >= 2;
+    settlingLabel = settlingOk
+      ? `Settling captured ${bounded.length} bounded waits (${bounded.map((s) => `${s.label || 'settle'} ${Math.round(s.waitMs / 1000)}s, residual ${s.residualInflight ?? 'unread'}`).join('; ')})`
+      : `Settling unproven: ${bounded.length}/≥2 bounded waits ended with measured zero residual work`;
+    if (!settlingOk) warnings.push('Settling uncontrolled: record ≥2 bounded waits with the residual dep in-flight gauge read after each.');
+  }
+
+  // Restore check: callers back to 2 with the default policy, loudly.
+  const restoreOk = restored === true && (restoreError == null || restoreError === '');
+  const restoreLabel = restoreOk
+    ? 'Callers back to 2 replicas with the default dependency policy'
+    : `Caller restore FAILED${restoreError ? `: ${restoreError}` : ' (unknown state)'} — inspect the deployment before trusting this run`;
+
+  const comparison = ['S', 'A', 'B'].map((k) => {
+    const p = k === 'S' ? phaseS : k === 'A' ? phaseA : phaseB;
+    const d = k === 'S' ? depS : k === 'A' ? depA : depB;
+    if (!p) return { phase: k, missing: true };
+    const total = (p.completed || 0) + (p.failed || 0);
+    return {
+      phase: k,
+      workload: p.workload || null,
+      settings: p.settings || null,
+      policyLabel: policyLabel(p),
+      durationMs: p.workload?.durationMs ?? p.elapsedMs ?? null,
+      offered: p.offered ?? null,
+      samples: total,
+      timelyRps: p.timelyRps ?? null,
+      p95: p.p95 ?? null,
+      errorPct: p.errorPct ?? null,
+      shed: p.shed ?? null,
+      timeouts: p.timeouts ?? null,
+      attemptsAvg: p.attemptsAvg ?? null,
+      attemptsMax: p.attemptsMax ?? null,
+      depCpuM: d?.cpuM ?? p.depCpuM ?? null,
+      depInflight: d?.inflight ?? null,
+    };
+  });
+  const verdict = [scaleOk ? `scale: ${phaseS.timelyRps}→${phaseA.timelyRps}/s (2→4 callers)` : 'scale: indeterminate', retryVerdict].join('; ');
   const evidence = {
-    phaseA: phaseA || null, phaseB: phaseB || null, depA: depA || null, depB: depB || null,
-    restored: restored || null, verdict,
-    note: 'Rejected/shed traffic is counted apart from successful latency so fast failures cannot fake health. Dependency saturation is measured on the dependency (CPU at limit, inflight gauge), not inferred from app shedding alone.',
+    phaseS: phaseS || null, phaseA: phaseA || null, phaseB: phaseB || null,
+    depS: depS || null, depA: depA || null, depB: depB || null,
+    settling: Array.isArray(settling) ? settling : null,
+    restored: restored ?? null, restoreError: restoreError || null,
+    comparison, warnings, verdict,
+    note: 'Rejected/shed traffic is counted apart from successful latency so fast failures cannot fake health. Dependency saturation is measured on the dependency (CPU at limit, inflight gauge), not inferred from app shedding alone. Timeout moves together with retries: verdicts name the combined budget change, never retries alone.',
   };
   const checks = [
-    { pass: Boolean(bottleneck), label: bottleneck ? `Bottleneck measured on the dependency (CPU ~${depA.cpuM}m, shed ${phaseA.shed}, timeouts ${phaseA.timeouts} at ${phaseA.offered} offered)` : 'No bottleneck measured: dependency was not saturated in phase A' },
-    { pass: Boolean(determinate), label: determinate ? `Both phases generator-clean with separated reject counts — ${verdict}` : 'Retry comparison indeterminate (need ≥200 offered per phase plus dep-side measurement)' },
-    { pass: restored === true, label: restored === true ? 'Callers back to 2 replicas with the default dependency policy' : 'Caller restore state unclear — inspect the deployment' },
+    { pass: scaleOk, label: scaleOk ? `Scale comparison controlled — ${scaleLabel}` : scaleLabel },
+    { pass: saturationOk, label: saturationLabel },
+    { pass: retryOk, label: retryLabel },
+    { pass: settlingOk, label: settlingLabel },
+    { pass: restoreOk, label: restoreLabel },
   ];
   return { status: checks.every((c) => c.pass) ? 'pass' : 'inconclusive', checks, evidence };
 }

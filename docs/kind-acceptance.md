@@ -75,6 +75,18 @@ node scripts/ui-race.mjs
 node scripts/ui-history.mjs
 ```
 
+Learning-record UI regression can also run without touching kind:
+
+```sh
+rtk proxy node scripts/ui-learning.mjs
+```
+
+This uses an in-memory cluster and simulated experiment outcomes. It checks
+saved-field hydration, drafts during polling, restart recovery, separate
+attempts, retained failures, and read-only History. It does not replace the
+real-kind acceptance matrix. Do not end an existing learner lesson to make
+space for acceptance; use the normal lifecycle when the learner is finished.
+
 Every check asserts and the script exits nonzero on any FAIL. Screenshots and
 downloaded evidence land in `results/`.
 

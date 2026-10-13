@@ -9,7 +9,10 @@ if (!allowed.has(id)) { console.error(`Unknown scenario: ${id}`); process.exit(2
 const events = [];
 const report = { scenario: id, mode, started: new Date().toISOString(), events };
 try {
-  report.result = await runScenario(id, { mode }, (type, data) => {
+  const options = id === 'capstone' ? {
+    rationale: process.env.SCALING_LAB_CAPSTONE_RATIONALE || 'CLI baseline: two warm replicas, at most five replicas, and a 60% CPU target for the local objective.',
+  } : undefined;
+  report.result = await runScenario(id, { mode, options }, (type, data) => {
     events.push({ at: new Date().toISOString(), type, data });
     if (type === 'note' || type === 'pod-delete' || type === 'slow-end' || type === 'stream-end') console.log(`${type}: ${data.text || data.pod || data.error || ''}`);
   });

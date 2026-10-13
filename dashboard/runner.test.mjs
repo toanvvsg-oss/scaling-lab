@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { requireAutoscaler, startRequest, traffic, createStopScope, drainBg, evaluateWindowCoverage, settleOwnedWork, hasUnsettled, awaitUnsettled, CLEANUP_UNSETTLED } from './runner.mjs';
+import { requireAutoscaler, startRequest, traffic, createStopScope, drainBg, evaluateWindowCoverage, settleOwnedWork, hasUnsettled, awaitUnsettled, CLEANUP_UNSETTLED, validateCapstoneOptions, pacedRequests, summarizePaced } from './runner.mjs';
+import { cpuHpaManifest } from './runs.mjs';
 import http from 'node:http';
 
 const cpu = { hpa: { name: 'app', metrics: [{ type: 'Resource', resource: 'cpu' }] } };
@@ -210,4 +211,59 @@ test('ownership handoff rethrows the original on drained work, retains on undrai
   assert.equal(await awaitUnsettled(retainedKey, 2000), true);
   assert.equal(hasUnsettled(retainedKey), false, 'settled work unregisters');
   assert.equal(await awaitUnsettled(retainedKey, 100), true, 'rejoin after settlement is a fast no-op');
+});
+
+test('capstone options accept bounded HPA settings with a rationale', () => {
+  const out = validateCapstoneOptions({ minReplicas: 1, maxReplicas: 8, cpuTarget: 30, rationale: 'Warm headroom for the burst within laptop bounds.' });
+  assert.equal(out.minReplicas, 1);
+  assert.equal(out.maxReplicas, 8);
+  assert.equal(out.cpuTarget, 30);
+  assert.match(out.rationale, /headroom/);
+  const manifest = cpuHpaManifest('scaling-run-abcdef12', out);
+  assert.equal(manifest.spec.minReplicas, 1);
+  assert.equal(manifest.spec.maxReplicas, 8);
+  assert.equal(manifest.spec.metrics[0].resource.target.averageUtilization, 30);
+});
+
+test('capstone options reject out-of-range bounds, max<min, and rationale problems', () => {
+  const base = { rationale: 'Holds headroom while capping laptop load.' };
+  assert.throws(() => validateCapstoneOptions({ ...base, minReplicas: 0 }), /minReplicas/);
+  assert.throws(() => validateCapstoneOptions({ ...base, minReplicas: 6 }), /minReplicas/);
+  assert.throws(() => validateCapstoneOptions({ ...base, maxReplicas: 0 }), /maxReplicas/);
+  assert.throws(() => validateCapstoneOptions({ ...base, maxReplicas: 9 }), /maxReplicas/);
+  assert.throws(() => validateCapstoneOptions({ ...base, minReplicas: 4, maxReplicas: 2 }), /greater than or equal/);
+  assert.throws(() => validateCapstoneOptions({ ...base, cpuTarget: 20 }), /cpuTarget/);
+  assert.throws(() => validateCapstoneOptions({ ...base, cpuTarget: 95 }), /cpuTarget/);
+  assert.throws(() => validateCapstoneOptions({ minReplicas: 2, maxReplicas: 5, cpuTarget: 60 }), /rationale/);
+  assert.throws(() => validateCapstoneOptions({ ...base, rationale: '   ' }), /rationale/);
+  assert.throws(() => validateCapstoneOptions({ ...base, rationale: 'x'.repeat(501) }), /at most 500/);
+});
+
+test('paced traffic records dropped offers and settles every started request', async () => {
+  const server = http.createServer((req, res) => setTimeout(() => res.end('ok'), 100));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const raw = await pacedRequests(`http://127.0.0.1:${server.address().port}`, '/fast', 40, 250, 1000, () => {}, { maxInflight: 1 });
+    const summary = summarizePaced(raw, 500);
+    assert.ok(raw.dropped > 0);
+    assert.equal(raw.offered, raw.started + raw.dropped);
+    assert.equal(raw.started, raw.completed + raw.failed);
+    assert.equal(summary.started, raw.started);
+    assert.equal(summary.missedSlots, raw.missedSlots);
+  } finally { await new Promise((r) => server.close(r)); }
+});
+
+test('late generator slots are counted rather than replayed as a clean burst', async () => {
+  const server = http.createServer((req, res) => { res.statusCode = 500; res.end('failed'); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const raw = await pacedRequests(`http://127.0.0.1:${server.address().port}`, '/fast', 100, 250, 1000, () => {
+      const until = Date.now() + 30;
+      while (Date.now() < until) { /* simulate a delayed event-loop observer */ }
+    });
+    assert.ok(raw.missedSlots > 0);
+    assert.ok(raw.dropped >= raw.missedSlots);
+    assert.equal(raw.offered, raw.started + raw.dropped);
+    assert.equal(raw.started, raw.completed + raw.failed);
+  } finally { await new Promise((r) => server.close(r)); }
 });

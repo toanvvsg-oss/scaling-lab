@@ -699,3 +699,207 @@ test('unsettled drain retains the allocation, blocks new work, and rejoins the s
   await new Promise((x) => setTimeout(x, 300));
   assert.equal(R.archives.get(runId).events?.length ?? -2, archivedEvents, 'no late events after archival');
 });
+
+test('M3 learning records: predict/explain/self-review persist with bounds and reveal never submits', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer();
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  const created = (await ctx.api('POST', '/api/runs', { lesson: 'capacity' })).body;
+  await readyIds(ctx.api, 1);
+  const id = created.id;
+
+  // Predict before any experiment: prior=true.
+  let r = await ctx.api('POST', '/api/predict', { run: id, guess: 'same', reasoning: 'flat goodput' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.prior, true);
+  assert.equal(r.body.prediction.answer, 'same');
+
+  // Lesson mismatch rejected.
+  r = await ctx.api('POST', '/api/predict', { run: id, lesson: 'downstream', guess: 'up' });
+  assert.equal(r.status, 400);
+
+  // Reasoning bound enforced.
+  r = await ctx.api('POST', '/api/predict', { run: id, guess: 'up', reasoning: 'x'.repeat(2001) });
+  assert.equal(r.status, 400);
+
+  // Explicit skip on a second run records skipped.
+  const c2 = (await ctx.api('POST', '/api/runs', { lesson: 'capacity' })).body;
+  await readyIds(ctx.api, 2);
+  r = await ctx.api('POST', '/api/predict', { run: c2.id, skip: true });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.prediction.status, 'skipped');
+
+  // Predict after observation is kept but not labeled prior.
+  await ctx.api('POST', `/api/runs/${id}/load`, { action: 'start', profile: 'cheap' });
+  await ctx.api('POST', `/api/runs/${id}/load`, { action: 'stop' });
+  r = await ctx.api('POST', '/api/predict', { run: id, guess: 'up', reasoning: 'after' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.prior, false);
+  // New observation after the second prediction re-opens reveal.
+  await ctx.api('POST', `/api/runs/${id}/load`, { action: 'start', profile: 'cheap' });
+  await ctx.api('POST', `/api/runs/${id}/load`, { action: 'stop' });
+
+  // Reveal works after observation but does NOT submit an explanation.
+  r = await ctx.api('POST', '/api/reveal', { run: id });
+  assert.equal(r.status, 200);
+  assert.ok(r.body.explanation);
+  let d = (await ctx.api('GET', `/api/runs/${id}`)).body;
+  assert.equal(d.explanation, null);
+  assert.ok(d.modelRevealed);
+  assert.equal(d.prediction.answer, 'up');
+  assert.equal(d.prediction.prior, false);
+
+  // Self-review gated before explanation.
+  r = await ctx.api('POST', '/api/self-review', { run: id });
+  assert.equal(r.status, 400);
+
+  // Explanation requires all four fields within bounds.
+  r = await ctx.api('POST', '/api/explain', { run: id, observation: 'o', evidence: 'e' });
+  assert.equal(r.status, 400);
+  r = await ctx.api('POST', '/api/explain', { run: id, observation: 'o', evidence: 'e', interpretation: 'i', nextAction: 'n' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.revision, 1);
+
+  // Revision preserves the initial response.
+  r = await ctx.api('POST', '/api/explain', { run: id, observation: 'o2', evidence: 'e2', interpretation: 'i2', nextAction: 'n2' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.revision, 2);
+  d = (await ctx.api('GET', `/api/runs/${id}`)).body;
+  assert.equal(d.explanation.revision, 2);
+  assert.equal(d.explanation.revisions.length, 2);
+  assert.equal(d.explanation.revisions[0].observation, 'o');
+  assert.equal(d.rubric.length, 4);
+
+  // Self-review returns the model explanation + rubric, idempotent.
+  r = await ctx.api('POST', '/api/self-review', { run: id });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.modelExplanation, EXPLANATIONS.capacity);
+  assert.equal(r.body.rubric.length, 4);
+  const firstAt = r.body.at;
+  r = await ctx.api('POST', '/api/self-review', { run: id });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.at, firstAt);
+  assert.equal(r.body.idempotent, true);
+
+  // Skipped explanation also unlocks self-review.
+  r = await ctx.api('POST', '/api/explain', { run: c2.id, skip: true });
+  assert.equal(r.status, 200);
+  r = await ctx.api('POST', '/api/self-review', { run: c2.id });
+  assert.equal(r.status, 200);
+
+  // Persistence: evidence export carries the learning record.
+  const ev = (await ctx.api('GET', `/api/evidence?run=${id}`)).body;
+  assert.equal(ev.learning.prediction.answer, 'up');
+  assert.equal(ev.learning.explanation.status, 'submitted');
+  assert.equal(ev.learning.selfReview.done, true);
+
+  // Legacy archive without learning renders as unavailable.
+  R.archives.set('ffffffff', { run: 'ffffffff', lesson: 'capacity', archivedAt: new Date().toISOString(), status: 'pass', ended: 'completed', result: { status: 'pass' } });
+  const hist = (await ctx.api('GET', '/api/lesson')).body.history;
+  const legacy = hist.find((h) => h.run === 'ffffffff');
+  assert.equal(legacy.prediction, null);
+  assert.equal(legacy.explanation, null);
+});
+
+test('Q5 minimal: hint levels and diagnosis report persist on the learning record', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer();
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  const created = (await ctx.api('POST', '/api/runs', { lesson: 'capacity' })).body;
+  await readyIds(ctx.api, 1);
+  const id = created.id;
+
+  let r = await ctx.api('POST', '/api/hint', { run: id, level: 9 });
+  assert.equal(r.status, 400);
+  r = await ctx.api('POST', '/api/hint', { run: id, level: 1 });
+  assert.equal(r.status, 200);
+  assert.ok(r.body.text);
+  r = await ctx.api('POST', '/api/hint', { run: id, level: 3 });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.hintsUsed, 2);
+
+  // Diagnosis rejects unknown variants and overlong text.
+  r = await ctx.api('POST', '/api/diagnosis', { run: id, variant: { kind: 'nope' } });
+  assert.equal(r.status, 400);
+  r = await ctx.api('POST', '/api/diagnosis', { run: id, initialDiagnosis: 'x'.repeat(2001) });
+  assert.equal(r.status, 400);
+  r = await ctx.api('POST', '/api/diagnosis', { run: id });
+  assert.equal(r.status, 400);
+
+  const variant = { kind: 'capacity-challenge', config: { work: 'expensive', sloP95Ms: 500, sloErrorPct: 5 } };
+  r = await ctx.api('POST', '/api/diagnosis', { run: id, initialDiagnosis: '15 RPS/pod generator-clean, +1 headroom', variant });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.diagnosis.initialDiagnosis.length > 0, true);
+  assert.equal(r.body.diagnosis.variant.kind, 'capacity-challenge');
+  // Partial update preserves hints and earlier fields.
+  r = await ctx.api('POST', '/api/diagnosis', { run: id, change: 'hold 5 pods for 60 peak RPS', outcome: 'pending measurement' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.diagnosis.change.length > 0, true);
+
+  const d = (await ctx.api('GET', `/api/runs/${id}`)).body;
+  assert.equal(d.learning.diagnosis.hintsUsed.length, 2);
+  assert.equal(d.learning.diagnosis.initialDiagnosis.length > 0, true);
+  assert.equal(d.learningStatus.diagnosis, 'submitted');
+  const ev = (await ctx.api('GET', `/api/evidence?run=${id}`)).body;
+  assert.equal(ev.learning.diagnosis.variant.kind, 'capacity-challenge');
+});
+
+test('attempts retain initial revisions, reset learning on rerun, and reject ended writes', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer();
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  await ctx.boot();
+  const id = (await ctx.api('POST', '/api/runs', { lesson: 'capacity' })).body.id;
+  await readyIds(ctx.api, 1);
+  await ctx.api('POST', '/api/predict', { run: id, guess: 'up', reasoning: 'first prediction' });
+  const fields = { run: id, evidence: 'e', interpretation: 'i', nextAction: 'n' };
+  for (let i = 1; i <= 12; i++) {
+    assert.equal((await ctx.api('POST', '/api/explain', { ...fields, observation: `response ${i}` })).status, 200);
+  }
+  let d = (await ctx.api('GET', `/api/runs/${id}`)).body;
+  assert.equal(d.explanation.revisions[0].observation, 'response 1');
+  assert.equal(d.explanation.revisions.at(-1).observation, 'response 12');
+  await ctx.api('POST', '/api/self-review', { run: id });
+  await ctx.api('POST', `/api/runs/${id}/run`, { id: 'capacity' });
+  while (R.runs.get(id).scenarioRunning) await new Promise((r) => setTimeout(r, 10));
+  assert.equal((await ctx.api('POST', '/api/attempt', { run: id })).status, 200);
+  d = (await ctx.api('GET', `/api/runs/${id}`)).body;
+  assert.equal(d.explanation, null);
+  assert.equal(d.selfReview, null);
+  assert.equal(d.modelRevealed, null);
+  const prediction = await ctx.api('POST', '/api/predict', { run: id, guess: 'same' });
+  assert.equal(prediction.body.prior, true);
+  await ctx.api('POST', `/api/runs/${id}/run`, { id: 'capacity' });
+  while (R.runs.get(id).scenarioRunning) await new Promise((r) => setTimeout(r, 10));
+  const ev = (await ctx.api('GET', `/api/evidence?run=${id}`)).body;
+  assert.equal(ev.attempts.length, 1);
+  assert.equal(ev.attempts[0].learning.explanation.revisions[0].observation, 'response 1');
+  assert.equal(ev.learning.prediction.answer, 'same');
+  await R.cleanupRun(id, ctx.dir, ctx.fake.deps);
+  for (const [path, body] of [
+    ['/api/predict', { guess: 'up' }], ['/api/explain', { ...fields, observation: 'after end' }],
+    ['/api/self-review', {}], ['/api/hint', { level: 1 }], ['/api/diagnosis', { outcome: 'after end' }], ['/api/attempt', {}],
+  ]) assert.equal((await ctx.api('POST', path, { ...body, run: id })).status, 409, path);
+});
+
+test('boot recovers active learning from disk without creating another environment', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  const ctx = await bootTestServer();
+  await ctx.boot();
+  const id = (await ctx.api('POST', '/api/runs', { lesson: 'capacity' })).body.id;
+  await readyIds(ctx.api, 1);
+  await ctx.api('POST', '/api/predict', { run: id, guess: 'up', reasoning: 'survives restart' });
+  await ctx.api('POST', '/api/explain', { run: id, observation: 'saved work', evidence: 'e', interpretation: 'i', nextAction: 'n' });
+  await new Promise((r) => ctx.server.close(r));
+  R.runs.clear();
+  const second = await bootTestServer({ resultsDir: ctx.dir, runsApi: { adoptOrphanRuns: () => R.adoptOrphanRuns(ctx.fake.deps) } });
+  t.after(() => new Promise((r) => second.server.close(r)));
+  await second.boot();
+  const detail = (await second.api('GET', `/api/runs/${id}`)).body;
+  assert.equal(detail.prediction.reasoning, 'survives restart');
+  assert.equal(detail.explanation.observation, 'saved work');
+  assert.equal((await second.api('GET', '/api/lesson')).body.active.runId, id);
+  assert.equal(R.runs.size, 1);
+});
