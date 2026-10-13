@@ -198,6 +198,14 @@ test('resources grader needs denominator, cpu.stat throttle, and OOM proof', asy
     restored: true,
   });
   assert.equal(noOom.status, 'inconclusive');
+  const noCoverage = gradeResources({
+    denom: { utilBefore: 300, utilAfter: 70, desiredBefore: 5, desiredAfter: 3, trafficSame: false, windows: { before: { offered: 80, successes: 16, failures: 0 }, after: { offered: 0, successes: 0, failures: 0, reasons: ['generation ended before the window end'] } } },
+    throttle: { baseDeltaUsec: 5000, tightDeltaUsec: 900000, cappedCpuM: 150, capped: true, samePod: true, podTight: 'app-x-1', tightUsageMs: 9000 },
+    oom: { restartsBefore: 0, restartsAfter: 1, reason: 'app-x:OOMKilled', reasons: ['app-x:OOMKilled'] },
+    restored: true,
+  });
+  assert.equal(noCoverage.status, 'inconclusive', 'halved utilization without proven constant-load generation never passes');
+  assert.equal(noCoverage.checks[0].pass, false);
 });
 
 test('signals grader separates equal-RPS cost', async () => {

@@ -483,6 +483,7 @@ export function describeRun(run) {
     scenario: run.scenario || null,
     mode: run.mode || null,
     scenarioRunning: Boolean(run.scenarioRunning),
+    cleanupPending: run.cleanupPending || null,
     actionRunning: Boolean(run.actionRunning),
     hasPendingLong: Boolean(run.pendingLong),
     actions: run.actions || 0,

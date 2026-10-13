@@ -83,3 +83,25 @@ test('auto mode scales workers up under backlog', async () => {
   assert.deepEqual(h.scales, [2], 'backlog above watermark scales 1 → 2');
   await q.stop('test');
 });
+
+test('scale landing after stop is undone and records no tick', async () => {
+  const h = harness();
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const q = createQueueRun({
+    request: h.request,
+    getWorkers: async () => 1,
+    setWorkers: (n) => { h.scales.push(n); if (n !== 1) return held; },
+    emit: () => {},
+  });
+  await q.start({ arrivalRps: 1, jobMs: 1000 });
+  for (let i = 0; i < 9; i++) q.jobs.push({ enqueuedAt: Date.now() });
+  q.auto = true;
+  const tickP = q.tick();
+  await new Promise((r) => setTimeout(r, 50)); // let the tick reach the held setWorkers(2)
+  const stopP = q.stop('test end');
+  release();
+  await Promise.all([tickP, stopP]);
+  assert.deepEqual(h.scales, [2, 1], 'post-stop scale is undone back to the pre-tick count');
+  assert.equal(q.ticks.length, 0, 'no post-stop tick recorded');
+});

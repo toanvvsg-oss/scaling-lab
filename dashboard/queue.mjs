@@ -124,7 +124,13 @@ export function createQueueRun({ request, getWorkers, setWorkers, emit = () => {
             if (!alive()) return null;
             if (want === 'up') { scaledTo = workers + 1; await setWorkers(scaledTo); }
             if (want === 'down') { scaledTo = workers - 1; await setWorkers(scaledTo); }
-            if (!alive()) return null;
+            if (!alive()) {
+              // stop() landed mid-scale: undo the write so no scale survives
+              // the stop, then exit without recording a post-stop tick.
+              // Best-effort (teardown may already own the namespace).
+              if (scaledTo != null) { try { await setWorkers(workers); } catch { /* stop wins */ } }
+              return null;
+            }
           }
           const tick = {
             at: new Date().toISOString(), backlog, oldestAgeMs, workers,

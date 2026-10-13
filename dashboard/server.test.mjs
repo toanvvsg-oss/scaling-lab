@@ -7,6 +7,7 @@ import http from 'node:http';
 import { createApp, EXPLANATIONS, prodDeps } from './server.mjs';
 import * as R from './runs.mjs';
 import { makeFakeCluster } from './test-fake.mjs';
+import { cleanupUnsettledError, awaitUnsettled } from './runner.mjs';
 
 test('production runsApi wires every method the routes call', () => {
   const api = prodDeps.runsApi;
@@ -596,4 +597,105 @@ test('concurrent starts grant exactly one allocation (TOCTOU guard)', async (t) 
   assert.equal(live.length, 1, 'the loser provisioned nothing');
   await ctx.api('POST', '/api/lesson/end');
   await waitLesson((x) => x.active === null, 30000);
+});
+
+test('unsettled drain retains the allocation, blocks new work, and rejoins the same work on retry', async (t) => {
+  R.runs.clear(); R.archives.clear();
+  let calls = 0;
+  const seenKeys = [];
+  let gateResolve;
+  const gate = new Promise((r) => { gateResolve = r; });
+  const flakyScenario = async (id, opts, emit) => {
+    calls += 1;
+    if (calls === 1) {
+      // Mimic a production catch that cannot drain: distinct cleanup failure
+      // carrying registry ownership of the outstanding promise.
+      emit('note', { text: 'first attempt leaves background work outstanding' });
+      throw cleanupUnsettledError('fake background work', [gate]);
+    }
+    return { status: 'pass', checks: [], evidence: {} };
+  };
+  const ctx = await bootTestServer({
+    runScenario: flakyScenario,
+    // Short bound keeps the test fast; production uses 120s.
+    awaitScenarioCleanup: (key) => { seenKeys.push(key); return awaitUnsettled(key, 300); },
+  });
+  t.after(() => new Promise((r) => ctx.server.close(r)));
+  t.after(() => { R.runs.clear(); R.archives.clear(); });
+  await ctx.boot();
+  const waitLesson = async (pred, timeoutMs = 20000) => {
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until) {
+      const s = await ctx.api('GET', '/api/lesson');
+      if (pred(s.body)) return s.body;
+      await new Promise((x) => setTimeout(x, 100));
+    }
+    throw new Error('lesson flow did not settle in time');
+  };
+  const waitRun = async (runId, pred, timeoutMs = 10000) => {
+    const until = Date.now() + timeoutMs;
+    let run;
+    while (Date.now() < until) {
+      run = (await ctx.api('GET', `/api/runs/${runId}`)).body;
+      if (pred(run)) return run;
+      await new Promise((x) => setTimeout(x, 100));
+    }
+    throw new Error('run did not settle in time');
+  };
+  let r = await ctx.api('POST', '/api/lesson/start', { lesson: 'connections' });
+  assert.equal(r.status, 202);
+  const flow = await waitLesson((b) => b.active?.status === 'ready');
+  const runId = flow.active.runId;
+  const runNs = (await ctx.api('GET', `/api/runs/${runId}`)).body.namespace;
+  assert.ok(ctx.fake.namespaces.has(runNs), 'namespace provisioned');
+
+  // First attempt fails with retained cleanup ownership.
+  r = await ctx.api('POST', `/api/runs/${runId}/run`, { id: 'connections' });
+  assert.equal(r.status, 202);
+  const retained = await waitRun(runId, (x) => Boolean(x.cleanupPending || x.error));
+  assert.ok(retained.cleanupPending?.key, 'outstanding-work ownership retained on the run');
+  assert.equal(retained.scenarioRunning, true, 'still marked running while retained');
+  assert.ok(ctx.fake.namespaces.has(runNs), 'namespace retained, not deleted');
+  assert.ok((await ctx.api('GET', '/api/lesson')).body.active, 'allocation retained');
+  assert.equal((await ctx.api('GET', '/api/lesson')).body.history.length, 0, 'nothing archived');
+
+  // Retry rejoins the SAME work instead of starting over; other work refuses.
+  r = await ctx.api('POST', `/api/runs/${runId}/run`, { id: 'connections' });
+  assert.equal(r.status, 202, 'retry accepted to rejoin retained work');
+  await new Promise((x) => setTimeout(x, 700)); // 300ms join bound lapses while the gate is shut
+  assert.equal(calls, 1, 'no fresh scenario started while work is unsettled');
+  const still = await waitRun(runId, (x) => /still unsettled/.test(x.error || ''));
+  assert.ok(still.cleanupPending, 'retention survives a failed rejoin');
+  r = await ctx.api('POST', `/api/runs/${runId}/actions`, { action: 'q-start' });
+  assert.equal(r.status, 409, 'actions blocked while retained');
+  r = await ctx.api('POST', `/api/runs/${runId}/load`, { action: 'start' });
+  assert.equal(r.status, 409, 'new load blocked while retained');
+  r = await ctx.api('DELETE', `/api/runs/${runId}`);
+  assert.equal(r.status, 409, 'namespace deletion blocked while retained');
+  r = await ctx.api('POST', '/api/lesson/start', { lesson: 'rollout' });
+  assert.equal(r.status, 409, 'switch/start blocked while retained');
+
+  // End while unsettled retains everything and names the same work.
+  r = await ctx.api('POST', '/api/lesson/end');
+  assert.equal(r.status, 202);
+  const failedEnd = await waitLesson((b) => b.active?.status === 'cleanup-failed');
+  assert.equal(failedEnd.active.status, 'cleanup-failed');
+  assert.ok(ctx.fake.namespaces.has(runNs), 'namespace still retained after failed End');
+  assert.ok(seenKeys.includes(retained.cleanupPending.key), 'End awaited the SAME registered work');
+
+  // Resolve the work: retry rejoins and runs, then End archives with no lates.
+  gateResolve();
+  r = await ctx.api('POST', `/api/runs/${runId}/run`, { id: 'connections' });
+  assert.equal(r.status, 202);
+  const passed = await waitRun(runId, (x) => x.resultStatus === 'pass');
+  assert.equal(calls, 2, 'retry ran the scenario only after the same work settled');
+  assert.equal(passed.cleanupPending, null, 'retention cleared after settlement');
+  r = await ctx.api('POST', '/api/lesson/end');
+  assert.equal(r.status, 202);
+  await waitLesson((b) => b.active === null, 30000);
+  assert.ok(!ctx.fake.namespaces.has(runNs), 'namespace deleted only after settlement');
+  assert.ok(R.archives.has(runId), 'evidence archived');
+  const archivedEvents = R.archives.get(runId).events?.length ?? -1;
+  await new Promise((x) => setTimeout(x, 300));
+  assert.equal(R.archives.get(runId).events?.length ?? -2, archivedEvents, 'no late events after archival');
 });

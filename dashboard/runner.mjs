@@ -38,51 +38,95 @@ export async function clusterState(ns = 'scaling-lab') {
   } catch (error) { return { connected: false, error: error.message, pods: [], endpoints: [] }; }
 }
 
-function startRequest(path, agent, baseUrl = base) {
+function startRequest(path, agent, baseUrl = base, opts = {}) {
+  const deadlineMs = Number(opts.deadlineMs ?? 35000);
   let onHeaders, onDone;
   const headers = new Promise(resolve => { onHeaders = resolve; });
   const done = new Promise(resolve => { onDone = resolve; });
   const started = Date.now();
   let headerSent = false;
+  let settled = false;
   let responseInfo = {};
+  const finish = (outcome) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(deadline);
+    onDone(outcome);
+  };
   const req = http.get(`${baseUrl}${path}`, { agent, timeout: 30000 }, res => {
     headerSent = true;
     responseInfo = { pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], status: res.statusCode };
     onHeaders(responseInfo);
     const chunks = [];
     res.on('data', x => chunks.push(x));
-    res.on('end', () => onDone({ ok: res.statusCode === 200, complete: true, status: res.statusCode, pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], ms: Date.now() - started, body: Buffer.concat(chunks).toString() }));
-    res.on('error', error => onDone({ ...responseInfo, ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started }));
+    res.on('end', () => finish({ ok: res.statusCode === 200, complete: true, status: res.statusCode, pod: res.headers['x-pod'], requestId: res.headers['x-request-id'], edgeConnection: res.headers['x-edge-connection'], appConnection: res.headers['x-app-connection'], ms: Date.now() - started, body: Buffer.concat(chunks).toString() }));
+    res.on('error', error => finish({ ...responseInfo, ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started }));
+    // A connection that closes mid-body without end/error (pod deleted
+    // mid-response, proxy FIN) must still settle: otherwise traffic's
+    // Promise.all waits forever and the scenario never reaches restore.
+    // finish() is settled-guarded, so the normal end/error path always wins.
+    res.on('close', () => finish({ ...responseInfo, ok: false, complete: false, error: responseInfo.error || 'connection closed mid-response', ms: Date.now() - started }));
   });
+  // Absolute deadline: socket inactivity timeouts alone cannot bound a
+  // slowly-dribbling response, and req.destroy() alone does not settle a
+  // request still queued in the agent (Node may emit the error only once a
+  // socket is assigned). So the deadline explicitly settles both promises
+  // once — preserving response identity when headers arrived — then aborts.
+  // Every startRequest settles by ~deadline, which bounds traffic()'s join
+  // and every scenario wait above it.
+  const deadline = setTimeout(() => {
+    if (!headerSent) onHeaders({ error: 'request deadline exceeded' });
+    finish({ ...responseInfo, ok: false, complete: false, error: 'request deadline exceeded', ms: Date.now() - started });
+    try { req.destroy(new Error('request deadline exceeded')); } catch { /* already gone */ }
+  }, Math.max(1, deadlineMs));
   req.on('timeout', () => req.destroy(new Error('request timeout')));
   req.on('error', error => {
     if (!headerSent) onHeaders({ error: error.code || error.message });
-    onDone({ ...responseInfo, ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started });
+    finish({ ...responseInfo, ok: false, complete: false, error: error.code || error.message, ms: Date.now() - started });
   });
   return { headers, done };
 }
 
-async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1, baseUrl = base, cancel = null) {
+async function traffic(durationMs, path, emit, intervalMs = 120, emitEvery = 1, baseUrl = base, cancel = null, probe = null) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: 12 });
   const requests = [];
   let observed = 0;
   const until = Date.now() + durationMs;
-  while (Date.now() < until) {
-    throwIfCancelled(cancel);
-    const task = startRequest(path, agent, baseUrl).done.then(x => {
-      const n = ++observed;
-      // Successful samples go to the trace as 'sample' (no milestone);
-      // failures keep the 'request' type so they milestone.
-      if (x.ok && (n % emitEvery === 0)) emit('sample', { pod: x.pod, ok: true, ms: x.ms, requestId: x.requestId, edgeConnection: x.edgeConnection, appConnection: x.appConnection });
-      else if (!x.ok) emit('request', { pod: x.pod, ok: x.ok, status: x.status, error: x.error, ms: x.ms, requestId: x.requestId });
-      return x;
-    });
-    requests.push(task);
-    await sleep(intervalMs);
+  // Generation (offering) ends when the loop exits — normally, by stop, or by
+  // error — strictly before the drain join below. The probe records that
+  // boundary so coverage can tell offered load apart from delayed completion.
+  let generationEnded = false;
+  const endGeneration = () => { if (probe && !generationEnded) { generationEnded = true; probe.stopped(Date.now()); } };
+  try {
+    while (Date.now() < until) {
+      throwIfCancelled(cancel);
+      if (probe) probe.offered(Date.now());
+      const task = startRequest(path, agent, baseUrl).done.then(x => {
+        const n = ++observed;
+        // Successful samples go to the trace as 'sample' (no milestone);
+        // failures keep the 'request' type so they milestone.
+        if (x.ok && (n % emitEvery === 0)) emit('sample', { pod: x.pod, ok: true, ms: x.ms, requestId: x.requestId, edgeConnection: x.edgeConnection, appConnection: x.appConnection });
+        else if (!x.ok) emit('request', { pod: x.pod, ok: x.ok, status: x.status, error: x.error, ms: x.ms, requestId: x.requestId });
+        return x;
+      });
+      requests.push(task);
+      await sleep(intervalMs);
+    }
+    endGeneration();
+    return await Promise.all(requests);
+  } catch (error) {
+    endGeneration();
+    throw error;
+  } finally {
+    // Cancellation or error rejects the loop above WITHOUT joining
+    // outstanding requests. Settle them here — each startRequest is
+    // deadline-bounded, so this drain is bounded — before releasing sockets,
+    // so a caller awaiting this promise observes actual settlement, and a
+    // wedged connection can never leak an agent socket in the long-lived
+    // dashboard server.
+    await Promise.allSettled(requests);
+    agent.destroy();
   }
-  const results = await Promise.all(requests);
-  agent.destroy();
-  return results;
 }
 
 export const CANCELLED = 'CANCELLED';
@@ -1007,27 +1051,84 @@ async function runResourcesScenario(emit, opts = {}) {
   emit('note', { text: `Baseline resources: ${JSON.stringify(original)}. Phase 1 keeps the HPA and holds CPU traffic constant while the CPU request quadruples (limit stays 1, so 400m ≤ 1 is valid).` });
   let denom = null, throttle = null, oom = null, restored = false, hpaRestored = false;
   const bg = [];
-  // Local token merges End-lesson cancellation with internal-error teardown:
-  // any failure below first stops background work, settles it, then restores.
-  const local = { requested: false };
-  const cancelFn = () => (typeof cancel === 'function' && cancel()) || local.requested;
+  // Stop scope merges End-lesson cancellation with internal-error teardown:
+  // any failure below first stops owned background work and awaits its actual
+  // settlement before the finally restores.
+  const scope = createStopScope(cancel);
+  const cancelFn = scope.cancelFn;
   try {
-    // Phase 1: denominator effect at constant traffic. The utilization ratio
-    // (usage ÷ request) is robust to HPA replica changes, but HPA metrics lag
-    // ~30s, so the load runs 120s and sampling starts after 40s.
-    const load = traffic(120000, '/cpu?ms=120', emit, 200, 5, baseUrl, cancelFn);
-    bg.push(load.catch((e) => { if (e?.code !== CANCELLED) throw e; return []; }));
+    // Phase 1: denominator effect at constant traffic. The load stays alive
+    // through BOTH sampling windows and is explicitly stopped and drained
+    // afterwards: a fixed window cannot cover rollout plus API time, so a
+    // hardcoded trafficSame would credit samples taken after traffic waned.
+    // Coverage is generation-based (offer timestamps + generator stop time),
+    // never completion-based: delayed completions after generation stopped,
+    // or a failures-only window, cannot prove unchanged useful work. Both
+    // windows need generation spanning them at rate with dominated successes
+    // or the phase is inconclusive. HPA replica moves and the ~30s metrics
+    // lag are recorded in evidence, not assumed away (utilization is the
+    // per-pod average, so the ratio still reads the denominator rather than
+    // total work).
+    const gen = { offers: [], stoppedAt: null, successes: [], failures: [] };
+    let activeWindow = null;
+    const phase1Emit = (type, data) => {
+      if (activeWindow) {
+        const now = Date.now();
+        if (type === 'sample') gen.successes.push(now);
+        else if (type === 'request') gen.failures.push(now);
+      }
+      emit(type, data);
+    };
+    const phase1Stop = createStopScope(cancelFn);
+    const probe = {
+      offered: (t) => gen.offers.push(t),
+      stopped: (t) => { if (gen.stoppedAt == null) gen.stoppedAt = t; },
+    };
+    // 300s is a backstop, not the plan: the explicit stop below ends
+    // generation right after the second window. A natural end before that
+    // (very slow rollout) fails the span check and yields inconclusive, never
+    // a pass on partial coverage.
+    const loadP = traffic(300000, '/cpu?ms=120', phase1Emit, 200, 5, baseUrl, phase1Stop.cancelFn, probe).then(
+      () => {},
+      (error) => { if (error?.code === CANCELLED) return; throw error; },
+    );
+    bg.push(loadP.catch(() => {}));
     await unlessCancelled(sleep(40000), cancelFn);
+    const winBeforeStart = Date.now();
+    activeWindow = 'before';
     const utilBefore = await avgUtil(ns, 3, cancelFn);
+    activeWindow = null;
+    const winBeforeEnd = Date.now();
     const desiredBefore = (await hpaSnapshot(ns).catch(() => ({}))).desired ?? null;
     await patchContainerResources(ns, { requests: { cpu: '400m', memory: original?.requests?.memory || '64Mi' }, limits: { cpu: '1', memory: original?.limits?.memory || '128Mi' } }, cancelFn, null);
     emit('note', { text: `CPU request ${original?.requests?.cpu || '?'}→400m (same traffic). Utilization was ${utilBefore}%; settling 30s past the rollout, then resampling.` });
     await unlessCancelled(sleep(30000), cancelFn);
+    const winAfterStart = Date.now();
+    activeWindow = 'after';
     const utilAfter = await avgUtil(ns, 5, cancelFn);
+    activeWindow = null;
+    const winAfterEnd = Date.now();
     const desiredAfter = (await hpaSnapshot(ns).catch(() => ({}))).desired ?? null;
-    await unlessCancelled(load, cancelFn);
-    denom = { utilBefore, utilAfter, desiredBefore, desiredAfter, trafficSame: true };
-    emit('note', { text: `Denominator: ${utilBefore}%→${utilAfter}% at the same offered traffic (desired ${desiredBefore}→${desiredAfter}).` });
+    // Explicit stop ends GENERATION here; the join below then drains delayed
+    // completions. Coverage is judged on offers, so drain events can never
+    // retroactively cover a window.
+    phase1Stop.requestStop();
+    await loadP;
+    throwIfCancelled(cancelFn);
+    const shared = { offers: gen.offers, successes: gen.successes, failures: gen.failures, generatorStoppedAt: gen.stoppedAt, intervalMs: 200 };
+    const before = evaluateWindowCoverage({ ...shared, winStart: winBeforeStart, winEnd: winBeforeEnd });
+    const after = evaluateWindowCoverage({ ...shared, winStart: winAfterStart, winEnd: winAfterEnd });
+    const covered = before.ok && after.ok;
+    denom = {
+      utilBefore, utilAfter, desiredBefore, desiredAfter, trafficSame: covered,
+      windows: {
+        before: { ...before.detail, reasons: before.reasons },
+        after: { ...after.detail, reasons: after.reasons },
+      },
+    };
+    emit('note', { text: covered
+      ? `Denominator: ${utilBefore}%→${utilAfter}% with generation spanning both windows at ~5 RPS (desired ${desiredBefore}→${desiredAfter}; before: ${before.detail.offered} offered/${before.detail.successes} succeeded, after: ${after.detail.offered} offered/${after.detail.successes} succeeded).`
+      : `Denominator sampling LACKED constant-load generation (${[...before.reasons, ...after.reasons].join('; ')}) — phase inconclusive, never graded as shown.` });
     // Phases 2–3 need FIXED capacity: the HPA would spread load across new
     // pods and hide both throttling and OOM. It is removed here (metrics
     // still flow; only the scaler object goes) and re-applied in the
@@ -1077,9 +1178,10 @@ async function runResourcesScenario(emit, opts = {}) {
     oom = { restartsBefore: r0.restarts, restartsAfter: r1.restarts, reason: r1.reasons.find((x) => /OOMKilled/.test(x)) || r1.reasons[0] || null, reasons: r1.reasons.slice(0, 4), allocOk, allocFailed, fixedReplicas: 2 };
     emit('note', { text: `OOM demo: restarts ${r0.restarts}→${r1.restarts}, termination ${oom.reason || 'none recorded'}.` });
   } catch (error) {
-    local.requested = true;
-    await settleBg(bg);
-    throw error;
+    // Ownership handoff: rethrows the original error when the owned drain
+    // finishes, or the distinct cleanup failure (cause-attached) when it does
+    // not — a cancelled scenario never hides an unsettled drain.
+    await settleOwnedWork(scope, bg, emit, 'resources background load', error);
   } finally {
     try {
       if (typeof cancel === 'function' && cancel()) throw Object.assign(new Error('restore skipped after cancellation: namespace teardown finalizes'), { code: CANCELLED });
@@ -1104,11 +1206,112 @@ async function runResourcesScenario(emit, opts = {}) {
   return gradeResources({ denom, throttle, oom, restored: restored && hpaRestored });
 }
 
-// Settle background promises after requesting their end: they observe the
-// local token every iteration and finish promptly, so restoration never waits
-// on a full-length load window.
-async function settleBg(bg) {
-  if (bg.length) await Promise.allSettled(bg);
+// Owned background work (load loops) runs under a stop scope: the scope merges
+// End-lesson cancellation with an internal stop request, so any error path can
+// halt exactly the work it owns. drainBg then awaits ACTUAL settlement — never
+// a blind race that returns while requests are still arriving — with a
+// generous bound; a false return means cleanup did not finish, and the caller
+// must report failure rather than grade or archive as if it drained. The
+// timeout timer is cleared on every path.
+export function createStopScope(externalCancel = null) {
+  const local = { requested: false };
+  return {
+    cancelFn: () => (typeof externalCancel === 'function' && externalCancel()) || local.requested,
+    requestStop: () => { local.requested = true; },
+  };
+}
+
+// Generation-based window coverage (resources phase 1): completion events
+// alone cannot prove constant load — delayed completions and timeouts emitted
+// after generation stopped would still land inside a later window. A window
+// counts only when the generator itself offered across it at the intended
+// rate through its end, AND successful (useful) work dominates the window.
+// Anything else yields ok:false with reasons, and the grader stays
+// inconclusive. Pure function over recorded timestamps: unit-testable.
+export function evaluateWindowCoverage({ offers, successes, failures, generatorStoppedAt, winStart, winEnd, intervalMs, minSuccesses = 5 }) {
+  const inWindow = (times) => (times || []).filter((t) => t >= winStart && t <= winEnd);
+  const offered = inWindow(offers);
+  const expected = Math.max(1, Math.round((winEnd - winStart) / intervalMs));
+  const firstOffer = offered.length ? offered[0] : null;
+  const lastOffer = offered.length ? offered[offered.length - 1] : null;
+  const okSuccess = inWindow(successes);
+  const failCount = inWindow(failures).length;
+  const reasons = [];
+  if (!(generatorStoppedAt != null && generatorStoppedAt >= winEnd)) reasons.push(`generation ended before the window end (stoppedAt ${generatorStoppedAt}, winEnd ${winEnd})`);
+  if (!(offered.length >= expected / 2)) reasons.push(`offer shortfall: ${offered.length} offered vs ~${expected} expected at ${intervalMs}ms intervals`);
+  if (!(lastOffer != null && winEnd - lastOffer <= Math.max(1500, intervalMs * 3))) reasons.push('no offer near the window end: generation did not span the window');
+  if (!(okSuccess.length >= minSuccesses)) reasons.push(`only ${okSuccess.length} successful completions in window (need ${minSuccesses})`);
+  if (!(okSuccess.length >= failCount)) reasons.push(`failures dominate (${failCount} failed vs ${okSuccess.length} succeeded): not unchanged useful work`);
+  return {
+    ok: reasons.length === 0,
+    reasons,
+    detail: { winStart, winEnd, offered: offered.length, expected, successes: okSuccess.length, failures: failCount, generatorStoppedAt, firstOffer, lastOffer },
+  };
+}
+
+export async function drainBg(bg, emit = null, timeoutMs = 120000) {
+  if (!bg.length) return true;
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.allSettled(bg).then(() => true),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), Math.max(1, timeoutMs)); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Distinct cleanup failure: background work owned by a scenario did not
+// settle after stop was requested. The server must retain the allocation on
+// this code — never archive, delete, or reuse the environment — until the
+// SAME registered work is awaited to settlement.
+export const CLEANUP_UNSETTLED = 'CLEANUP_UNSETTLED';
+
+// Outstanding-work ownership: key -> { label, at, promises }. Entries are
+// removed only by awaitUnsettled after every promise actually settles, so a
+// retry always rejoins the SAME work instead of starting over.
+const unsettled = new Map();
+export function registerUnsettled(label, promises, key = null) {
+  const id = key || `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  unsettled.set(id, { label, at: new Date().toISOString(), promises: [...promises] });
+  return id;
+}
+export function hasUnsettled(key) { return unsettled.has(key); }
+export async function awaitUnsettled(key, timeoutMs = 120000) {
+  const entry = unsettled.get(key);
+  if (!entry) return true;
+  let timer = null;
+  try {
+    const settled = await Promise.race([
+      Promise.allSettled(entry.promises).then(() => true),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), Math.max(1, timeoutMs)); }),
+    ]);
+    if (settled) unsettled.delete(key);
+    return settled;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+export function cleanupUnsettledError(label, bg, cause) {
+  const key = registerUnsettled(label, bg);
+  const error = new Error(`${label}: background work did not settle after stop was requested; environment retained for retry.`);
+  error.code = CLEANUP_UNSETTLED;
+  error.cleanupKey = key;
+  if (cause) error.cause = cause;
+  return error;
+}
+// Shared error-path ownership handoff: stop owned work, await its actual
+// settlement, and rethrow the ORIGINAL error when the drain finishes. When it
+// does not finish, throw the distinct cleanup failure (carrying the original
+// as cause) instead — a cancelled scenario never hides an unsettled drain.
+// Always throws; callers write `catch (e) { await settleOwnedWork(...); }`.
+export async function settleOwnedWork(scope, bg, emit, label, originalError, drainTimeoutMs = 120000) {
+  scope.requestStop();
+  const drained = await drainBg(bg, emit, drainTimeoutMs);
+  if (drained) throw originalError;
+  emit('error', { text: `${label}: background work did not settle after stop was requested; restoration still runs, but this run cannot be graded — environment retained for retry.` });
+  throw cleanupUnsettledError(label, bg, originalError);
 }
 
 async function runSignalsScenario(emit, opts = {}) {
@@ -1251,12 +1454,17 @@ async function runDisruptionsScenario(emit, opts = {}) {
   const cancel = opts.cancel || null;
   let e1 = null, e2 = null, deleted = null, trafficRes = null, pdbRemoved = false;
   const bg = [];
+  // The 90s background load is owned work: the scope lets any error below
+  // stop it, and the catch awaits its actual settlement before PDB cleanup,
+  // so no request outlives the environment becoming reusable.
+  const scope = createStopScope(cancel);
+  const cancelFn = scope.cancelFn;
   try {
     await kubectlApply(ns, DISRUPTION_PDB(ns));
     emit('note', { text: 'PDB applied (maxUnavailable 1 over 3 pods). Background traffic started; evictions honor the budget, deletes do not.' });
-    const trafficP = traffic(90000, '/fast', emit, 120, 5, baseUrl, cancel);
-    bg.push(trafficP.catch((e) => { if (e?.code !== CANCELLED) throw e; return []; }));
-    await unlessCancelled(sleep(3000), cancel);
+    const trafficP = traffic(90000, '/fast', emit, 120, 5, baseUrl, cancelFn);
+    bg.push(trafficP.catch(() => {}));
+    await unlessCancelled(sleep(3000), cancelFn);
     const pods = await podNames(ns);
     throwIfCancelled(cancel);
     e1 = await evictPod(ns, pods[0]);
@@ -1303,10 +1511,10 @@ async function runDisruptionsScenario(emit, opts = {}) {
     trafficRes = { total: samples.length, failures: failures.length, kinds: [...new Set(failures.map((x) => x.error || `HTTP ${x.status}`))].slice(0, 5) };
     emit('note', { text: `Background: ${samples.length} sampled, ${failures.length} failed (${trafficRes.kinds.join(', ') || 'none'}).` });
   } catch (error) {
-    if (error?.code !== CANCELLED) {
-      await settleBg(bg);
-    }
-    throw error;
+    // Ownership handoff: rethrows the original error when the owned drain
+    // finishes, or the distinct cleanup failure (cause-attached) when it does
+    // not — a cancelled scenario never hides an unsettled drain.
+    await settleOwnedWork(scope, bg, emit, 'disruptions background traffic', error);
   } finally {
     try {
       await kubectl(ns, 'delete', 'pdb', 'app-pdb', '--ignore-not-found');
@@ -1433,6 +1641,11 @@ async function runCapstoneScenario(emit, opts = {}) {
   };
   const phases = {};
   const bg = [];
+  // Rollout/disruption streams are owned background work: the scope stops
+  // them on any error and the catch awaits their actual settlement before
+  // PDB cleanup, so no graded traffic outlives its phase.
+  const scope = createStopScope(cancel);
+  const cancelFn = scope.cancelFn;
   try {
     // Burst.
     emit('note', { text: 'Phase burst: 40s elevated load, graded throughout.' });
@@ -1441,8 +1654,8 @@ async function runCapstoneScenario(emit, opts = {}) {
     emit('note', { text: `Burst: offered ${burst.offered}, p95 ${phases.burst.p95}ms, errors ${phases.burst.errorPct}% (${phases.burst.samples} samples).` });
     // Rollout under traffic: the stream covers trigger, roll, and settle.
     emit('note', { text: 'Phase rollout: traffic runs through trigger, roll, and settle.' });
-    const rollP = pacedRequests(baseUrl, spec.path, spec.rps, 45000, 5000, emit, { cancel });
-    bg.push(rollP.catch((e) => { if (e?.code !== CANCELLED) throw e; return null; }));
+    const rollP = pacedRequests(baseUrl, spec.path, spec.rps, 45000, 5000, emit, { cancel: cancelFn });
+    bg.push(rollP.catch(() => {}));
     await unlessCancelled(sleep(3000), cancel);
     throwIfCancelled(cancel);
     await kubectl(ns, 'set', 'env', 'deployment/app', `LAB_REV=${Date.now()}`);
@@ -1454,8 +1667,8 @@ async function runCapstoneScenario(emit, opts = {}) {
     // allowed eviction is required — a refused one fails the phase openly.
     emit('note', { text: 'Phase disruption: PDB-guarded eviction under traffic (allowed eviction required).' });
     await kubectlApply(ns, DISRUPTION_PDB(ns));
-    const disP = pacedRequests(baseUrl, spec.path, spec.rps, 30000, 5000, emit, { cancel });
-    bg.push(disP.catch((e) => { if (e?.code !== CANCELLED) throw e; return null; }));
+    const disP = pacedRequests(baseUrl, spec.path, spec.rps, 30000, 5000, emit, { cancel: cancelFn });
+    bg.push(disP.catch(() => {}));
     await unlessCancelled(sleep(3000), cancel);
     const dpods = await podNames(ns);
     throwIfCancelled(cancel);
@@ -1470,8 +1683,10 @@ async function runCapstoneScenario(emit, opts = {}) {
     phases.recovery = toPhase(rec);
     emit('note', { text: `Recovery: p95 ${phases.recovery.p95}ms, errors ${phases.recovery.errorPct}% (${phases.recovery.samples} samples).` });
   } catch (error) {
-    if (error?.code !== CANCELLED) await settleBg(bg);
-    throw error;
+    // Ownership handoff: rethrows the original error when the owned drain
+    // finishes, or the distinct cleanup failure (cause-attached) when it does
+    // not — a cancelled scenario never hides an unsettled drain.
+    await settleOwnedWork(scope, bg, emit, 'capstone background traffic', error);
   } finally {
     try {
       await kubectl(ns, 'delete', 'pdb', 'app-pdb', '--ignore-not-found');

@@ -7,7 +7,8 @@ MODE ?= graceful
 .PHONY: up check open dashboard ui-build ui-dev reset down test hpa-up prometheus-up prometheus-ui grafana-up grafana-ui verify
 
 up:
-	@kind get clusters | grep -qx $(CLUSTER) || kind create cluster --config k8s/kind.yaml
+	@clusters="$$(kind get clusters 2>&1)" || { echo "$$clusters"; exit 1; }; \
+	echo "$$clusters" | grep -qx $(CLUSTER) || kind create cluster --config k8s/kind.yaml
 	docker build -t scaling-lab-app:local app
 	kind load docker-image scaling-lab-app:local --name $(CLUSTER)
 	$(KUBECTL) apply -f k8s/app.yaml -f k8s/proxy.yaml

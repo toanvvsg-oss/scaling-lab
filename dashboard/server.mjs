@@ -2,7 +2,7 @@ import http from 'node:http';
 import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { clusterState, runScenario, validateCapacityOptions, validateHpaReactOptions, validateCapstoneOptions } from './runner.mjs';
+import { clusterState, runScenario, awaitUnsettled, CLEANUP_UNSETTLED, validateCapacityOptions, validateHpaReactOptions, validateCapstoneOptions } from './runner.mjs';
 import { LoadSession, PROFILES, CPU_PROFILES, CAPACITY_PROFILES, profileSet, profilesForLesson } from './load.mjs';
 import { createHistory, pushPoint, pushMilestone } from './timeline.mjs';
 import { validateResetTarget, runReset } from './reset.mjs';
@@ -41,6 +41,9 @@ const PREDICT_VALUES = new Set(['up', 'down', 'same', 'share', 'fresh']);
 
 export const prodDeps = {
   clusterState, runScenario, checkLessonPrereqs,
+  // Same-work cleanup joins: retained after an unsettled drain, awaited by
+  // End and scenario retry before the environment is reused or released.
+  awaitScenarioCleanup: awaitUnsettled,
   loadFactory: (emitFn, opts) => new LoadSession(emitFn, opts),
   runsApi: {
     runs, archives, activeRuns, MAX_ACTIVE_RUNS, RUN_LESSONS,
@@ -102,6 +105,24 @@ async function endLessonRun(run, ctx) {
         emit('error', { text: 'Guided request still in flight after 30s; teardown finalizes and the outcome is recorded as cancelled.' });
         run.pendingLong = null;
       }
+    }
+    // Retained cleanup joins BEFORE the scenario wait: cleanupPending means the
+    // scenario promise already settled but left background work outstanding,
+    // and scenarioRunning is deliberately still set. Awaiting the SAME
+    // registered work here keeps teardown from racing it.
+    if (run.cleanupPending) {
+      // A scenario settled but left background work outstanding: await the
+      // SAME registered work before anything is archived or deleted. The wait
+      // is bounded; an unsettled drain retains the allocation for retry.
+      stage('await-cleanup', 'Waiting for retained background work to settle before teardown.');
+      const settled = await io.awaitScenarioCleanup(run.cleanupPending.key, 120000).catch(() => false);
+      if (!settled) {
+        fail(`Background work from ${run.cleanupPending.scenario} is still unsettled; nothing was deleted. Retry End once it drains.`);
+        return;
+      }
+      run.cleanupPending = null;
+      run.scenarioRunning = false;
+      emit('note', { text: 'Retained background work settled; teardown proceeds.' });
     }
     stage('await-scenario', 'Waiting for any in-progress scenario to reach a cancellation boundary.');
     const until = Date.now() + 420000;
@@ -502,7 +523,9 @@ function summarizeAction(s) {
       if (!R.RUN_LESSONS.has(input.lesson)) return send(res, 400, { error: `Unknown lesson. Expected one of ${[...R.RUN_LESSONS].join(', ')}.` });
       if (lessonFlow.migration) return send(res, 409, { error: 'Resolve the inherited environments first (GET /api/lesson).', migration: lessonFlow.migration });
       if (lessonFlow.active && lessonFlow.active.status !== 'failed') {
-        return send(res, 409, { error: `Lesson ${lessonFlow.active.lesson} already holds the single environment (status ${lessonFlow.active.status}). End it before starting another.`, active: lessonFlow.active });
+        const held = R.runs.get(lessonFlow.active.runId);
+        const cleanupNote = held?.cleanupPending ? ` Retained background work from ${held.cleanupPending.scenario} is unsettled; End the lesson to await it.` : '';
+        return send(res, 409, { error: `Lesson ${lessonFlow.active.lesson} already holds the single environment (status ${lessonFlow.active.status}). End it before starting another.${cleanupNote}`, active: lessonFlow.active });
       }
       // Synchronous reservation BEFORE any await below: the check and the
       // claim run atomically, so two concurrent Starts cannot both pass.
@@ -650,7 +673,8 @@ function summarizeAction(s) {
         let options = {};
         try { options = scenarioOptions(input.id, input.options); } catch (error) { return send(res, 400, { error: error.message }); }
         if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before running scenarios.` });
-        if (run.scenarioRunning) return send(res, 409, { error: 'A scenario is already running in this run.' });
+        if (run.retryJoining) return send(res, 409, { error: 'A cleanup join is already awaiting retained background work. Wait for it.' });
+        if (run.scenarioRunning && !run.cleanupPending) return send(res, 409, { error: 'A scenario is already running in this run.' });
         if (run.actionRunning) return send(res, 409, { error: 'A learner action is running in this run. Wait for it before the one-click scenario.' });
         if (run.pendingLong) return send(res, 409, { error: 'A guided long request is in flight. Terminate it before the one-click scenario.' });
         if (run.load?.active) return send(res, 409, { error: 'Manual load is running in this run. Stop it before the one-click scenario.' });
@@ -663,21 +687,48 @@ function summarizeAction(s) {
         run.experimentAt = new Date().toISOString();
         send(res, 202, { started: true });
         const stopObs = observeRun(run);
-        io.runScenario(input.id, {
+        // Retained-cleanup retry rejoins the SAME outstanding work instead of
+        // starting over: the scenario runs only after the registered drain
+        // actually settles. Concurrent retries serialize on retryJoining.
+        let joinPending = Promise.resolve();
+        if (run.cleanupPending) {
+          run.retryJoining = true;
+          runEmit(run, 'note', { text: `Awaiting retained background work from ${run.cleanupPending.scenario} before starting.` });
+          joinPending = io.awaitScenarioCleanup(run.cleanupPending.key, 120000).then(
+            (settled) => {
+              run.retryJoining = false;
+              if (!settled) throw Object.assign(new Error(`Retained background work from ${run.cleanupPending.scenario} is still unsettled; End the lesson to retry teardown, or retry once it drains.`), { code: 'CLEANUP_STILL_PENDING' });
+              run.cleanupPending = null;
+              runEmit(run, 'note', { text: 'Retained background work settled; starting the scenario.' });
+            },
+            (joinError) => { run.retryJoining = false; throw joinError; },
+          );
+        }
+        joinPending.then(() => io.runScenario(input.id, {
           mode: input.mode, namespace: run.ns, endpoint: `http://127.0.0.1:${run.forwardPort}`,
           rateQuery: io.rateQueryForRun(run.id), upQuery: io.upQueryForRun(run.id), options,
           cancel: () => Boolean(run.cancel?.requested),
-        }, (t, d) => runEmit(run, t, d))
+        }, (t, d) => runEmit(run, t, d)))
           .then((result) => { run.result = result; runEmit(run, 'result', { status: result.status }); })
           .catch((error) => {
-            if (error?.code === 'CANCELLED') {
+            if (error?.code === CLEANUP_UNSETTLED && error?.cleanupKey) {
+              // Distinct cleanup failure wins — even when the original
+              // scenario was cancelled: retain the allocation with ownership
+              // of the SAME outstanding work for End/retry to rejoin.
+              run.cleanupPending = { key: error.cleanupKey, scenario: input.id, at: new Date().toISOString(), detail: error.message };
+              run.error = error.message;
+              runEmit(run, 'error', { text: `${error.message} End the lesson to await it, or retry this scenario.` });
+            } else if (error?.code === 'CANCELLED') {
               run.result = { status: 'cancelled', checks: [], evidence: { note: 'Ended by the learner before completion: partial events above are the honest trail, never a pass.' } };
               runEmit(run, 'result', { status: 'cancelled' });
             } else {
               run.error = error.message; runEmit(run, 'error', { text: error.message });
             }
           })
-          .finally(() => { run.scenarioRunning = false; stopObs(); });
+          // Never clear the running flag while cleanup is retained: the
+          // record is removed only after the SAME work is awaited to
+          // settlement (End or retry), never by this flag alone.
+          .finally(() => { if (!run.cleanupPending) run.scenarioRunning = false; stopObs(); });
         return;
       }
       if (req.method === 'POST' && sub === 'load') {
@@ -685,6 +736,7 @@ function summarizeAction(s) {
           const input = await readBody(req);
           if (!['start', 'increase', 'decrease', 'stop'].includes(input.action)) return send(res, 400, { error: 'Unknown load action. Expected start, increase, decrease, or stop.' });
           if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before sending traffic.` });
+          if (run.cleanupPending && input.action !== 'stop') return send(res, 409, { error: `Retained background work from ${run.cleanupPending.scenario} is unsettled. No new load until it settles.` });
           const out = await runLoadAction(run, input.action, input.profile, input.durationMs);
           if (input.action === 'start') run.experimentAt = new Date().toISOString();
           return send(res, 200, out);
@@ -698,6 +750,7 @@ function summarizeAction(s) {
           if (run.status !== 'ready') return send(res, 409, { error: `Run ${run.id} is ${run.status}. Wait before learner actions.` });
           if (run.actionRunning) return send(res, 409, { error: 'Another learner action is running in this run. Wait for it.' });
           if (run.scenarioRunning) return send(res, 409, { error: 'A scenario is running in this run. Wait for it before learner actions.' });
+          if (run.cleanupPending) return send(res, 409, { error: `Retained background work from ${run.cleanupPending.scenario} is unsettled. End the lesson or retry the scenario; no new actions until it settles.` });
           // Guided actions observe clean traffic, except the intentional
           // rollout background sequence (bg-start, bg-stop, trigger-rollout).
           if (!['bg-start', 'bg-stop', 'trigger-rollout'].includes(input.action) && run.load?.active) {
@@ -723,6 +776,7 @@ function summarizeAction(s) {
         // Preflight the same guards cleanupRun enforces, so a rejected
         // cleanup returns 409 immediately instead of a misleading 202.
         if (run.status === 'creating') return send(res, 409, { error: `Run ${run.id} is still being created. Wait before cleanup.` });
+        if (run.cleanupPending) return send(res, 409, { error: `Run ${run.id} has unsettled background work from ${run.cleanupPending.scenario}. End the lesson to await it before cleanup.` });
         if (run.scenarioRunning) return send(res, 409, { error: `Run ${run.id} has a scenario running. Wait for it before cleanup.` });
         if (run.actionRunning) return send(res, 409, { error: `Run ${run.id} has a learner action running. Wait for it before cleanup.` });
         if (run.pendingLong) return send(res, 409, { error: `Run ${run.id} has a long request in flight. Terminate it (terminate-serving) before cleanup.` });
